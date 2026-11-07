@@ -1,38 +1,48 @@
-// Server-only settings helpers.
-// Reads / upserts the singleton Settings row and derives the AIConfig.
+// Server-only settings helpers (singleton row in SQLite).
 import { db } from './db'
-import { DEFAULT_TOOLS, type SettingsData, type ToolToggles, type ClozeStyle } from './types'
 import type { AIConfig } from './ai'
+import {
+  DEFAULT_TOOLS,
+  type SettingsData,
+  type ToolToggles,
+  type ClozeStyle,
+  type PageMode,
+} from './types'
 
 const ID = 'singleton'
 
-type SettingsRow = {
+export function parseSettings(row: {
   id: string
   clozeStyle: string
   showAnswers: boolean
   tools: string
+  fontSize: number
+  pageMode: string
   aiProvider: string
   aiBaseURL: string | null
   aiApiKey: string | null
   aiModel: string | null
-} | null
-
-export function parseSettings(row: SettingsRow): SettingsData {
+} | null): SettingsData {
   let tools: ToolToggles = { ...DEFAULT_TOOLS }
   try {
     if (row?.tools) tools = { ...DEFAULT_TOOLS, ...JSON.parse(row.tools) }
-  } catch {
-    /* keep defaults */
-  }
-  const clozeStyle = ((row?.clozeStyle as ClozeStyle) || 'underline')
-  const aiProvider =
-    row?.aiProvider === 'custom' ? 'custom' : ((row?.aiProvider as 'zai' | 'custom') || 'zai')
+  } catch {}
+
+  let clozeStyle: ClozeStyle = 'circle'
+  if (row?.clozeStyle === 'underline') clozeStyle = 'underline'
+  // legacy 'highlight' maps to the new 圈圈 (circle) style
+
+  let pageMode: PageMode = 'scroll'
+  if (row?.pageMode === 'paged') pageMode = 'paged'
+
   return {
     id: row?.id ?? ID,
     clozeStyle,
     showAnswers: !!row?.showAnswers,
     tools,
-    aiProvider,
+    fontSize: typeof row?.fontSize === 'number' ? row.fontSize : 18,
+    pageMode,
+    aiProvider: (row?.aiProvider as 'zai' | 'custom') || 'zai',
     aiBaseURL: row?.aiBaseURL ?? '',
     aiApiKey: row?.aiApiKey ?? '',
     aiModel: row?.aiModel ?? '',
@@ -41,7 +51,7 @@ export function parseSettings(row: SettingsRow): SettingsData {
 
 export async function getSettings(): Promise<SettingsData> {
   const row = await db.settings.findUnique({ where: { id: ID } })
-  return parseSettings(row as SettingsRow)
+  return parseSettings(row as never)
 }
 
 export async function getAIConfig(): Promise<AIConfig> {

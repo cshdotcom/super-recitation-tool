@@ -11,24 +11,30 @@ datasource db {
 }
 
 // A recitation / memorization card.
-// `keywords` is a JSON-encoded string[] of words that should be blanked out (挖空).
+// `keywords` : JSON string[] of words blanked out (挖空)
+// `strokes`  : JSON string[][] doodle strokes, each stroke = [x,y][] normalized 0..1 (涂鸦)
+// `plan`     : JSON {"goal":number} daily recitation plan (今日计划)
 model Card {
   id        String   @id @default(cuid())
   title     String
   content   String
   keywords  String   @default("[]")
+  strokes   String   @default("[]")
+  plan      String   @default("")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
 
 // Singleton settings row (id = "singleton").
 model Settings {
-  id         String  @id
-  clozeStyle String  @default("underline") // underline | highlight
+  id          String  @id
+  clozeStyle  String  @default("circle")    // circle(圈圈) | underline(下划线)
   showAnswers Boolean @default(false)
-  tools      String  @default("")          // JSON-encoded ToolToggles
-  aiProvider String  @default("zai")       // zai | custom
-  aiBaseURL  String?
-  aiApiKey   String?
-  aiModel    String?
+  tools       String  @default("")          // JSON ToolToggles
+  fontSize    Int     @default(18)          // 字体设置 (px)
+  pageMode    String  @default("scroll")    // scroll(上下滑动) | paged(左右滑动)
+  aiProvider  String  @default("zai")       // zai | custom
+  aiBaseURL   String?
+  aiApiKey    String?
+  aiModel     String?
 }

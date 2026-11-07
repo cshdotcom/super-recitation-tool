@@ -2,47 +2,70 @@
 
 import * as React from 'react'
 import {
-  Volume2,
-  Mic,
+  FerrisWheel,
   FileQuestion,
   GraduationCap,
+  Headphones,
   MessageCircleQuestion,
+  Mic,
   Network,
-  ArrowLeft,
+  PenLine,
+  Volume2,
 } from 'lucide-react'
 
+import type { CardData, SettingsData, ToolToggles } from '@/lib/types'
 import { cn } from '@/lib/utils'
-import type { CardData, SettingsData } from '@/lib/types'
-import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-} from '@/components/ui/sheet'
-import { TtsPlayer } from './tts-player'
-import { AsrRecorder } from './asr-recorder'
-import { QuizPanel } from './quiz-panel'
-import { ChatTool } from './chat-tool'
-import { MindmapView } from './mindmap-view'
+import { BottomSheet } from '@/components/recitation/bottom-sheet'
+import { ToolTogglesSheet } from '@/components/recitation/tool-toggles-sheet'
+import { TtsPlayer } from '@/components/recitation/tts-player'
+import { AsrRecorder } from '@/components/recitation/asr-recorder'
+import { QuizPanel } from '@/components/recitation/quiz-panel'
+import { ChatTool } from '@/components/recitation/chat-tool'
+import { MindmapView } from '@/components/recitation/mindmap-view'
+import { EarbackPanel } from '@/components/recitation/panel-earback'
+import { CopywritePanel } from '@/components/recitation/panel-copywrite'
+import { WheelPanel } from '@/components/recitation/panel-wheel'
+
+export type ToolKey = keyof Omit<ToolToggles, 'aiChunk' | 'aiCloze' | 'doodle' | 'brush' | 'manualCloze' | 'ruleCloze'>
 
 interface ToolsSheetProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** Active tool; null shows the grid. */
   tool: string | null
   onToolChange: (tool: string | null) => void
   card: CardData | null
-  settings: SettingsData | null
+  settings: SettingsData
+  onChangeSettings: (patch: Partial<SettingsData>) => void
 }
 
-const TOOLS = [
-  { key: 'tts', label: '朗读文本', icon: Volume2, desc: 'AI 朗读全文' },
-  { key: 'asr', label: '录音背书', icon: Mic, desc: '语音识别打分' },
-  { key: 'quiz', label: 'AI出题', icon: FileQuestion, desc: '智能生成练习' },
-  { key: 'supervise', label: 'AI督背', icon: GraduationCap, desc: '引导背诵' },
-  { key: 'ask', label: 'AI问问', icon: MessageCircleQuestion, desc: '对课文提问' },
-  { key: 'mindmap', label: '思维导图', icon: Network, desc: '结构化整理' },
-] as const
+const TOOLS: {
+  key: ToolKey
+  label: string
+  icon: React.ComponentType<{ className?: string; strokeWidth?: number }>
+}[] = [
+  { key: 'tts', label: '朗读文本', icon: Volume2 },
+  { key: 'quiz', label: 'AI出题', icon: FileQuestion },
+  { key: 'supervise', label: 'AI督背', icon: GraduationCap },
+  { key: 'asr', label: '录音背书', icon: Mic },
+  { key: 'mindmap', label: '思维导图', icon: Network },
+  { key: 'ask', label: 'AI问问', icon: MessageCircleQuestion },
+  { key: 'earback', label: '耳返背书', icon: Headphones },
+  { key: 'copywrite', label: '摹写', icon: PenLine },
+  { key: 'wheel', label: '轮盘抽背', icon: FerrisWheel },
+]
+
+const TOOL_TITLES: Record<string, string> = {
+  tts: '朗读文本',
+  quiz: 'AI出题',
+  supervise: 'AI督背',
+  asr: '录音背书',
+  mindmap: '思维导图',
+  ask: 'AI问问',
+  earback: '耳返背书',
+  copywrite: '摹写',
+  wheel: '轮盘抽背',
+}
 
 export function ToolsSheet({
   open,
@@ -51,97 +74,122 @@ export function ToolsSheet({
   onToolChange,
   card,
   settings,
+  onChangeSettings,
 }: ToolsSheetProps) {
-  const activeTool = TOOLS.find((t) => t.key === tool) ?? null
+  const [togglesOpen, setTogglesOpen] = React.useState(false)
 
-  const enabledTools = React.useMemo(() => {
-    if (!settings) return TOOLS
-    return TOOLS.filter((t) => settings.tools[t.key as keyof SettingsData['tools']])
-  }, [settings])
+  const enabledTools = TOOLS.filter((t) => settings.tools[t.key])
+  const content = card?.content ?? ''
+
+  const renderPanel = () => {
+    if (!card) {
+      return (
+        <div className="py-16 text-center text-sm text-muted-foreground">
+          请先选择一张有内容的背书卡
+        </div>
+      )
+    }
+    switch (tool) {
+      case 'tts':
+        return <TtsPlayer text={content} />
+      case 'asr':
+        return <AsrRecorder originalText={content} keywords={card.keywords} />
+      case 'quiz':
+        return <QuizPanel content={content} keywords={card.keywords} />
+      case 'supervise':
+        return <ChatTool mode="supervise" content={content} />
+      case 'ask':
+        return <ChatTool mode="ask" content={content} />
+      case 'mindmap':
+        return <MindmapView content={content} />
+      case 'earback':
+        return <EarbackPanel content={content} />
+      case 'copywrite':
+        return <CopywritePanel content={content} />
+      case 'wheel':
+        return <WheelPanel content={content} />
+      default:
+        return null
+    }
+  }
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent
-        side="right"
-        className={cn(
-          'flex w-full flex-col gap-0 p-0',
-          tool ? 'sm:max-w-lg' : 'sm:max-w-md',
-        )}
+    <>
+      {/* Grid sheet (Screenshot C) */}
+      <BottomSheet
+        open={open && tool === null}
+        onOpenChange={onOpenChange}
+        title="背书工具"
+        showClose={false}
+        rightAction={
+          <button
+            type="button"
+            onClick={() => setTogglesOpen(true)}
+            className="rounded-full px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+          >
+            自定义编辑
+          </button>
+        }
       >
-        <SheetHeader className="border-b p-4">
-          <div className="flex items-center gap-2">
-            {activeTool && (
+        <div className="mt-5 grid grid-cols-4 gap-3 overflow-y-auto pb-4">
+          {enabledTools.map((t) => {
+            const Icon = t.icon
+            return (
               <button
+                key={t.key}
                 type="button"
-                onClick={() => onToolChange(null)}
-                className="flex items-center gap-1 rounded-md px-2 py-1 text-sm text-muted-foreground hover:bg-accent"
-                aria-label="返回工具列表"
+                onClick={() => onToolChange(t.key)}
+                className="flex flex-col items-center gap-1.5"
               >
-                <ArrowLeft className="size-4" /> 返回
+                <span
+                  className={cn(
+                    'flex size-[72px] w-full items-center justify-center rounded-2xl border border-border bg-card shadow-sm transition-all',
+                    'hover:-translate-y-0.5 hover:shadow-md',
+                  )}
+                >
+                  <Icon className="size-7 text-foreground/80" strokeWidth={1.5} />
+                </span>
+                <span className="text-xs text-muted-foreground">{t.label}</span>
               </button>
-            )}
-            <SheetTitle className="text-base">
-              {activeTool ? activeTool.label : '背书工具'}
-            </SheetTitle>
-          </div>
-          {!activeTool && (
-            <SheetDescription>
-              选择一个工具开始背诵练习（受设置开关控制）
-            </SheetDescription>
+            )
+          })}
+          {enabledTools.length === 0 && (
+            <div className="col-span-4 py-10 text-center text-sm text-muted-foreground">
+              所有背书工具均已关闭，可在「自定义编辑」中开启
+            </div>
           )}
-        </SheetHeader>
-
-        <div className="flex-1 overflow-y-auto p-4">
-          {!card ? (
-            <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-muted-foreground">
-              <FileQuestion className="size-8 text-muted-foreground/40" />
-              请先选择或创建一张背书卡
-            </div>
-          ) : !activeTool ? (
-            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
-              {enabledTools.map((t) => {
-                const Icon = t.icon
-                return (
-                  <button
-                    key={t.key}
-                    type="button"
-                    onClick={() => onToolChange(t.key)}
-                    className="flex flex-col items-center gap-2 rounded-xl border p-4 text-center transition-colors hover:bg-accent"
-                  >
-                    <span className="flex size-10 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600">
-                      <Icon className="size-5" />
-                    </span>
-                    <span className="text-sm font-medium">{t.label}</span>
-                    <span className="text-xs text-muted-foreground">
-                      {t.desc}
-                    </span>
-                  </button>
-                )
-              })}
-              {enabledTools.length === 0 && (
-                <div className="col-span-full py-10 text-center text-sm text-muted-foreground">
-                  所有工具已关闭，请到设置中开启
-                </div>
-              )}
-            </div>
-          ) : activeTool.key === 'tts' ? (
-            <TtsPlayer text={card.content} />
-          ) : activeTool.key === 'asr' ? (
-            <AsrRecorder
-              originalText={card.content}
-              keywords={card.keywords}
-            />
-          ) : activeTool.key === 'quiz' ? (
-            <QuizPanel content={card.content} keywords={card.keywords} />
-          ) : activeTool.key === 'supervise' ? (
-            <ChatTool mode="supervise" content={card.content} />
-          ) : activeTool.key === 'ask' ? (
-            <ChatTool mode="ask" content={card.content} />
-          ) : activeTool.key === 'mindmap' ? (
-            <MindmapView content={card.content} />
-          ) : null}
         </div>
-      </SheetContent>
-    </Sheet>
+      </BottomSheet>
+
+      {/* Active tool panel sheet */}
+      <BottomSheet
+        open={open && tool !== null}
+        onOpenChange={(o) => {
+          if (!o) {
+            onToolChange(null)
+            onOpenChange(false)
+          }
+        }}
+        title={tool ? TOOL_TITLES[tool] ?? '背书工具' : '背书工具'}
+        rightAction={
+          <button
+            type="button"
+            onClick={() => onToolChange(null)}
+            className="rounded-full px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+          >
+            返回
+          </button>
+        }
+      >
+        <div className="mt-4 overflow-y-auto pb-6">{renderPanel()}</div>
+      </BottomSheet>
+
+      <ToolTogglesSheet
+        open={togglesOpen}
+        onOpenChange={setTogglesOpen}
+        settings={settings}
+        onChangeSettings={onChangeSettings}
+      />
+    </>
   )
 }

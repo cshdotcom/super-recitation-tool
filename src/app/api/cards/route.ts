@@ -1,6 +1,7 @@
 // Card collection endpoints.
 // GET    /api/cards          -> list all cards (newest first)
 // POST   /api/cards          -> create a new card
+// DELETE /api/cards          -> delete ALL cards (storage management)
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { serializeCard } from '@/lib/card'
@@ -40,6 +41,17 @@ export async function POST(req: NextRequest) {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('[POST /api/cards] failed:', err)
+    return NextResponse.json({ error: msg }, { status: 500 })
+  }
+}
+
+export async function DELETE() {
+  try {
+    await db.card.deleteMany({})
+    return NextResponse.json({ ok: true })
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error('[DELETE /api/cards] failed:', err)
     return NextResponse.json({ error: msg }, { status: 500 })
   }
 }

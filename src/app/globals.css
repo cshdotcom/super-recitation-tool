@@ -120,3 +120,12 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Hide scrollbars for horizontal chip/tool rails */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}

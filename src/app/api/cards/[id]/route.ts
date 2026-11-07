@@ -1,6 +1,6 @@
 // Single-card endpoints.
 // GET    /api/cards/:id   -> fetch one card
-// PATCH  /api/cards/:id   -> partial update
+// PATCH  /api/cards/:id   -> partial update (title/content/keywords/strokes/plan)
 // DELETE /api/cards/:id   -> remove
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
@@ -42,6 +42,33 @@ export async function PATCH(
       data.keywords = JSON.stringify(
         body.keywords.filter((k: unknown): k is string => typeof k === 'string')
       )
+    }
+    // 涂鸦 strokes: array of stroke arrays (normalized 0..1 points), persisted to DB.
+    if (Array.isArray(body?.strokes)) {
+      const validStrokes = body.strokes.filter(
+        (s: unknown) =>
+          Array.isArray(s) &&
+          s.every(
+            (p: unknown) =>
+              Array.isArray(p) &&
+              p.length === 2 &&
+              typeof p[0] === 'number' &&
+              typeof p[1] === 'number',
+          ),
+      )
+      data.strokes = JSON.stringify(validStrokes)
+    }
+    // 今日计划 plan: { goal: number } | null
+    if (body?.plan !== undefined) {
+      if (body.plan === null) {
+        data.plan = ''
+      } else if (
+        typeof body.plan === 'object' &&
+        typeof body.plan.goal === 'number' &&
+        Number.isFinite(body.plan.goal)
+      ) {
+        data.plan = JSON.stringify({ goal: Math.min(200, Math.max(1, Math.round(body.plan.goal))) })
+      }
     }
 
     const updated = await db.card.update({

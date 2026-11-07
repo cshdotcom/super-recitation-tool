@@ -4,7 +4,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getSettings, parseSettings } from '@/lib/settings'
-import { DEFAULT_TOOLS, type ClozeStyle, type ToolToggles } from '@/lib/types'
+import { DEFAULT_TOOLS, type ToolToggles } from '@/lib/types'
 
 const ID = 'singleton'
 
@@ -31,11 +31,14 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json(await getSettings())
     }
 
-    const data: Record<string, string | boolean> = {}
+    const data: Record<string, string | boolean | number> = {}
 
     if (typeof body?.clozeStyle === 'string') {
-      const style: ClozeStyle = body.clozeStyle === 'highlight' ? 'highlight' : 'underline'
-      data.clozeStyle = style
+      // Accept the new 圈圈/下划线 styles; legacy 'highlight' maps to 圈圈.
+      data.clozeStyle =
+        body.clozeStyle === 'underline'
+          ? 'underline'
+          : 'circle'
     }
     if (typeof body?.showAnswers === 'boolean') {
       data.showAnswers = body.showAnswers
@@ -48,6 +51,13 @@ export async function PATCH(req: NextRequest) {
         }
       }
       data.tools = JSON.stringify(merged)
+    }
+    if (typeof body?.fontSize === 'number' && Number.isFinite(body.fontSize)) {
+      const size = Math.round(body.fontSize)
+      data.fontSize = Math.min(32, Math.max(12, size))
+    }
+    if (body?.pageMode === 'scroll' || body?.pageMode === 'paged') {
+      data.pageMode = body.pageMode
     }
     if (typeof body?.aiProvider === 'string') {
       data.aiProvider = body.aiProvider === 'custom' ? 'custom' : 'zai'

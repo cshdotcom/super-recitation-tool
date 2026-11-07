@@ -1,274 +1,327 @@
 'use client'
 
 import * as React from 'react'
+import {
+  Braces,
+  Cpu,
+  Database,
+  Globe,
+  KeyRound,
+  Loader2,
+  Trash2,
+} from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { SettingsData, ToolToggles, ClozeStyle } from '@/lib/types'
-import { DEFAULT_TOOLS } from '@/lib/types'
+import type { CardData, SettingsData, ToolToggles } from '@/lib/types'
+import { cn } from '@/lib/utils'
+import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import {
-  Sheet,
-  SheetContent,
-  SheetHeader,
-  SheetTitle,
-  SheetDescription,
-  SheetFooter,
-} from '@/components/ui/sheet'
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Switch } from '@/components/ui/switch'
-import { Separator } from '@/components/ui/separator'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { Switch } from '@/components/ui/switch'
 
 interface SettingsSheetProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   settings: SettingsData | null
-  onSave: (settings: SettingsData) => void
+  cards: CardData[]
+  onChangeSettings: (patch: Partial<SettingsData>) => void
+  onClearAll: () => Promise<void> | void
 }
 
-const TOOL_LABELS: { key: keyof ToolToggles; label: string }[] = [
-  { key: 'tts', label: '朗读文本' },
-  { key: 'asr', label: '录音背书' },
-  { key: 'quiz', label: 'AI 出题' },
-  { key: 'supervise', label: 'AI 督背' },
-  { key: 'ask', label: 'AI 问问' },
-  { key: 'mindmap', label: '思维导图' },
+const QUICK_TOGGLES: { key: keyof ToolToggles; label: string; desc: string }[] = [
+  { key: 'aiChunk', label: 'AI快速分块', desc: 'AI 将正文智能分段记忆' },
+  { key: 'aiCloze', label: 'AI快速挖空', desc: 'AI 智能分析关键点挖空' },
+  { key: 'doodle', label: '涂鸦', desc: '在正文上自由绘制笔迹' },
+  { key: 'brush', label: '挖空刷', desc: '快速滑选词语挖空' },
+  { key: 'manualCloze', label: '手动挖空', desc: '双击文本快捷挖空' },
+  { key: 'ruleCloze', label: '规则挖空', desc: '按照一定规则批量挖空' },
 ]
+
+const TOOL_TOGGLES: { key: keyof ToolToggles; label: string; desc: string }[] = [
+  { key: 'tts', label: '朗读文本', desc: 'TTS 朗读全文' },
+  { key: 'quiz', label: 'AI出题', desc: '生成填空 / 选择 / 简答题' },
+  { key: 'supervise', label: 'AI督背', desc: 'AI 老师引导背诵' },
+  { key: 'asr', label: '录音背书', desc: '录音识别并打分' },
+  { key: 'mindmap', label: '思维导图', desc: 'AI 梳理知识结构' },
+  { key: 'ask', label: 'AI问问', desc: '自由提问课文内容' },
+  { key: 'earback', label: '耳返背书', desc: '逐句朗读 + 跟读对比' },
+  { key: 'copywrite', label: '摹写', desc: '默写并逐字检查' },
+  { key: 'wheel', label: '轮盘抽背', desc: '随机抽句背诵' },
+]
+
+function ToggleRow({
+  label,
+  desc,
+  checked,
+  onCheckedChange,
+}: {
+  label: string
+  desc: string
+  checked: boolean
+  onCheckedChange: (v: boolean) => void
+}) {
+  return (
+    <div
+      className={cn(
+        'flex items-center justify-between gap-3 rounded-2xl border border-border bg-card px-4 py-3.5 transition-colors',
+        checked && 'border-emerald-600/30',
+      )}
+    >
+      <div className="min-w-0">
+        <p className="text-sm font-bold">{label}</p>
+        <p className="mt-0.5 truncate text-xs text-muted-foreground">{desc}</p>
+      </div>
+      <Switch
+        checked={checked}
+        onCheckedChange={onCheckedChange}
+        aria-label={`开关：${label}`}
+        className="data-[state=checked]:bg-emerald-600"
+      />
+    </div>
+  )
+}
 
 export function SettingsSheet({
   open,
   onOpenChange,
   settings,
-  onSave,
+  cards,
+  onChangeSettings,
+  onClearAll,
 }: SettingsSheetProps) {
-  const [draft, setDraft] = React.useState<SettingsData | null>(settings)
+  // AI model draft (saved via 保存 button)
+  const [aiDraft, setAiDraft] = React.useState({
+    aiProvider: 'zai' as 'zai' | 'custom',
+    aiBaseURL: '',
+    aiApiKey: '',
+    aiModel: '',
+  })
+  const [saving, setSaving] = React.useState(false)
 
   React.useEffect(() => {
-    setDraft(settings)
-  }, [settings])
+    if (open && settings) {
+      setAiDraft({
+        aiProvider: settings.aiProvider,
+        aiBaseURL: settings.aiBaseURL,
+        aiApiKey: settings.aiApiKey,
+        aiModel: settings.aiModel,
+      })
+    }
+  }, [open, settings])
 
-  if (!draft) {
-    return (
-      <Sheet open={open} onOpenChange={onOpenChange}>
-        <SheetContent side="right" className="sm:max-w-md">
-          <SheetHeader>
-            <SheetTitle>设置</SheetTitle>
-            <SheetDescription>正在加载设置…</SheetDescription>
-          </SheetHeader>
-        </SheetContent>
-      </Sheet>
-    )
+  const totalChars = cards.reduce((sum, c) => sum + c.content.length, 0)
+
+  const toggleTool = (key: keyof ToolToggles, v: boolean) => {
+    if (!settings) return
+    onChangeSettings({ tools: { ...settings.tools, [key]: v } })
   }
 
-  const update = <K extends keyof SettingsData>(
-    key: K,
-    value: SettingsData[K],
-  ) => {
-    setDraft((prev) => (prev ? { ...prev, [key]: value } : prev))
+  const handleSaveAi = async () => {
+    setSaving(true)
+    try {
+      onChangeSettings({ ...aiDraft })
+      toast.success('AI 模型设置已保存')
+    } finally {
+      setSaving(false)
+    }
   }
 
-  const updateTool = (key: keyof ToolToggles, value: boolean) => {
-    setDraft((prev) =>
-      prev
-        ? { ...prev, tools: { ...prev.tools, [key]: value } }
-        : prev,
-    )
-  }
-
-  const handleSave = () => {
-    onSave(draft)
-  }
-
-  const handleReset = () => {
-    setDraft({
-      ...draft,
-      clozeStyle: 'underline',
-      showAnswers: false,
-      tools: { ...DEFAULT_TOOLS },
-      aiProvider: 'zai',
-      aiBaseURL: '',
-      aiApiKey: '',
-      aiModel: '',
+  const handleExportAll = () => {
+    const blob = new Blob([JSON.stringify({ cards }, null, 2)], {
+      type: 'application/json',
     })
-    toast.info('已恢复默认设置（未保存）')
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = '超级背书-全部数据.json'
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success('已导出全部数据')
   }
 
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="flex flex-col gap-0 sm:max-w-md">
-        <SheetHeader className="border-b p-4">
-          <SheetTitle>设置</SheetTitle>
-          <SheetDescription>
-            调整挖空样式、工具开关与 AI 模型
-          </SheetDescription>
-        </SheetHeader>
-
-        <div className="flex-1 overflow-y-auto p-4">
-          {/* 显示设置 */}
-          <section className="flex flex-col gap-3">
-            <h3 className="text-sm font-semibold">显示设置</h3>
-            <div className="flex flex-col gap-2">
-              <Label className="text-xs text-muted-foreground">挖空风格</Label>
-              <RadioGroup
-                value={draft.clozeStyle}
-                onValueChange={(v) => update('clozeStyle', v as ClozeStyle)}
-                className="grid grid-cols-2 gap-2"
-              >
-                <label
-                  htmlFor="style-underline"
-                  className="flex cursor-pointer items-center gap-2 rounded-md border p-3 text-sm has-[[data-state=checked]]:border-emerald-500/50 has-[[data-state=checked]]:bg-emerald-500/10"
-                >
-                  <RadioGroupItem id="style-underline" value="underline" />
-                  <span className="border-b-2 border-dashed border-foreground/40 px-1">
-                    下划线
-                  </span>
-                </label>
-                <label
-                  htmlFor="style-highlight"
-                  className="flex cursor-pointer items-center gap-2 rounded-md border p-3 text-sm has-[[data-state=checked]]:border-emerald-500/50 has-[[data-state=checked]]:bg-emerald-500/10"
-                >
-                  <RadioGroupItem id="style-highlight" value="highlight" />
-                  <span className="rounded-full bg-emerald-500/15 px-2 text-emerald-700 dark:text-emerald-300">
-                    高亮
-                  </span>
-                </label>
-              </RadioGroup>
-            </div>
-
-            <div className="flex items-center justify-between rounded-md border p-3">
-              <div className="flex flex-col">
-                <Label className="text-sm">默认显示答案</Label>
-                <span className="text-xs text-muted-foreground">
-                  打开后所有挖空默认揭示
-                </span>
-              </div>
-              <Switch
-                checked={draft.showAnswers}
-                onCheckedChange={(v) => update('showAnswers', v)}
-              />
-            </div>
-          </section>
-
-          <Separator className="my-4" />
-
-          {/* 背书工具 */}
-          <section className="flex flex-col gap-3">
-            <h3 className="text-sm font-semibold">背书工具</h3>
-            <div className="flex flex-col gap-1">
-              {TOOL_LABELS.map((t) => (
-                <div
+    <BottomSheet open={open} onOpenChange={onOpenChange} title="设置" className="h-[85vh]">
+      {!settings ? (
+        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+          <Loader2 className="mr-2 size-4 animate-spin" /> 正在加载设置…
+        </div>
+      ) : (
+        <div className="mt-4 flex-1 space-y-5 overflow-y-auto pb-6">
+          {/* ---------- 快捷编辑栏 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">快捷编辑栏</p>
+            <div className="space-y-2.5">
+              {QUICK_TOGGLES.map((t) => (
+                <ToggleRow
                   key={t.key}
-                  className="flex items-center justify-between rounded-md px-3 py-2 hover:bg-accent"
-                >
-                  <Label className="text-sm">{t.label}</Label>
-                  <Switch
-                    checked={draft.tools[t.key]}
-                    onCheckedChange={(v) => updateTool(t.key, v)}
-                  />
-                </div>
+                  label={t.label}
+                  desc={t.desc}
+                  checked={settings.tools[t.key]}
+                  onCheckedChange={(v) => toggleTool(t.key, v)}
+                />
               ))}
             </div>
+            <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">已自动保存</p>
           </section>
 
-          <Separator className="my-4" />
-
-          {/* AI 模型 */}
-          <section className="flex flex-col gap-3">
-            <h3 className="text-sm font-semibold">AI 模型</h3>
-            <RadioGroup
-              value={draft.aiProvider}
-              onValueChange={(v) =>
-                update('aiProvider', v as SettingsData['aiProvider'])
-              }
-              className="grid gap-2"
-            >
-              <label
-                htmlFor="provider-zai"
-                className="flex cursor-pointer items-start gap-2 rounded-md border p-3 has-[[data-state=checked]]:border-emerald-500/50 has-[[data-state=checked]]:bg-emerald-500/10"
-              >
-                <RadioGroupItem
-                  id="provider-zai"
-                  value="zai"
-                  className="mt-0.5"
+          {/* ---------- 背书工具 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">背书工具</p>
+            <div className="space-y-2.5">
+              {TOOL_TOGGLES.map((t) => (
+                <ToggleRow
+                  key={t.key}
+                  label={t.label}
+                  desc={t.desc}
+                  checked={settings.tools[t.key]}
+                  onCheckedChange={(v) => toggleTool(t.key, v)}
                 />
-                <div className="flex flex-col gap-0.5">
-                  <span className="text-sm font-medium">z-ai SDK 默认</span>
-                  <span className="text-xs text-muted-foreground">
-                    使用内置 z-ai 模型，无需配置
-                  </span>
-                </div>
-              </label>
-              <label
-                htmlFor="provider-custom"
-                className="flex cursor-pointer items-start gap-2 rounded-md border p-3 has-[[data-state=checked]]:border-emerald-500/50 has-[[data-state=checked]]:bg-emerald-500/10"
-              >
-                <RadioGroupItem
-                  id="provider-custom"
-                  value="custom"
-                  className="mt-0.5"
-                />
-                <div className="flex flex-col gap-0.5">
-                  <span className="text-sm font-medium">
-                    第三方 OpenAI 兼容 API
-                  </span>
-                  <span className="text-xs text-muted-foreground">
-                    适用于文本类 AI（挖空/出题/督背/思维导图）
-                  </span>
-                </div>
-              </label>
-            </RadioGroup>
+              ))}
+            </div>
+            <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">已自动保存</p>
+          </section>
 
-            {draft.aiProvider === 'custom' && (
-              <div className="flex flex-col gap-3 rounded-md border bg-muted/20 p-3">
-                <div className="flex flex-col gap-1">
-                  <Label className="text-xs text-muted-foreground">
-                    Base URL
-                  </Label>
-                  <Input
-                    value={draft.aiBaseURL}
-                    onChange={(e) => update('aiBaseURL', e.target.value)}
-                    placeholder="https://api.openai.com/v1"
-                  />
-                </div>
-                <div className="flex flex-col gap-1">
-                  <Label className="text-xs text-muted-foreground">
-                    API Key
-                  </Label>
-                  <Input
-                    type="password"
-                    value={draft.aiApiKey}
-                    onChange={(e) => update('aiApiKey', e.target.value)}
-                    placeholder="sk-..."
-                  />
-                </div>
-                <div className="flex flex-col gap-1">
-                  <Label className="text-xs text-muted-foreground">模型</Label>
-                  <Input
-                    value={draft.aiModel}
-                    onChange={(e) => update('aiModel', e.target.value)}
-                    placeholder="gpt-4o-mini"
-                  />
-                </div>
+          {/* ---------- 存储与数据 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">存储与数据</p>
+            <div className="rounded-2xl border border-border bg-card px-4 py-4">
+              <div className="flex items-center gap-2 text-sm">
+                <Database className="size-4 text-muted-foreground" strokeWidth={1.75} />
+                <span className="font-medium">
+                  SQLite 本地数据库 · 已存 {cards.length} 张卡片 · 共 {totalChars} 字
+                </span>
               </div>
-            )}
+              <div className="mt-3 flex flex-col gap-2">
+                <Button
+                  variant="outline"
+                  className="h-10 rounded-full"
+                  onClick={handleExportAll}
+                >
+                  <Braces className="size-4" strokeWidth={1.75} />
+                  导出全部数据（JSON 下载）
+                </Button>
+                <AlertDialog>
+                  <AlertDialogTrigger asChild>
+                    <Button
+                      variant="outline"
+                      className="h-10 rounded-full border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                    >
+                      <Trash2 className="size-4" strokeWidth={1.75} />
+                      清空全部数据
+                    </Button>
+                  </AlertDialogTrigger>
+                  <AlertDialogContent className="rounded-2xl">
+                    <AlertDialogHeader>
+                      <AlertDialogTitle>清空全部背书卡？</AlertDialogTitle>
+                      <AlertDialogDescription>
+                        将删除数据库中的全部 {cards.length} 张背书卡，此操作不可撤销。
+                      </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter>
+                      <AlertDialogCancel>取消</AlertDialogCancel>
+                      <AlertDialogAction
+                        className="bg-destructive text-white hover:bg-destructive/90"
+                        onClick={() => void onClearAll()}
+                      >
+                        确认清空
+                      </AlertDialogAction>
+                    </AlertDialogFooter>
+                  </AlertDialogContent>
+                </AlertDialog>
+              </div>
+            </div>
+          </section>
 
-            <p className="text-xs leading-relaxed text-muted-foreground">
-              z-ai SDK 用于图片识别 / 语音朗读 / 语音识别；文本类
-              AI（挖空、出题、督背、思维导图）可切换为第三方模型。
-            </p>
+          {/* ---------- AI 模型 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">AI 模型</p>
+            <div className="rounded-2xl border border-border bg-card px-4 py-4">
+              <RadioGroup
+                value={aiDraft.aiProvider}
+                onValueChange={(v) => setAiDraft((d) => ({ ...d, aiProvider: v as 'zai' | 'custom' }))}
+                className="gap-2.5"
+              >
+                <div className="flex items-center gap-2.5">
+                  <RadioGroupItem value="zai" id="provider-zai" />
+                  <Label htmlFor="provider-zai" className="cursor-pointer text-sm font-medium">
+                    z-ai SDK（内置默认）
+                  </Label>
+                </div>
+                <div className="flex items-center gap-2.5">
+                  <RadioGroupItem value="custom" id="provider-custom" />
+                  <Label htmlFor="provider-custom" className="cursor-pointer text-sm font-medium">
+                    第三方 OpenAI 兼容 API
+                  </Label>
+                </div>
+              </RadioGroup>
+
+              {aiDraft.aiProvider === 'custom' && (
+                <div className="mt-4 space-y-3">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="ai-baseurl" className="flex items-center gap-1 text-xs text-muted-foreground">
+                      <Globe className="size-3" /> API Base URL
+                    </Label>
+                    <Input
+                      id="ai-baseurl"
+                      value={aiDraft.aiBaseURL}
+                      onChange={(e) => setAiDraft((d) => ({ ...d, aiBaseURL: e.target.value }))}
+                      placeholder="https://api.example.com/v1"
+                      className="h-10 rounded-xl"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="ai-apikey" className="flex items-center gap-1 text-xs text-muted-foreground">
+                      <KeyRound className="size-3" /> API Key
+                    </Label>
+                    <Input
+                      id="ai-apikey"
+                      type="password"
+                      value={aiDraft.aiApiKey}
+                      onChange={(e) => setAiDraft((d) => ({ ...d, aiApiKey: e.target.value }))}
+                      placeholder="sk-…"
+                      className="h-10 rounded-xl"
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="ai-model" className="flex items-center gap-1 text-xs text-muted-foreground">
+                      <Cpu className="size-3" /> 模型名称
+                    </Label>
+                    <Input
+                      id="ai-model"
+                      value={aiDraft.aiModel}
+                      onChange={(e) => setAiDraft((d) => ({ ...d, aiModel: e.target.value }))}
+                      placeholder="gpt-4o-mini / deepseek-chat 等"
+                      className="h-10 rounded-xl"
+                    />
+                  </div>
+                </div>
+              )}
+
+              <Button
+                onClick={() => void handleSaveAi()}
+                disabled={saving}
+                className="mt-4 h-10 w-full rounded-full bg-primary font-semibold"
+              >
+                {saving && <Loader2 className="size-4 animate-spin" />}
+                保存 AI 模型设置
+              </Button>
+            </div>
           </section>
         </div>
-
-        <SheetFooter className="flex-row justify-between gap-2 border-t p-4">
-          <Button variant="ghost" size="sm" onClick={handleReset}>
-            重置默认
-          </Button>
-          <Button size="sm" onClick={handleSave} className="rounded-full px-5">
-            保存
-          </Button>
-        </SheetFooter>
-      </SheetContent>
-    </Sheet>
+      )}
+    </BottomSheet>
   )
 }

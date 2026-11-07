@@ -1,39 +1,74 @@
 // Shared types used by both backend API routes and the frontend.
 
-export type ClozeStyle = 'underline' | 'highlight'
+export type ClozeStyle = 'circle' | 'underline'
+
+export interface CardPlan {
+  goal: number
+}
+
+// One doodle stroke: array of normalized [x, y] points (0..1 relative to content box).
+export type Stroke = [number, number][]
 
 export interface CardData {
   id: string
   title: string
   content: string
   keywords: string[]
+  strokes: Stroke[] // 涂鸦笔迹 (persisted)
+  plan: CardPlan | null
   createdAt: string
   updatedAt: string
 }
 
+// Quick edit bar toggles (screenshot: AI快速分块/AI快速挖空/涂鸦/挖空刷/手动挖空/规则挖空)
+// + recitation tool toggles (背书工具 grid).
 export interface ToolToggles {
+  aiChunk: boolean
+  aiCloze: boolean
+  doodle: boolean
+  brush: boolean
+  manualCloze: boolean
+  ruleCloze: boolean
+
   tts: boolean
-  asr: boolean
   quiz: boolean
   supervise: boolean
-  ask: boolean
+  asr: boolean
   mindmap: boolean
+  ask: boolean
+  earback: boolean
+  copywrite: boolean
+  wheel: boolean
 }
 
 export const DEFAULT_TOOLS: ToolToggles = {
+  aiChunk: true,
+  aiCloze: true,
+  doodle: true,
+  brush: true,
+  manualCloze: true,
+  ruleCloze: true,
+
   tts: true,
-  asr: true,
   quiz: true,
   supervise: true,
-  ask: true,
+  asr: true,
   mindmap: true,
+  ask: true,
+  earback: true,
+  copywrite: true,
+  wheel: true,
 }
+
+export type PageMode = 'scroll' | 'paged'
 
 export interface SettingsData {
   id: string
   clozeStyle: ClozeStyle
   showAnswers: boolean
   tools: ToolToggles
+  fontSize: number
+  pageMode: PageMode
   aiProvider: 'zai' | 'custom'
   aiBaseURL: string
   aiApiKey: string
