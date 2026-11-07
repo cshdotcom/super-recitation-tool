@@ -1,13 +1,18 @@
-// Card collection endpoints.
+// Card collection endpoints (require login).
 // GET    /api/cards          -> list all cards (newest first)
 // POST   /api/cards          -> create a new card
 // DELETE /api/cards          -> delete ALL cards (storage management)
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { getSessionUser } from '@/lib/auth'
 import { serializeCard } from '@/lib/card'
 
 export async function GET() {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
     const cards = await db.card.findMany({ orderBy: { updatedAt: 'desc' } })
     return NextResponse.json({ cards: cards.map(serializeCard) })
   } catch (err: unknown) {
@@ -19,6 +24,10 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
     const body = await req.json().catch(() => ({}))
     const content: string = typeof body?.content === 'string' ? body.content : ''
     if (!content.trim()) {
@@ -47,6 +56,10 @@ export async function POST(req: NextRequest) {
 
 export async function DELETE() {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
     await db.card.deleteMany({})
     return NextResponse.json({ ok: true })
   } catch (err: unknown) {

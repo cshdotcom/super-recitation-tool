@@ -1,7 +1,13 @@
 // LLM abstraction layer.
 // Supports two providers:
-//   1. "zai"  -> z-ai-web-dev-sdk (default)
+//   1. "zai"    -> z-ai-web-dev-sdk (default)
 //   2. "custom" -> any OpenAI-compatible /chat/completions endpoint
+//
+// Vision: a ChatMessage may carry `images: string[]` (data URIs). When any
+// message has images the request is upgraded to a multimodal payload —
+// OpenAI-style `{type:'text'}/{type:'image_url'}` content parts for "custom",
+// `zai.chat.completions.createVision` for "zai". Text-only requests keep the
+// exact previous behaviour on both providers.
 //
 // This lets the user plug in their own third-party model API while still
 // using the z-ai SDK for everything else (VLM/OCR, TTS, ASR).
@@ -16,10 +22,65 @@ export interface AIConfig {
   model?: string
 }
 
+// ---------- vision helpers ----------
+
+// OpenAI-style multimodal content parts.
+type TextPart = { type: 'text'; text: string }
+type ImagePart = { type: 'image_url'; image_url: { url: string } }
+type ContentPart = TextPart | ImagePart
+
+const IMAGE_DATA_PREFIX = 'data:image/'
+
+// Body shape of the SDK's zai.chat.completions.createVision. Its TS types
+// require `model`, but the z-ai backend selects a default vision model when
+// it is omitted — per the app contract the body only carries messages +
+// thinking, so it is cast to the SDK's parameter type.
+type CreateVisionBody = Parameters<
+  Awaited<ReturnType<typeof getZAI>>['chat']['completions']['createVision']
+>[0]
+
+function isValidImage(img: unknown): img is string {
+  return typeof img === 'string' && img.startsWith(IMAGE_DATA_PREFIX)
+}
+
+/** Whether any message carries valid data-URI images (→ vision request). */
+export function hasImages(messages: ChatMessage[]): boolean {
+  return messages.some(
+    (m) => Array.isArray(m.images) && m.images.some(isValidImage)
+  )
+}
+
+/**
+ * Build OpenAI-compatible message payloads: messages with images become
+ * multimodal content arrays, plain messages keep their string content.
+ */
+function toOpenAIMessages(
+  messages: ChatMessage[]
+): Array<{ role: ChatMessage['role']; content: string | ContentPart[] }> {
+  return messages.map((m) => {
+    const images = Array.isArray(m.images)
+      ? m.images.filter(isValidImage)
+      : []
+    if (!images.length) {
+      return { role: m.role, content: m.content }
+    }
+    const content: ContentPart[] = [
+      { type: 'text', text: m.content },
+      ...images.map(
+        (url) => ({ type: 'image_url', image_url: { url } }) as ImagePart
+      ),
+    ]
+    return { role: m.role, content }
+  })
+}
+
 export async function chatComplete(
   messages: ChatMessage[],
   config?: AIConfig
 ): Promise<string> {
+  const vision = hasImages(messages)
+  const payloadMessages = toOpenAIMessages(messages)
+
   // Custom OpenAI-compatible endpoint
   if (
     config &&
@@ -36,7 +97,7 @@ export async function chatComplete(
       },
       body: JSON.stringify({
         model: config.model || 'gpt-4o-mini',
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        messages: payloadMessages,
       }),
     })
     if (!res.ok) {
@@ -53,6 +114,13 @@ export async function chatComplete(
 
   // Default: z-ai SDK
   const zai = await getZAI()
+  if (vision) {
+    const completion = await zai.chat.completions.createVision({
+      messages: payloadMessages,
+      thinking: { type: 'disabled' },
+    } as CreateVisionBody)
+    return completion.choices?.[0]?.message?.content ?? ''
+  }
   const completion = await zai.chat.completions.create({
     messages: messages as never,
     thinking: { type: 'disabled' },

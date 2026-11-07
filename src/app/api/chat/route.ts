@@ -1,9 +1,18 @@
 // AI chat endpoints — supervise (recitation coach) and ask (comprehension).
 // POST /api/chat   { mode: 'supervise' | 'ask', messages: ChatMessage[], content: string }
+//
+// Vision: each incoming user message may carry `images: string[]` (data URIs).
+// Validation: every entry must be a `data:image/` URI, max 4 images per
+// message, each base64 payload <= 2MB — otherwise 400. Valid images are
+// forwarded through chatComplete (vision-capable payload, see src/lib/ai.ts).
 import { NextRequest, NextResponse } from 'next/server'
 import { chatComplete } from '@/lib/ai'
 import { getAIConfig } from '@/lib/settings'
 import type { ChatMessage } from '@/lib/types'
+
+const MAX_IMAGES_PER_MESSAGE = 4
+// Base64 character cap per image (≈1.5MB of binary).
+const MAX_IMAGE_B64_LENGTH = 2 * 1024 * 1024
 
 export async function POST(req: NextRequest) {
   try {
@@ -15,20 +24,67 @@ export async function POST(req: NextRequest) {
     const mode: 'supervise' | 'ask' =
       body?.mode === 'ask' ? 'ask' : 'supervise'
 
-    const incomingMessages: ChatMessage[] = Array.isArray(body?.messages)
+    const rawMessages: unknown[] = Array.isArray(body?.messages)
       ? body.messages
-          .filter(
-            (m: unknown): m is ChatMessage =>
-              !!m &&
-              typeof m === 'object' &&
-              (m as ChatMessage).role !== undefined &&
-              typeof (m as ChatMessage).content === 'string'
-          )
-          .map((m) => ({
-            role: m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user',
-            content: m.content,
-          }))
       : []
+
+    // Validate optional per-message image attachments before mapping.
+    for (const m of rawMessages) {
+      const images = (m as { images?: unknown } | null)?.images
+      if (images == null) continue
+      if (!Array.isArray(images)) {
+        return NextResponse.json(
+          { error: '图片格式不正确，需为 data:image/ 开头的 data URI 数组' },
+          { status: 400 }
+        )
+      }
+      if (images.length === 0) continue
+      if (images.length > MAX_IMAGES_PER_MESSAGE) {
+        return NextResponse.json(
+          { error: `每条消息最多附带 ${MAX_IMAGES_PER_MESSAGE} 张图片` },
+          { status: 400 }
+        )
+      }
+      if (
+        images.some(
+          (img) => typeof img !== 'string' || !img.startsWith('data:image/')
+        )
+      ) {
+        return NextResponse.json(
+          { error: '图片格式不正确，需为 data:image/ 开头的 data URI' },
+          { status: 400 }
+        )
+      }
+      if (images.some((img) => (img as string).length > MAX_IMAGE_B64_LENGTH)) {
+        return NextResponse.json(
+          { error: '单张图片过大（base64 超过 2MB）' },
+          { status: 400 }
+        )
+      }
+    }
+
+    const incomingMessages: ChatMessage[] = rawMessages
+      .filter(
+        (m: unknown): m is ChatMessage =>
+          !!m &&
+          typeof m === 'object' &&
+          (m as ChatMessage).role !== undefined &&
+          typeof (m as ChatMessage).content === 'string'
+      )
+      .map((m) => {
+        const role =
+          m.role === 'assistant' ? 'assistant' : m.role === 'system' ? 'system' : 'user'
+        // Images ride on user messages only (already validated above).
+        const images = (m as { images?: unknown }).images
+        if (
+          role === 'user' &&
+          Array.isArray(images) &&
+          images.length > 0
+        ) {
+          return { role, content: m.content, images: images as string[] }
+        }
+        return { role, content: m.content }
+      })
 
     const systemPrompt =
       mode === 'supervise'

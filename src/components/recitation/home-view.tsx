@@ -10,8 +10,9 @@ import {
   Trash2,
 } from 'lucide-react'
 
-import type { CardData } from '@/lib/types'
+import type { AccountData, CardData } from '@/lib/types'
 import { cn } from '@/lib/utils'
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import {
   AlertDialog,
@@ -30,19 +31,23 @@ import { ThemeToggle } from '@/components/theme-toggle'
 interface HomeViewProps {
   cards: CardData[]
   loading: boolean
+  account: AccountData
   onOpenCard: (card: CardData) => void
   onDelete: (id: string) => void
   onNew: () => void
   onOpenSettings: () => void
+  onOpenAccount: () => void
 }
 
 export function HomeView({
   cards,
   loading,
+  account,
   onOpenCard,
   onDelete,
   onNew,
   onOpenSettings,
+  onOpenAccount,
 }: HomeViewProps) {
   return (
     <>
@@ -53,6 +58,21 @@ export function HomeView({
             超级背书
           </div>
           <div className="ml-auto flex items-center gap-1">
+            <button
+              type="button"
+              aria-label="账号"
+              onClick={onOpenAccount}
+              className="shrink-0 rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+            >
+              <Avatar className="size-9 ring-1 ring-border transition hover:ring-emerald-600/50">
+                {account.avatar ? (
+                  <AvatarImage src={account.avatar} alt={account.username} />
+                ) : null}
+                <AvatarFallback className="bg-emerald-600 text-xs font-bold text-white">
+                  {account.username.slice(0, 1) || '账'}
+                </AvatarFallback>
+              </Avatar>
+            </button>
             <ThemeToggle />
             <Button
               variant="ghost"

@@ -1,16 +1,22 @@
-// Single-card endpoints.
+// Single-card endpoints (require login).
 // GET    /api/cards/:id   -> fetch one card
 // PATCH  /api/cards/:id   -> partial update (title/content/keywords/strokes/plan)
 // DELETE /api/cards/:id   -> remove
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { serializeCard } from '@/lib/card'
+import { getSessionUser } from '@/lib/auth'
+import { normalizeStrokeInput, serializeCard } from '@/lib/card'
+import type { Stroke } from '@/lib/types'
 
 export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
     const { id } = await params
     const card = await db.card.findUnique({ where: { id } })
     if (!card) {
@@ -29,6 +35,10 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
     const { id } = await params
     const body = await req.json().catch(() => ({}))
     const data: Record<string, string> = {}
@@ -43,19 +53,13 @@ export async function PATCH(
         body.keywords.filter((k: unknown): k is string => typeof k === 'string')
       )
     }
-    // 涂鸦 strokes: array of stroke arrays (normalized 0..1 points), persisted to DB.
+    // 涂鸦 strokes: accepts both formats — legacy [[x,y],...] point arrays and
+    // styled { pts:[[x,y],...], color, width, tool } doodle strokes. Points are
+    // normalized 0..1; object widths are clamped to 1..60. Persisted to DB.
     if (Array.isArray(body?.strokes)) {
-      const validStrokes = body.strokes.filter(
-        (s: unknown) =>
-          Array.isArray(s) &&
-          s.every(
-            (p: unknown) =>
-              Array.isArray(p) &&
-              p.length === 2 &&
-              typeof p[0] === 'number' &&
-              typeof p[1] === 'number',
-          ),
-      )
+      const validStrokes = body.strokes
+        .map((s: unknown): Stroke | null => normalizeStrokeInput(s))
+        .filter((s): s is Stroke => s !== null)
       data.strokes = JSON.stringify(validStrokes)
     }
     // 今日计划 plan: { goal: number } | null
@@ -88,6 +92,10 @@ export async function DELETE(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
     const { id } = await params
     await db.card.delete({ where: { id } })
     return NextResponse.json({ ok: true })

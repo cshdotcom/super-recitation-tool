@@ -1,13 +1,17 @@
 'use client'
 
 import * as React from 'react'
+import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { CardData, SettingsData } from '@/lib/types'
+import type { AccountData, CardData, SettingsData } from '@/lib/types'
 import { HomeView } from '@/components/recitation/home-view'
 import { ReaderView } from '@/components/recitation/reader-view'
 import { ImportSheet, type ImportPayload } from '@/components/recitation/import-sheet'
 import { SettingsSheet } from '@/components/recitation/settings-sheet'
+import { LoginView } from '@/components/recitation/login-view'
+import { AccountSheet } from '@/components/recitation/account-sheet'
+import { SharedCardView } from '@/components/recitation/shared-card-view'
 
 export default function Page() {
   const [view, setView] = React.useState<'home' | 'reader'>('home')
@@ -15,6 +19,14 @@ export default function Page() {
   const [currentCard, setCurrentCard] = React.useState<CardData | null>(null)
   const [settings, setSettings] = React.useState<SettingsData | null>(null)
   const [loading, setLoading] = React.useState(true)
+
+  // ---------- auth / share ----------
+  const [account, setAccount] = React.useState<AccountData | null>(null)
+  const [registered, setRegistered] = React.useState(false)
+  const [authLoading, setAuthLoading] = React.useState(true)
+  const [shareToken, setShareToken] = React.useState<string | null>(null)
+  const [accountOpen, setAccountOpen] = React.useState(false)
+  const dataLoadedRef = React.useRef(false)
 
   const [importOpen, setImportOpen] = React.useState(false)
   const [importDraft, setImportDraft] = React.useState<{
@@ -26,28 +38,82 @@ export default function Page() {
 
   const saveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  // ---------- initial load ----------
+  // ---------- initial data load (cards + settings) ----------
+  const loadInitialData = React.useCallback(async () => {
+    setLoading(true)
+    try {
+      const [cardsRes, settingsRes] = await Promise.all([
+        fetch('/api/cards').then((r) => r.json()),
+        fetch('/api/settings').then((r) => r.json()),
+      ])
+      setCards(((cardsRes && cardsRes.cards) as CardData[]) || [])
+      setSettings((settingsRes as SettingsData) || null)
+    } catch (err) {
+      toast.error('加载数据失败：' + (err instanceof Error ? err.message : String(err)))
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  // ---------- auth bootstrap: resolve ?share= + session ----------
   React.useEffect(() => {
     let alive = true
-    void Promise.all([
-      fetch('/api/cards').then((r) => r.json()),
-      fetch('/api/settings').then((r) => r.json()),
-    ])
-      .then(([cardsRes, settingsRes]) => {
+    const shareParam = new URLSearchParams(window.location.search).get('share')
+    setShareToken(shareParam)
+
+    fetch('/api/auth/me')
+      .then((r) => r.json())
+      .then((res) => {
         if (!alive) return
-        setCards(((cardsRes && cardsRes.cards) as CardData[]) || [])
-        setSettings((settingsRes as SettingsData) || null)
+        setRegistered(!!res?.registered)
+        if (res?.account) setAccount(res.account as AccountData)
       })
-      .catch((err) => {
-        toast.error('加载数据失败：' + (err instanceof Error ? err.message : String(err)))
+      .catch(() => {
+        if (alive) setRegistered(false)
       })
       .finally(() => {
-        if (alive) setLoading(false)
+        if (alive) setAuthLoading(false)
       })
+
     return () => {
       alive = false
+    }
+  }, [])
+
+  // Load cards/settings once authed (skipped while viewing a share link;
+  // re-runs after exiting the share view or after a fresh login).
+  React.useEffect(() => {
+    if (!account || dataLoadedRef.current || shareToken) return
+    dataLoadedRef.current = true
+    void loadInitialData()
+  }, [account, shareToken, loadInitialData])
+
+  // Cleanup the debounced card-save timer on unmount.
+  React.useEffect(() => {
+    return () => {
       if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
     }
+  }, [])
+
+  // ---------- auth handlers ----------
+  const handleAuthed = React.useCallback((acc: AccountData) => {
+    setRegistered(true)
+    setAccount(acc)
+  }, [])
+
+  const handleLogout = React.useCallback(() => {
+    dataLoadedRef.current = false
+    setAccount(null)
+    setCards([])
+    setSettings(null)
+    setCurrentCard(null)
+    setView('home')
+    setAccountOpen(false)
+  }, [])
+
+  const handleShareExit = React.useCallback(() => {
+    window.history.replaceState(null, '', window.location.pathname)
+    setShareToken(null)
   }, [])
 
   // ---------- card CRUD ----------
@@ -220,16 +286,43 @@ export default function Page() {
     setEditingCardId(null)
   }, [])
 
+  // ---------- gated rendering ----------
+  if (authLoading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">
+        <Loader2 className="size-6 animate-spin" />
+      </div>
+    )
+  }
+
+  if (shareToken) {
+    return (
+      <div className="flex min-h-screen flex-col bg-background text-foreground">
+        <SharedCardView token={shareToken} onExit={handleShareExit} />
+      </div>
+    )
+  }
+
+  if (!account) {
+    return (
+      <div className="flex min-h-screen flex-col bg-background text-foreground">
+        <LoginView registered={registered} onAuthed={handleAuthed} />
+      </div>
+    )
+  }
+
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       {view === 'home' ? (
         <HomeView
           cards={cards}
           loading={loading}
+          account={account}
           onOpenCard={handleOpenCard}
           onDelete={handleDelete}
           onNew={handleNewCard}
           onOpenSettings={() => setSettingsOpen(true)}
+          onOpenAccount={() => setAccountOpen(true)}
         />
       ) : currentCard && settings ? (
         <ReaderView
@@ -268,6 +361,14 @@ export default function Page() {
         cards={cards}
         onChangeSettings={handleChangeSettings}
         onClearAll={handleClearAll}
+      />
+
+      <AccountSheet
+        open={accountOpen}
+        onOpenChange={setAccountOpen}
+        account={account}
+        onAccountChange={setAccount}
+        onLogout={handleLogout}
       />
     </div>
   )

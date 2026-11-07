@@ -1,8 +1,9 @@
-// Settings endpoints.
+// Settings endpoints (require login).
 // GET    /api/settings   -> current settings (singleton)
 // PATCH  /api/settings   -> upsert partial settings
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { getSessionUser } from '@/lib/auth'
 import { getSettings, parseSettings } from '@/lib/settings'
 import { DEFAULT_TOOLS, type ToolToggles } from '@/lib/types'
 
@@ -10,6 +11,10 @@ const ID = 'singleton'
 
 export async function GET() {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
     return NextResponse.json(await getSettings())
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -20,6 +25,11 @@ export async function GET() {
 
 export async function PATCH(req: NextRequest) {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
+
     const body = await req.json().catch(() => ({}))
 
     // If no fields supplied, just return current settings.
@@ -70,6 +80,38 @@ export async function PATCH(req: NextRequest) {
     }
     if (typeof body?.aiModel === 'string') {
       data.aiModel = body.aiModel
+    }
+    // TTS provider: zai | custom(OpenAI 兼容) | browser(Web Speech API)
+    if (typeof body?.ttsProvider === 'string') {
+      data.ttsProvider =
+        body.ttsProvider === 'custom' || body.ttsProvider === 'browser'
+          ? body.ttsProvider
+          : 'zai'
+    }
+    if (typeof body?.ttsBaseURL === 'string') {
+      data.ttsBaseURL = body.ttsBaseURL
+    }
+    if (typeof body?.ttsApiKey === 'string') {
+      data.ttsApiKey = body.ttsApiKey
+    }
+    if (typeof body?.ttsModel === 'string') {
+      data.ttsModel = body.ttsModel
+    }
+    // ASR provider: same options as TTS
+    if (typeof body?.asrProvider === 'string') {
+      data.asrProvider =
+        body.asrProvider === 'custom' || body.asrProvider === 'browser'
+          ? body.asrProvider
+          : 'zai'
+    }
+    if (typeof body?.asrBaseURL === 'string') {
+      data.asrBaseURL = body.asrBaseURL
+    }
+    if (typeof body?.asrApiKey === 'string') {
+      data.asrApiKey = body.asrApiKey
+    }
+    if (typeof body?.asrModel === 'string') {
+      data.asrModel = body.asrModel
     }
 
     if (Object.keys(data).length === 0) {

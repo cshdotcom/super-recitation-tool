@@ -1,12 +1,16 @@
 // Mind-map generation.
 // POST /api/mindmap   { content } -> { mindmap: MindNode }
 import { NextRequest, NextResponse } from 'next/server'
+import { getSessionUser } from '@/lib/auth'
 import { chatComplete, extractJSON } from '@/lib/ai'
 import { getAIConfig } from '@/lib/settings'
 import type { MindNode } from '@/lib/types'
 
 export async function POST(req: NextRequest) {
   try {
+    const user = await getSessionUser()
+    if (!user) return NextResponse.json({ error: '未登录' }, { status: 401 })
+
     const body = await req.json().catch(() => ({}))
     const content: string = typeof body?.content === 'string' ? body.content : ''
     if (!content.trim()) {

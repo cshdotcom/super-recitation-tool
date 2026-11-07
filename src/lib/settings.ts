@@ -7,6 +7,7 @@ import {
   type ToolToggles,
   type ClozeStyle,
   type PageMode,
+  type VoiceProvider,
 } from './types'
 
 const ID = 'singleton'
@@ -22,6 +23,14 @@ export function parseSettings(row: {
   aiBaseURL: string | null
   aiApiKey: string | null
   aiModel: string | null
+  ttsProvider?: string | null
+  ttsBaseURL?: string | null
+  ttsApiKey?: string | null
+  ttsModel?: string | null
+  asrProvider?: string | null
+  asrBaseURL?: string | null
+  asrApiKey?: string | null
+  asrModel?: string | null
 } | null): SettingsData {
   let tools: ToolToggles = { ...DEFAULT_TOOLS }
   try {
@@ -35,6 +44,10 @@ export function parseSettings(row: {
   let pageMode: PageMode = 'scroll'
   if (row?.pageMode === 'paged') pageMode = 'paged'
 
+  // Voice providers accept zai | custom | browser; anything else falls back to zai.
+  const voiceProvider = (v: string | null | undefined): VoiceProvider =>
+    v === 'custom' || v === 'browser' ? v : 'zai'
+
   return {
     id: row?.id ?? ID,
     clozeStyle,
@@ -46,6 +59,14 @@ export function parseSettings(row: {
     aiBaseURL: row?.aiBaseURL ?? '',
     aiApiKey: row?.aiApiKey ?? '',
     aiModel: row?.aiModel ?? '',
+    ttsProvider: voiceProvider(row?.ttsProvider),
+    ttsBaseURL: row?.ttsBaseURL ?? '',
+    ttsApiKey: row?.ttsApiKey ?? '',
+    ttsModel: row?.ttsModel ?? '',
+    asrProvider: voiceProvider(row?.asrProvider),
+    asrBaseURL: row?.asrBaseURL ?? '',
+    asrApiKey: row?.asrApiKey ?? '',
+    asrModel: row?.asrModel ?? '',
   }
 }
 

@@ -1,19 +1,68 @@
-// Text-to-speech via the z-ai SDK.
-// POST /api/tts   { text, voice?, speed? }  -> audio/wav
+// Text-to-speech — provider-aware.
+// POST /api/tts   { text, voice?, speed?, provider? }
 //
-// Splits the text into chunks of <=900 chars along Chinese / English sentence
-// boundaries, synthesises each chunk as WAV, extracts the PCM payload from
-// each WAV (the SDK emits non-standard AIGC/LIST chunks before `data`), and
-// concatenates the PCM into a single valid WAV file.
+// Providers (request `provider` overrides the settings ttsProvider):
+//   zai     -> z-ai SDK (default). Splits the text into <=900-char chunks on
+//              sentence boundaries, synthesises each chunk as WAV, extracts
+//              the PCM payload from each WAV (the SDK emits non-standard
+//              AIGC/LIST chunks before `data`), and concatenates the PCM into
+//              a single valid 44-byte-header WAV file. -> audio/wav
+//   custom  -> any OpenAI-compatible POST {baseURL}/audio/speech endpoint.
+//              Each chunk is requested as mp3 (frames concatenate); accepts
+//              raw audio/* responses or JSON envelopes with base64 audio
+//              (b64 / audio_b64 / data). -> upstream content-type or audio/mpeg
+//   browser -> Web Speech API on the client; the server only answers 400
+//              browser_mode (graceful fallback — the client normally won't
+//              call this endpoint in that mode).
 import { NextRequest, NextResponse } from 'next/server'
 import { getZAI } from '@/lib/zai'
+import { getSessionUser } from '@/lib/auth'
+import { db } from '@/lib/db'
 
 const MAX_CHUNK = 900
+const SETTINGS_ID = 'singleton'
+
+type TtsProvider = 'zai' | 'custom' | 'browser'
 
 interface FmtInfo {
   channels: number
   sampleRate: number
   bitsPerSample: number
+}
+
+function asProvider(v: unknown): TtsProvider | null {
+  return v === 'zai' || v === 'custom' || v === 'browser' ? v : null
+}
+
+function readString(v: unknown): string {
+  return typeof v === 'string' ? v : ''
+}
+
+/**
+ * Defensive settings read: parseSettings() in src/lib/settings.ts may not
+ * surface the tts* fields yet (another agent owns that file), so read the
+ * raw DB row directly and fall back gracefully (missing row/columns/DB -> zai).
+ */
+async function getTtsSettings(): Promise<{
+  provider: TtsProvider
+  baseURL: string
+  apiKey: string
+  model: string
+}> {
+  try {
+    const row = (await db.settings.findUnique({
+      where: { id: SETTINGS_ID },
+    })) as unknown as Record<string, unknown> | null
+    return {
+      provider: asProvider(row?.ttsProvider) ?? 'zai',
+      baseURL: readString(row?.ttsBaseURL),
+      apiKey: readString(row?.ttsApiKey),
+      model: readString(row?.ttsModel),
+    }
+  } catch {
+    // Schema/migration not applied yet — fall back to the built-in z-ai SDK.
+    return { provider: 'zai', baseURL: '', apiKey: '', model: '' }
+  }
 }
 
 /** Split text into chunks no longer than maxLen, breaking on sentence boundaries. */
@@ -91,17 +140,78 @@ function buildWav(pcm: Buffer, fmt: FmtInfo): Buffer {
   return Buffer.concat([header, pcm])
 }
 
+/**
+ * One OpenAI-compatible /audio/speech call for a single chunk.
+ * Accepts either raw audio/* bytes or a JSON envelope with base64 audio
+ * (b64 / audio_b64 / data fields).
+ */
+async function synthesizeCustomChunk(opts: {
+  baseURL: string
+  apiKey: string
+  model: string
+  chunk: string
+  voice: string
+  speed: number
+}): Promise<{ buffer: Buffer; contentType: string }> {
+  const url = `${opts.baseURL.replace(/\/$/, '')}/audio/speech`
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${opts.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: opts.model || 'tts-1',
+      input: opts.chunk,
+      voice: opts.voice || 'alloy',
+      speed: opts.speed,
+      response_format: 'mp3',
+      stream: false,
+    }),
+  })
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '')
+    throw new Error(`第三方 TTS 请求失败 (${res.status}): ${detail.slice(0, 200)}`)
+  }
+  const contentType = (res.headers.get('content-type') || '').toLowerCase()
+  if (contentType.startsWith('audio/')) {
+    return {
+      buffer: Buffer.from(new Uint8Array(await res.arrayBuffer())),
+      contentType,
+    }
+  }
+  // JSON envelope carrying base64 audio.
+  let payload: Record<string, unknown> = {}
+  try {
+    payload = (await res.json()) as Record<string, unknown>
+  } catch {
+    throw new Error('第三方 TTS 返回格式异常（既非 audio 也非 JSON）')
+  }
+  const b64 = [payload.b64, payload.audio_b64, payload.data].find(
+    (v) => typeof v === 'string' && v.length > 0
+  )
+  if (typeof b64 === 'string') {
+    return { buffer: Buffer.from(b64, 'base64'), contentType: 'audio/mpeg' }
+  }
+  throw new Error('第三方 TTS 返回 JSON 中缺少音频数据（b64/audio_b64/data）')
+}
+
 export async function POST(req: NextRequest) {
   try {
+    const user = await getSessionUser()
+    if (!user) {
+      return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
+
     const body = await req.json().catch(() => ({}))
     const text: string = typeof body?.text === 'string' ? body.text : ''
     if (!text.trim()) {
       return NextResponse.json({ error: '文本不能为空' }, { status: 400 })
     }
-    const voice: string =
+    const rawVoice: string =
       typeof body?.voice === 'string' && body.voice.trim()
         ? body.voice.trim()
-        : 'tongtong'
+        : ''
     let speed: number =
       typeof body?.speed === 'number' && Number.isFinite(body.speed)
         ? body.speed
@@ -109,7 +219,57 @@ export async function POST(req: NextRequest) {
     if (speed < 0.5) speed = 0.5
     if (speed > 2.0) speed = 2.0
 
+    // Provider: request override > settings ttsProvider > 'zai'.
+    const settings = await getTtsSettings()
+    const provider: TtsProvider = asProvider(body?.provider) ?? settings.provider
+
+    if (provider === 'browser') {
+      return NextResponse.json(
+        {
+          error: 'browser_mode',
+          message: '浏览器模式由前端 Web Speech API 合成，无需服务端',
+        },
+        { status: 400 }
+      )
+    }
+
     const chunks = splitTextIntoChunks(text, MAX_CHUNK)
+
+    if (provider === 'custom') {
+      if (!settings.baseURL || !settings.apiKey) {
+        return NextResponse.json(
+          { error: '请先在设置中配置第三方 TTS API' },
+          { status: 400 }
+        )
+      }
+      const voice = rawVoice || 'alloy'
+      const parts: Buffer[] = []
+      let upstreamType = ''
+      for (const chunk of chunks) {
+        const r = await synthesizeCustomChunk({
+          baseURL: settings.baseURL,
+          apiKey: settings.apiKey,
+          model: settings.model,
+          chunk,
+          voice,
+          speed,
+        })
+        if (!upstreamType) upstreamType = r.contentType
+        parts.push(r.buffer)
+      }
+      const audio = Buffer.concat(parts)
+      return new NextResponse(audio, {
+        status: 200,
+        headers: {
+          'Content-Type': upstreamType || 'audio/mpeg',
+          'Cache-Control': 'no-cache',
+          'Content-Length': String(audio.length),
+        },
+      })
+    }
+
+    // provider === 'zai' — built-in pipeline (audio/wav).
+    const voice = rawVoice || 'tongtong'
     const zai = await getZAI()
     const pcms: Buffer[] = []
     let fmt: FmtInfo | null = null
@@ -131,7 +291,7 @@ export async function POST(req: NextRequest) {
     const mergedPcm = Buffer.concat(pcms)
     const wav = buildWav(mergedPcm, fmt ?? { channels: 1, sampleRate: 24000, bitsPerSample: 16 })
 
-    return new NextResponse(wav, {
+    return new NextResponse(new Uint8Array(wav), {
       status: 200,
       headers: {
         'Content-Type': 'audio/wav',

@@ -6,8 +6,25 @@ export interface CardPlan {
   goal: number
 }
 
-// One doodle stroke: array of normalized [x, y] points (0..1 relative to content box).
-export type Stroke = [number, number][]
+// ---------- doodle strokes ----------
+export type Point = [number, number]
+
+export type DoodleTool = 'pen' | 'pencil' | 'marker' | 'brush' | 'eraser'
+
+// A styled doodle stroke (v2).
+export interface DoodleStroke {
+  pts: Point[]
+  color: string
+  width: number
+  tool: DoodleTool
+}
+
+// Legacy strokes were plain point arrays; they still render (black pen).
+export type Stroke = Point[] | DoodleStroke
+
+export function isDoodleStroke(s: Stroke): s is DoodleStroke {
+  return !Array.isArray(s)
+}
 
 export interface CardData {
   id: string
@@ -62,6 +79,12 @@ export const DEFAULT_TOOLS: ToolToggles = {
 
 export type PageMode = 'scroll' | 'paged'
 
+// Provider for TTS / ASR:
+//   zai     -> z-ai-web-dev-sdk (built-in)
+//   custom  -> any OpenAI-compatible endpoint (/audio/speech, /audio/transcriptions)
+//   browser -> Web Speech API (speechSynthesis / SpeechRecognition), no server needed
+export type VoiceProvider = 'zai' | 'custom' | 'browser'
+
 export interface SettingsData {
   id: string
   clozeStyle: ClozeStyle
@@ -73,11 +96,21 @@ export interface SettingsData {
   aiBaseURL: string
   aiApiKey: string
   aiModel: string
+  ttsProvider: VoiceProvider
+  ttsBaseURL: string
+  ttsApiKey: string
+  ttsModel: string
+  asrProvider: VoiceProvider
+  asrBaseURL: string
+  asrApiKey: string
+  asrModel: string
 }
 
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
+  /** data-URI images attached to (user) messages — vision requests. */
+  images?: string[]
 }
 
 export type QuizType = 'fill' | 'short' | 'choice'
@@ -92,6 +125,21 @@ export interface QuizQuestion {
 export interface MindNode {
   title: string
   children?: MindNode[]
+}
+
+// ---------- account ----------
+export interface AccountData {
+  id: string
+  username: string
+  avatar: string // data URL ('' = none)
+}
+
+// ---------- share ----------
+export interface ShareInfo {
+  token: string
+  /** ISO date or null = 无限 (never expires). */
+  expiresAt: string | null
+  createdAt: string
 }
 
 // TTS voice options supported by the z-ai SDK.

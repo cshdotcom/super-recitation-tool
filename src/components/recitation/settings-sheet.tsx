@@ -8,11 +8,13 @@ import {
   Globe,
   KeyRound,
   Loader2,
+  Mic,
   Trash2,
+  Volume2,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { CardData, SettingsData, ToolToggles } from '@/lib/types'
+import type { CardData, SettingsData, ToolToggles, VoiceProvider } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import {
@@ -62,6 +64,46 @@ const TOOL_TOGGLES: { key: keyof ToolToggles; label: string; desc: string }[] = 
   { key: 'wheel', label: '轮盘抽背', desc: '随机抽句背诵' },
 ]
 
+// Reusable radio row for the voice provider pickers.
+function VoiceProviderOptions({
+  prefix,
+  value,
+  onChange,
+  includeBrowser,
+}: {
+  prefix: string
+  value: VoiceProvider
+  onChange: (v: VoiceProvider) => void
+  includeBrowser: boolean
+}) {
+  const options: { value: VoiceProvider; label: string }[] = [
+    { value: 'zai', label: 'z-ai SDK（内置默认）' },
+    { value: 'custom', label: '第三方 OpenAI 兼容 API' },
+    ...(includeBrowser
+      ? ([{ value: 'browser', label: '浏览器 Web Speech（免费，用系统语音）' }] as const)
+      : []),
+  ]
+  return (
+    <RadioGroup
+      value={value}
+      onValueChange={(v) => onChange(v as VoiceProvider)}
+      className="gap-2.5"
+    >
+      {options.map((opt) => (
+        <div key={opt.value} className="flex items-center gap-2.5">
+          <RadioGroupItem value={opt.value} id={`${prefix}-${opt.value}`} />
+          <Label
+            htmlFor={`${prefix}-${opt.value}`}
+            className="cursor-pointer text-sm font-medium"
+          >
+            {opt.label}
+          </Label>
+        </div>
+      ))}
+    </RadioGroup>
+  )
+}
+
 function ToggleRow({
   label,
   desc,
@@ -109,7 +151,19 @@ export function SettingsSheet({
     aiApiKey: '',
     aiModel: '',
   })
+  // TTS / ASR voice drafts (saved via 保存语音设置 button)
+  const [voiceDraft, setVoiceDraft] = React.useState({
+    ttsProvider: 'zai' as VoiceProvider,
+    ttsBaseURL: '',
+    ttsApiKey: '',
+    ttsModel: '',
+    asrProvider: 'zai' as VoiceProvider,
+    asrBaseURL: '',
+    asrApiKey: '',
+    asrModel: '',
+  })
   const [saving, setSaving] = React.useState(false)
+  const [savingVoice, setSavingVoice] = React.useState(false)
 
   React.useEffect(() => {
     if (open && settings) {
@@ -118,6 +172,16 @@ export function SettingsSheet({
         aiBaseURL: settings.aiBaseURL,
         aiApiKey: settings.aiApiKey,
         aiModel: settings.aiModel,
+      })
+      setVoiceDraft({
+        ttsProvider: settings.ttsProvider,
+        ttsBaseURL: settings.ttsBaseURL,
+        ttsApiKey: settings.ttsApiKey,
+        ttsModel: settings.ttsModel,
+        asrProvider: settings.asrProvider,
+        asrBaseURL: settings.asrBaseURL,
+        asrApiKey: settings.asrApiKey,
+        asrModel: settings.asrModel,
       })
     }
   }, [open, settings])
@@ -136,6 +200,16 @@ export function SettingsSheet({
       toast.success('AI 模型设置已保存')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handleSaveVoice = async () => {
+    setSavingVoice(true)
+    try {
+      onChangeSettings({ ...voiceDraft })
+      toast.success('语音与识别设置已保存')
+    } finally {
+      setSavingVoice(false)
     }
   }
 
@@ -242,6 +316,149 @@ export function SettingsSheet({
                   </AlertDialogContent>
                 </AlertDialog>
               </div>
+            </div>
+          </section>
+
+          {/* ---------- 语音与识别 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">语音与识别</p>
+            <div className="space-y-3">
+              {/* TTS 朗读 */}
+              <div className="rounded-2xl border border-border bg-card px-4 py-4">
+                <div className="flex items-center gap-2 text-sm font-bold">
+                  <Volume2 className="size-4 text-muted-foreground" strokeWidth={1.75} />
+                  TTS 朗读
+                </div>
+                <div className="mt-3">
+                  <VoiceProviderOptions
+                    prefix="tts-provider"
+                    value={voiceDraft.ttsProvider}
+                    onChange={(v) => setVoiceDraft((d) => ({ ...d, ttsProvider: v }))}
+                    includeBrowser
+                  />
+                </div>
+
+                {voiceDraft.ttsProvider === 'browser' && (
+                  <p className="mt-3 rounded-xl bg-muted/60 px-3 py-2.5 text-xs leading-relaxed text-muted-foreground">
+                    使用系统内置语音，无需配置
+                  </p>
+                )}
+
+                {voiceDraft.ttsProvider === 'custom' && (
+                  <div className="mt-4 space-y-3">
+                    <div className="space-y-1.5">
+                      <Label htmlFor="tts-baseurl" className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <Globe className="size-3" /> API Base URL
+                      </Label>
+                      <Input
+                        id="tts-baseurl"
+                        value={voiceDraft.ttsBaseURL}
+                        onChange={(e) => setVoiceDraft((d) => ({ ...d, ttsBaseURL: e.target.value }))}
+                        placeholder="https://api.example.com/v1"
+                        className="h-10 rounded-xl"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="tts-apikey" className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <KeyRound className="size-3" /> API Key
+                      </Label>
+                      <Input
+                        id="tts-apikey"
+                        type="password"
+                        value={voiceDraft.ttsApiKey}
+                        onChange={(e) => setVoiceDraft((d) => ({ ...d, ttsApiKey: e.target.value }))}
+                        placeholder="sk-…"
+                        className="h-10 rounded-xl"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="tts-model" className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <Cpu className="size-3" /> 模型名称
+                      </Label>
+                      <Input
+                        id="tts-model"
+                        value={voiceDraft.ttsModel}
+                        onChange={(e) => setVoiceDraft((d) => ({ ...d, ttsModel: e.target.value }))}
+                        placeholder="tts-1 / cosyvoice 等"
+                        className="h-10 rounded-xl"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* ASR 识别 */}
+              <div className="rounded-2xl border border-border bg-card px-4 py-4">
+                <div className="flex items-center gap-2 text-sm font-bold">
+                  <Mic className="size-4 text-muted-foreground" strokeWidth={1.75} />
+                  ASR 识别
+                </div>
+                <div className="mt-3">
+                  <VoiceProviderOptions
+                    prefix="asr-provider"
+                    value={voiceDraft.asrProvider}
+                    onChange={(v) => setVoiceDraft((d) => ({ ...d, asrProvider: v }))}
+                    includeBrowser
+                  />
+                </div>
+
+                {voiceDraft.asrProvider === 'browser' && (
+                  <p className="mt-3 rounded-xl bg-muted/60 px-3 py-2.5 text-xs leading-relaxed text-muted-foreground">
+                    使用 Chrome/Edge 内置语音识别，需联网
+                  </p>
+                )}
+
+                {voiceDraft.asrProvider === 'custom' && (
+                  <div className="mt-4 space-y-3">
+                    <div className="space-y-1.5">
+                      <Label htmlFor="asr-baseurl" className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <Globe className="size-3" /> API Base URL
+                      </Label>
+                      <Input
+                        id="asr-baseurl"
+                        value={voiceDraft.asrBaseURL}
+                        onChange={(e) => setVoiceDraft((d) => ({ ...d, asrBaseURL: e.target.value }))}
+                        placeholder="https://api.example.com/v1"
+                        className="h-10 rounded-xl"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="asr-apikey" className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <KeyRound className="size-3" /> API Key
+                      </Label>
+                      <Input
+                        id="asr-apikey"
+                        type="password"
+                        value={voiceDraft.asrApiKey}
+                        onChange={(e) => setVoiceDraft((d) => ({ ...d, asrApiKey: e.target.value }))}
+                        placeholder="sk-…"
+                        className="h-10 rounded-xl"
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <Label htmlFor="asr-model" className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <Cpu className="size-3" /> 模型名称
+                      </Label>
+                      <Input
+                        id="asr-model"
+                        value={voiceDraft.asrModel}
+                        onChange={(e) => setVoiceDraft((d) => ({ ...d, asrModel: e.target.value }))}
+                        placeholder="whisper-1 / paraformer 等"
+                        className="h-10 rounded-xl"
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <Button
+                onClick={() => void handleSaveVoice()}
+                disabled={savingVoice}
+                className="h-10 w-full rounded-full bg-primary font-semibold"
+              >
+                {savingVoice && <Loader2 className="size-4 animate-spin" />}
+                保存语音设置
+              </Button>
             </div>
           </section>
 

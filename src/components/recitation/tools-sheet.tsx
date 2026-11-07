@@ -91,15 +91,21 @@ export function ToolsSheet({
     }
     switch (tool) {
       case 'tts':
-        return <TtsPlayer text={content} />
+        return <TtsPlayer text={content} settings={settings} />
       case 'asr':
-        return <AsrRecorder originalText={content} keywords={card.keywords} />
+        return (
+          <AsrRecorder
+            originalText={content}
+            keywords={card.keywords}
+            settings={settings}
+          />
+        )
       case 'quiz':
         return <QuizPanel content={content} keywords={card.keywords} />
       case 'supervise':
         return <ChatTool mode="supervise" content={content} />
       case 'ask':
-        return <ChatTool mode="ask" content={content} />
+        return <ChatTool mode="ask" content={content} allowImages />
       case 'mindmap':
         return <MindmapView content={content} />
       case 'earback':

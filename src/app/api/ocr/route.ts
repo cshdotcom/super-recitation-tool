@@ -1,4 +1,5 @@
-// OCR via the z-ai vision model.
+// OCR via the configured AI provider's vision model (z-ai SDK or any
+// OpenAI-compatible endpoint — see src/lib/ai.ts chatComplete).
 // Supports two input shapes:
 //   1) multipart/form-data, field "file"  (backward compatible, no crop)
 //   2) application/json: { image: dataURI, crop?: { x, y, width, height } }
@@ -7,7 +8,8 @@
 // server-side with sharp before being sent to the vision model.
 import sharp from 'sharp'
 import { NextRequest, NextResponse } from 'next/server'
-import { getZAI } from '@/lib/zai'
+import { chatComplete } from '@/lib/ai'
+import { getAIConfig } from '@/lib/settings'
 
 interface CropBox {
   x: number
@@ -23,35 +25,23 @@ interface OcrJsonBody {
 
 // Parse a data URI ("data:image/jpeg;base64,....") into { buffer, mime }.
 function parseDataURI(dataURI: string): { buffer: Buffer; mime: string } {
-  const match = /^data:([^;]+);base64,(.*)$/s.exec(dataURI.trim())
+  const match = /^data:([^;]+);base64,([\s\S]*)$/.exec(dataURI.trim())
   if (!match) throw new Error('图片格式不正确，需为 data URI')
   const mime = match[1] || 'image/jpeg'
   const buffer = Buffer.from(match[2], 'base64')
   return { buffer, mime }
 }
 
+const OCR_PROMPT =
+  '请识别并提取这张图片中的全部文字内容，保持原有的段落结构和标点符号。只返回提取的纯文字内容，不要加任何解释、前后缀或引号。'
+
 async function runVision(buffer: Buffer, mime: string): Promise<string> {
-  const zai = await getZAI()
-  const response = await zai.chat.completions.createVision({
-    model: 'glm-4.6v',
-    messages: [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'text',
-            text: '请识别并提取这张图片中的全部文字内容，保持原有的段落结构和标点符号。只返回提取的纯文字内容，不要加任何解释、前后缀或引号。',
-          },
-          {
-            type: 'image_url',
-            image_url: { url: `data:${mime};base64,${buffer.toString('base64')}` },
-          },
-        ],
-      },
-    ],
-    thinking: { type: 'disabled' },
-  })
-  return response.choices?.[0]?.message?.content ?? ''
+  const config = await getAIConfig()
+  const dataURI = `data:${mime};base64,${buffer.toString('base64')}`
+  return chatComplete(
+    [{ role: 'user', content: OCR_PROMPT, images: [dataURI] }],
+    config
+  )
 }
 
 export async function POST(req: NextRequest) {

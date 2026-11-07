@@ -1,6 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -12,7 +9,8 @@ datasource db {
 
 // A recitation / memorization card.
 // `keywords` : JSON string[] of words blanked out (挖空)
-// `strokes`  : JSON string[][] doodle strokes, each stroke = [x,y][] normalized 0..1 (涂鸦)
+// `strokes`  : JSON doodle strokes — legacy [x,y][] arrays or
+//              { pts:[x,y][], color, width, tool } objects (涂鸦)
 // `plan`     : JSON {"goal":number} daily recitation plan (今日计划)
 model Card {
   id        String   @id @default(cuid())
@@ -37,4 +35,42 @@ model Settings {
   aiBaseURL   String?
   aiApiKey    String?
   aiModel     String?
+  // TTS provider: zai | custom(OpenAI 兼容 /audio/speech) | browser(Web Speech API)
+  ttsProvider String  @default("zai")
+  ttsBaseURL  String?
+  ttsApiKey   String?
+  ttsModel    String?
+  // ASR provider: zai | custom(OpenAI 兼容 /audio/transcriptions) | browser(SpeechRecognition)
+  asrProvider String  @default("zai")
+  asrBaseURL  String?
+  asrApiKey   String?
+  asrModel    String?
+}
+
+// The single app account. Registration is only allowed while this table is
+// empty (初始化注册), afterwards login-only.
+model Account {
+  id           String   @id @default(cuid())
+  username     String   @unique
+  passwordHash String
+  avatar       String   @default("") // data URL (small, client-resized)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+// Server-side session tokens referenced by the httpOnly `sb_session` cookie.
+model Session {
+  token     String   @id
+  accountId String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+// One share link per card. expiresAt = null means 无限 (never expires).
+model Share {
+  id        String    @id @default(cuid())
+  token     String    @unique
+  cardId    String
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
 }

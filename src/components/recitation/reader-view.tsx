@@ -18,6 +18,7 @@ import {
   Network,
   Pencil,
   Settings2,
+  Share2,
   Sparkles,
   SquareSlash,
   Volume2,
@@ -51,6 +52,7 @@ import { ClozeText } from '@/components/recitation/cloze-text'
 import { DoodleCanvas } from '@/components/recitation/doodle-canvas'
 import { MoreSheet, type ClozeTemplate } from '@/components/recitation/more-sheet'
 import { PlanDialog } from '@/components/recitation/plan-dialog'
+import { ShareDialog } from '@/components/recitation/share-dialog'
 import { ToolsSheet } from '@/components/recitation/tools-sheet'
 
 type ReaderMode = null | 'chunk' | 'doodle' | 'brush' | 'manual'
@@ -124,6 +126,7 @@ export function ReaderView({
   const [toolsOpen, setToolsOpen] = React.useState(false)
   const [activeTool, setActiveTool] = React.useState<string | null>(null)
   const [planOpen, setPlanOpen] = React.useState(false)
+  const [shareOpen, setShareOpen] = React.useState(false)
 
   // paged mode indicator
   const [page, setPage] = React.useState(0)
@@ -414,6 +417,15 @@ export function ReaderView({
               <Button
                 variant="ghost"
                 size="icon"
+                aria-label="共享背书卡"
+                className="text-foreground/80"
+                onClick={() => setShareOpen(true)}
+              >
+                <Share2 className="size-5" strokeWidth={1.75} />
+              </Button>
+              <Button
+                variant="ghost"
+                size="icon"
                 aria-label="更多"
                 className="text-foreground/80"
                 onClick={() => setMoreOpen(true)}
@@ -452,7 +464,11 @@ export function ReaderView({
         </section>
 
         {/* ---------- Content ---------- */}
-        <section className="relative mt-4 min-h-[260px]" aria-label="正文">
+        {/* pb reserves space for the doodle toolbar overlay while 涂鸦 mode is on */}
+        <section
+          className={cn('relative mt-4 min-h-[260px]', mode === 'doodle' && 'pb-36')}
+          aria-label="正文"
+        >
           <DoodleCanvas
             strokes={card.strokes}
             onStrokesChange={(strokes) => onUpdateCard({ ...card, strokes })}
@@ -762,6 +778,8 @@ export function ReaderView({
           setPlanOpen(false)
         }}
       />
+
+      <ShareDialog card={card} open={shareOpen} onOpenChange={setShareOpen} />
     </>
   )
 }
