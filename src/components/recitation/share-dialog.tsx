@@ -73,7 +73,7 @@ export function ShareDialog({
     }
   }, [open, card.id])
 
-  const link = share ? `${origin}/?share=${share.token}` : ''
+  const link = share ? `${origin}/share/${share.token}` : ''
 
   const handleCreate = async () => {
     let days: number | null
