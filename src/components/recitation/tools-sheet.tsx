@@ -107,7 +107,15 @@ export function ToolsSheet({
       case 'ask':
         return <ChatTool mode="ask" content={content} allowImages />
       case 'mindmap':
-        return <MindmapView content={content} />
+        return (
+          <MindmapView
+            key={card.id}
+            content={content}
+            cardId={card.id}
+            cardTitle={card.title}
+            initialDocs={card.mindmaps ?? []}
+          />
+        )
       case 'earback':
         return <EarbackPanel content={content} />
       case 'copywrite':

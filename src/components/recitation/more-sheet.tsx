@@ -1,28 +1,27 @@
 'use client'
 
 import * as React from 'react'
-import { useTheme } from 'next-themes'
 import {
   ALargeSmall,
   BookText,
   Braces,
   Check,
   ChevronRight,
-  Circle,
   Copy,
   Download,
   FileOutput,
   FileText,
-  Moon,
+  Timer,
   Sparkles,
-  Sun,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { CardData, ClozeStyle, PageMode, SettingsData } from '@/lib/types'
+import type { CardData, ClozeStyle, PageMode, SettingsData, ThemeName } from '@/lib/types'
+import { THEME_OPTIONS } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { useLocalStorage } from '@/lib/use-local-storage'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
+import { FocusMode } from '@/components/recitation/focus-mode'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 
@@ -133,6 +132,55 @@ function ActionRow({
   )
 }
 
+// ---------- theme picker (白天/夜间/护眼/羊皮纸/跟随系统) ----------
+// Shared with settings-sheet; both persist via settings.theme.
+const THEME_DOTS: Record<string, React.ReactNode> = {
+  light: <span className="size-4 rounded-full border border-border bg-white" />,
+  dark: <span className="size-4 rounded-full border border-border bg-zinc-900" />,
+  green: <span className="size-4 rounded-full border border-border bg-[#C8E6C9]" />,
+  sepia: <span className="size-4 rounded-full border border-border bg-[#F5E6C8]" />,
+  system: (
+    <span
+      className="size-4 rounded-full border border-border"
+      style={{ background: 'linear-gradient(90deg, #ffffff 50%, #18181b 50%)' }}
+    />
+  ),
+}
+
+export function ThemePicker({
+  value,
+  onChange,
+}: {
+  value: ThemeName | 'system'
+  onChange: (t: ThemeName | 'system') => void
+}) {
+  return (
+    <div className="grid grid-cols-3 gap-2" role="radiogroup" aria-label="界面主题">
+      {THEME_OPTIONS.map((o) => {
+        const active = value === o.value
+        return (
+          <button
+            key={o.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              'flex items-center justify-center gap-1.5 rounded-xl border px-2 py-2.5 text-xs transition-colors',
+              active
+                ? 'border-emerald-600 bg-emerald-500/10 font-semibold text-emerald-600'
+                : 'border-border bg-card text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {THEME_DOTS[o.value]}
+            {o.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 export function MoreSheet({
   open,
   onOpenChange,
@@ -145,11 +193,11 @@ export function MoreSheet({
   onManualMode,
   onBrushMode,
 }: MoreSheetProps) {
-  const { theme, setTheme } = useTheme()
   const [tab, setTab] = React.useState<Tab>('cloze')
   const [ruleExpanded, setRuleExpanded] = React.useState(false)
   const [templateExpanded, setTemplateExpanded] = React.useState(false)
   const [fontSizeDraft, setFontSizeDraft] = React.useState(settings.fontSize)
+  const [focusOpen, setFocusOpen] = React.useState(false)
   const [showQuickBar, setShowQuickBar] = useLocalStorage<boolean>('showQuickBar', true)
   const [showToolBar, setShowToolBar] = useLocalStorage<boolean>('showToolBar', true)
 
@@ -203,7 +251,7 @@ export function MoreSheet({
       if (!res.ok) throw new Error('获取数据失败')
       const data = await res.json()
       downloadFile(
-        `超级背书-全部数据.json`,
+        `背书吧-全部数据.json`,
         JSON.stringify(data, null, 2),
         'application/json',
       )
@@ -214,9 +262,10 @@ export function MoreSheet({
   }
 
   return (
-    <BottomSheet open={open} onOpenChange={onOpenChange} title="更多" className="h-[80vh]">
-      {/* tab selector: 4 icon cards */}
-      <div className="mt-4 grid grid-cols-4 gap-2">
+    <>
+      <BottomSheet open={open} onOpenChange={onOpenChange} title="更多" className="h-[80vh]">
+        {/* tab selector: 4 icon cards */}
+        <div className="mt-4 grid grid-cols-4 gap-2">
         {TABS.map((t) => {
           const Icon = t.icon
           const active = tab === t.key
@@ -381,19 +430,34 @@ export function MoreSheet({
         {/* ---------------- 阅读设置 ---------------- */}
         {tab === 'read' && (
           <div className="space-y-4">
+            {/* 专注模式 entry */}
+            <button
+              type="button"
+              onClick={() => {
+                setFocusOpen(true)
+                onOpenChange(false)
+              }}
+              className="flex w-full items-center gap-3 rounded-2xl border border-border bg-card px-4 py-4 text-left transition-colors hover:bg-accent/50"
+            >
+              <span className="flex size-10 items-center justify-center rounded-xl bg-emerald-500/10">
+                <Timer className="size-5 text-emerald-600" strokeWidth={1.5} />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-bold">专注模式</span>
+                <span className="block text-xs text-muted-foreground">
+                  全屏倒计时，免打扰沉浸式背书
+                </span>
+              </span>
+              <ChevronRight className="size-4 text-muted-foreground/60" strokeWidth={1.75} />
+            </button>
+
             <div className="rounded-2xl border border-border bg-card">
               <div className="border-b border-border/60 px-4 py-3.5">
-                <p className="text-sm font-bold">阅读模式</p>
+                <p className="text-sm font-bold">界面主题</p>
                 <div className="mt-2.5">
-                  <Segmented<'system' | 'light' | 'dark'>
-                    ariaLabel="阅读模式"
-                    value={(theme as 'system' | 'light' | 'dark') ?? 'system'}
-                    onChange={setTheme}
-                    options={[
-                      { value: 'system', label: '跟随', icon: Circle },
-                      { value: 'light', label: '日间', icon: Sun },
-                      { value: 'dark', label: '夜间', icon: Moon },
-                    ]}
+                  <ThemePicker
+                    value={settings.theme}
+                    onChange={(t) => onChangeSettings({ theme: t })}
                   />
                 </div>
               </div>
@@ -550,5 +614,9 @@ export function MoreSheet({
         )}
       </div>
     </BottomSheet>
+
+      {/* 专注模式 fullscreen overlay (renders above the sheet) */}
+      {focusOpen && <FocusMode card={card} onExit={() => setFocusOpen(false)} />}
+    </>
   )
 }

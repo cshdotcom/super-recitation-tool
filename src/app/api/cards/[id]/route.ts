@@ -1,6 +1,6 @@
 // Single-card endpoints (require login).
 // GET    /api/cards/:id   -> fetch one card
-// PATCH  /api/cards/:id   -> partial update (title/content/keywords/strokes/plan)
+// PATCH  /api/cards/:id   -> partial update (title/content/keywords/strokes/plan/mindmaps)
 // DELETE /api/cards/:id   -> remove
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
@@ -73,6 +73,13 @@ export async function PATCH(
       ) {
         data.plan = JSON.stringify({ goal: Math.min(200, Math.max(1, Math.round(body.plan.goal))) })
       }
+    }
+    // 思维导图 mindmaps: array of MindmapDoc objects (persisted JSON)
+    if (Array.isArray(body?.mindmaps)) {
+      const docs = body.mindmaps.filter(
+        (m: unknown) => m && typeof m === 'object'
+      )
+      data.mindmaps = JSON.stringify(docs.slice(0, 50))
     }
 
     const updated = await db.card.update({

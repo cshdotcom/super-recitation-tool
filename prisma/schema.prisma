@@ -7,23 +7,28 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// A recitation / memorization card.
+// A recitation / memorization card. Every record gets a UUID.
 // `keywords` : JSON string[] of words blanked out (挖空)
 // `strokes`  : JSON doodle strokes — legacy [x,y][] arrays or
 //              { pts:[x,y][], color, width, tool } objects (涂鸦)
 // `plan`     : JSON {"goal":number} daily recitation plan (今日计划)
+// `mindmaps` : JSON MindmapDoc[] saved mind maps for this card (思维导图)
 model Card {
-  id        String   @id @default(cuid())
+  id        String   @id @default(uuid())
   title     String
   content   String
   keywords  String   @default("[]")
   strokes   String   @default("[]")
   plan      String   @default("")
+  mindmaps  String   @default("[]")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
 
 // Singleton settings row (id = "singleton").
+// `theme`     : light | dark | green(护眼) | sepia(羊皮纸) | system
+// `voicePrefs`: JSON per-context TTS/ASR voice defaults
+//               { [ctx:string]: { tts:{provider,voice,speed,voiceURI}, asr:{provider,lang} } }
 model Settings {
   id          String  @id
   clozeStyle  String  @default("circle")    // circle(圈圈) | underline(下划线)
@@ -31,6 +36,8 @@ model Settings {
   tools       String  @default("")          // JSON ToolToggles
   fontSize    Int     @default(18)          // 字体设置 (px)
   pageMode    String  @default("scroll")    // scroll(上下滑动) | paged(左右滑动)
+  theme       String  @default("system")    // light | dark | green | sepia | system
+  voicePrefs  String  @default("{}")        // JSON per-context voice defaults
   aiProvider  String  @default("zai")       // zai | custom
   aiBaseURL   String?
   aiApiKey    String?
@@ -50,7 +57,7 @@ model Settings {
 // The single app account. Registration is only allowed while this table is
 // empty (初始化注册), afterwards login-only.
 model Account {
-  id           String   @id @default(cuid())
+  id           String   @id @default(uuid())
   username     String   @unique
   passwordHash String
   avatar       String   @default("") // data URL (small, client-resized)
@@ -68,7 +75,7 @@ model Session {
 
 // One share link per card. expiresAt = null means 无限 (never expires).
 model Share {
-  id        String    @id @default(cuid())
+  id        String    @id @default(uuid())
   token     String    @unique
   cardId    String
   expiresAt DateTime?

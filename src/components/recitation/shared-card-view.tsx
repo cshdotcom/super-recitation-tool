@@ -196,7 +196,7 @@ export function SharedCardView({ token, onExit }: SharedCardViewProps) {
       <footer className="mt-auto border-t bg-background">
         <div className="mx-auto flex max-w-2xl items-center justify-center gap-1.5 px-4 py-3 text-[11px] text-muted-foreground">
           <BookOpenText className="size-3.5 text-emerald-600" strokeWidth={1.75} />
-          来自超级背书工具的分享
+          来自背书吧的分享
         </div>
       </footer>
     </div>

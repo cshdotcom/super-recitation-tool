@@ -33,6 +33,7 @@ export interface CardData {
   keywords: string[]
   strokes: Stroke[] // 涂鸦笔迹 (persisted)
   plan: CardPlan | null
+  mindmaps: MindmapDoc[] // 已保存的思维导图
   createdAt: string
   updatedAt: string
 }
@@ -85,6 +86,49 @@ export type PageMode = 'scroll' | 'paged'
 //   browser -> Web Speech API (speechSynthesis / SpeechRecognition), no server needed
 export type VoiceProvider = 'zai' | 'custom' | 'browser'
 
+// App themes (白天/晚上/护眼/羊皮纸). Persisted server-side in Settings.theme.
+export type ThemeName = 'light' | 'dark' | 'green' | 'sepia'
+export const THEME_OPTIONS: { value: ThemeName | 'system'; label: string }[] = [
+  { value: 'light', label: '白天模式' },
+  { value: 'dark', label: '夜间模式' },
+  { value: 'green', label: '护眼模式' },
+  { value: 'sepia', label: '羊皮纸模式' },
+  { value: 'system', label: '跟随系统' },
+]
+
+/** Voice/rate defaults for one context (朗读/背书酱/督背/问问/出题...). */
+export interface VoicePrefTTS {
+  provider: VoiceProvider
+  /** z-ai voice name or OpenAI voice id */
+  voice: string
+  /** playback speed 0.5 - 3 */
+  speed: number
+  /** browser speechSynthesis voiceURI (browser provider only) */
+  voiceURI?: string
+}
+export interface VoicePrefASR {
+  provider: VoiceProvider
+  /** recognition language (browser provider only) */
+  lang?: string
+}
+export interface VoicePref {
+  tts?: VoicePrefTTS
+  asr?: VoicePrefASR
+}
+/** map of context key -> pref, e.g. { reader: { tts: {...} }, ask: {...} } */
+export type VoicePrefs = Record<string, VoicePref>
+export const VOICE_CONTEXTS = [
+  'reader',    // AI 朗读
+  'tts',       // 朗读文本工具
+  'asr',       // 背诵录音识别
+  'supervise', // AI 督背
+  'quiz',      // 出题
+  'ask',       // AI 问问
+  'earback',   // 磨耳朵
+  'copywrite', // 默写
+] as const
+export type VoiceContext = (typeof VOICE_CONTEXTS)[number]
+
 export interface SettingsData {
   id: string
   clozeStyle: ClozeStyle
@@ -92,6 +136,8 @@ export interface SettingsData {
   tools: ToolToggles
   fontSize: number
   pageMode: PageMode
+  theme: ThemeName | 'system'
+  voicePrefs: VoicePrefs
   aiProvider: 'zai' | 'custom'
   aiBaseURL: string
   aiApiKey: string
@@ -123,8 +169,21 @@ export interface QuizQuestion {
 }
 
 export interface MindNode {
+  id: string
   title: string
   children?: MindNode[]
+}
+
+/** A saved mind map document (per card). */
+export interface MindmapDoc {
+  id: string
+  title: string
+  /** scope label, e.g. 第1页 / 全文 */
+  scope?: string
+  levels?: number
+  root: MindNode
+  createdAt?: string
+  updatedAt?: string
 }
 
 // ---------- account ----------

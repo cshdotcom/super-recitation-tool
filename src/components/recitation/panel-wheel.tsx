@@ -2,11 +2,13 @@
 
 import * as React from 'react'
 import { motion } from 'framer-motion'
-import { Check, Loader2, RotateCw, Volume2 } from 'lucide-react'
+import { Check, Loader2, RotateCw, Square, Volume2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
 import { splitSentences } from '@/lib/sentences'
+import { useSettingsLite } from '@/lib/voice-prefs'
+import { useQuickTts, VoiceSpeedBar } from '@/components/recitation/tts-player'
 import { Button } from '@/components/ui/button'
 
 interface WheelPanelProps {
@@ -15,6 +17,8 @@ interface WheelPanelProps {
 
 // 轮盘抽背：随机抽一句来背
 export function WheelPanel({ content }: WheelPanelProps) {
+  const settings = useSettingsLite()
+  const tts = useQuickTts('wheel', settings)
   const sentences = React.useMemo(() => splitSentences(content), [content])
   const segments = React.useMemo(
     () => sentences.slice(0, 8).map((s, i) => ({ text: s, label: `第${i + 1}句` })),
@@ -25,21 +29,12 @@ export function WheelPanel({ content }: WheelPanelProps) {
   const [spinning, setSpinning] = React.useState(false)
   const [picked, setPicked] = React.useState<number | null>(null)
   const [mastered, setMastered] = React.useState<Set<number>>(new Set())
-  const [speaking, setSpeaking] = React.useState(false)
-
-  const audioUrlRef = React.useRef<string | null>(null)
 
   React.useEffect(() => {
     setPicked(null)
     setMastered(new Set())
     setRotation(0)
   }, [content])
-
-  React.useEffect(() => {
-    return () => {
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current)
-    }
-  }, [])
 
   if (segments.length === 0) {
     return (
@@ -73,32 +68,13 @@ export function WheelPanel({ content }: WheelPanelProps) {
     }, 2700)
   }
 
-  const handleSpeak = async () => {
+  const handleSpeak = () => {
     if (picked === null) return
-    setSpeaking(true)
-    const tid = toast.loading('正在生成语音…')
-    try {
-      const res = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: segments[picked].text }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.error || '生成语音失败')
-      }
-      const blob = await res.blob()
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current)
-      const url = URL.createObjectURL(blob)
-      audioUrlRef.current = url
-      const audio = new Audio(url)
-      toast.success('开始朗读', { id: tid })
-      await audio.play().catch(() => {})
-    } catch (err) {
-      toast.error('朗读失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
-    } finally {
-      setSpeaking(false)
+    if (tts.speaking) {
+      tts.stop()
+      return
     }
+    tts.speak(segments[picked].text)
   }
 
   const handleMastered = () => {
@@ -180,19 +156,24 @@ export function WheelPanel({ content }: WheelPanelProps) {
             )}
           </div>
           <p className="mt-3 text-lg font-medium leading-loose">{segments[picked].text}</p>
+
+          {/* 音色/倍速选择（可设为默认） */}
+          <div className="mt-3 flex">
+            <VoiceSpeedBar context="wheel" pref={tts.pref} onChange={tts.setPref} />
+          </div>
+
           <div className="mt-3 flex gap-2">
             <Button
               variant="outline"
               className="h-10 flex-1 rounded-full"
-              onClick={() => void handleSpeak()}
-              disabled={speaking}
+              onClick={handleSpeak}
             >
-              {speaking ? (
-                <Loader2 className="size-4 animate-spin" />
+              {tts.speaking ? (
+                <Square className="size-4" />
               ) : (
                 <Volume2 className="size-4" strokeWidth={1.75} />
               )}
-              朗读
+              {tts.speaking ? '停止' : '朗读'}
             </Button>
             <Button
               className={cn(

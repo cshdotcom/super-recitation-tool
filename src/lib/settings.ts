@@ -8,6 +8,7 @@ import {
   type ClozeStyle,
   type PageMode,
   type VoiceProvider,
+  type VoicePrefs,
 } from './types'
 
 const ID = 'singleton'
@@ -19,6 +20,8 @@ export function parseSettings(row: {
   tools: string
   fontSize: number
   pageMode: string
+  theme?: string | null
+  voicePrefs?: string | null
   aiProvider: string
   aiBaseURL: string | null
   aiApiKey: string | null
@@ -44,6 +47,19 @@ export function parseSettings(row: {
   let pageMode: PageMode = 'scroll'
   if (row?.pageMode === 'paged') pageMode = 'paged'
 
+  const theme =
+    row?.theme === 'light' ||
+    row?.theme === 'dark' ||
+    row?.theme === 'green' ||
+    row?.theme === 'sepia'
+      ? row.theme
+      : 'system'
+
+  let voicePrefs: VoicePrefs = {}
+  try {
+    if (row?.voicePrefs) voicePrefs = JSON.parse(row.voicePrefs) as VoicePrefs
+  } catch {}
+
   // Voice providers accept zai | custom | browser; anything else falls back to zai.
   const voiceProvider = (v: string | null | undefined): VoiceProvider =>
     v === 'custom' || v === 'browser' ? v : 'zai'
@@ -55,6 +71,8 @@ export function parseSettings(row: {
     tools,
     fontSize: typeof row?.fontSize === 'number' ? row.fontSize : 18,
     pageMode,
+    theme,
+    voicePrefs,
     aiProvider: (row?.aiProvider as 'zai' | 'custom') || 'zai',
     aiBaseURL: row?.aiBaseURL ?? '',
     aiApiKey: row?.aiApiKey ?? '',

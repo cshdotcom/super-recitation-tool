@@ -3,6 +3,7 @@
 import * as React from 'react'
 import {
   Brush,
+  Download,
   Eraser,
   Highlighter,
   Palette,
@@ -13,9 +14,11 @@ import {
   Undo2,
   type LucideIcon,
 } from 'lucide-react'
+import { toast } from 'sonner'
 
 import { Slider } from '@/components/ui/slider'
 import { cn } from '@/lib/utils'
+import { LongPressMenu, type MenuAction } from '@/components/recitation/long-press-menu'
 import {
   isDoodleStroke,
   type DoodleStroke,
@@ -29,6 +32,8 @@ interface DoodleCanvasProps {
   onStrokesChange: (strokes: Stroke[]) => void
   /** When true, the canvas accepts pointer input (涂鸦 mode active). */
   active: boolean
+  /** Full override of the canvas long-press / right-click menu actions. */
+  menuActions?: MenuAction[]
 }
 
 // Ink used for legacy strokes (plain point arrays) — dark-mode aware.
@@ -44,6 +49,10 @@ const PENCIL_JITTER: [number, number][] = [
 // 8 preset swatches; the first is the theme-aware default ink.
 const WHEEL_GRADIENT =
   'conic-gradient(#ef4444,#f97316,#eab308,#22c55e,#14b8a6,#3b82f6,#a855f7,#ec4899,#ef4444)'
+// Custom palette (up to 8 user-picked colors) persisted in localStorage.
+const CUSTOM_COLORS_KEY = 'beishuba-doodle-colors'
+const MAX_CUSTOM_COLORS = 8
+const TOOL_CYCLE: DoodleTool[] = ['pen', 'pencil', 'marker', 'brush']
 
 const TOOLS: { key: DoodleTool; label: string; icon: LucideIcon }[] = [
   { key: 'pen', label: '钢笔', icon: PenTool },
@@ -183,7 +192,7 @@ function strokesArraysEqual(a: Stroke[] | null, b: Stroke[]): boolean {
 // normalized [x,y] points (0..1) so they survive resizes and are persisted
 // to the backend via the parent's debounced card PATCH. A pill toolbar with
 // tool/color/width controls and undo/redo/clear renders while `active`.
-export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasProps) {
+export function DoodleCanvas({ strokes, onStrokesChange, active, menuActions }: DoodleCanvasProps) {
   const wrapRef = React.useRef<HTMLDivElement>(null)
   const canvasRef = React.useRef<HTMLCanvasElement>(null)
   const drawingRef = React.useRef(false)
@@ -200,6 +209,12 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
   const [tool, setTool] = React.useState<DoodleTool>('pen')
   const [color, setColor] = React.useState(LIGHT_INK)
   const [width, setWidth] = React.useState(4)
+  // Custom palette (localStorage-persisted) + inline palette expansion in the
+  // long-press menu.
+  const [customColors, setCustomColors] = React.useState<string[]>([])
+  const [colorsExpanded, setColorsExpanded] = React.useState(false)
+  // Last non-eraser tool, so 切换橡皮 can toggle back.
+  const lastToolRef = React.useRef<DoodleTool>('pen')
 
   const darkInk = React.useCallback(() => systemInk(), [])
 
@@ -208,11 +223,49 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
     setColor(darkInk())
   }, [darkInk])
 
+  // Load the persisted custom palette once.
+  React.useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(CUSTOM_COLORS_KEY)
+      if (!raw) return
+      const arr: unknown = JSON.parse(raw)
+      if (Array.isArray(arr)) {
+        setCustomColors(arr.filter((c): c is string => typeof c === 'string').slice(0, MAX_CUSTOM_COLORS))
+      }
+    } catch {
+      // corrupted localStorage — ignore
+    }
+  }, [])
+
+  const addCustomColor = (c: string) => {
+    setCustomColors((prev) => {
+      const next = [c, ...prev.filter((x) => x !== c)].slice(0, MAX_CUSTOM_COLORS)
+      try {
+        window.localStorage.setItem(CUSTOM_COLORS_KEY, JSON.stringify(next))
+      } catch {
+        // storage full / unavailable — palette still works for this session
+      }
+      return next
+    })
+  }
+
+  const pickCustomColor = (c: string) => {
+    setColor(c)
+    addCustomColor(c)
+  }
+
+  // Menu color picks: apply without re-adding colors that are already in the
+  // preset / custom palette.
+  const applyColor = (c: string) => {
+    setColor(c)
+    if (!presetColors.includes(c) && !customColors.includes(c)) addCustomColor(c)
+  }
+
   const presetColors = React.useMemo(
     () => [systemInk(), '#ef4444', '#f97316', '#eab308', '#22c55e', '#14b8a6', '#3b82f6', '#ec4899'],
     [],
   )
-  const isCustomColor = !presetColors.includes(color)
+  const isCustomColor = !presetColors.includes(color) && !customColors.includes(color)
 
   const emit = (next: Stroke[]) => {
     emittedRef.current = next
@@ -334,6 +387,15 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
     ]
   }
 
+  // Drop an in-progress stroke without committing (e.g. when the long-press
+  // menu opens mid-gesture — the triggering pointerdown must leave no dot).
+  const cancelStroke = () => {
+    if (!drawingRef.current && !currentRef.current) return
+    drawingRef.current = false
+    currentRef.current = null
+    scheduleRedraw()
+  }
+
   const pushPoint = (clientX: number, clientY: number) => {
     const cur = currentRef.current
     if (!cur) return
@@ -345,6 +407,7 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
 
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     if (!active || drawingRef.current) return
+    if (e.button !== 0) return // primary button only; right-click opens the menu
     e.preventDefault()
     try {
       e.currentTarget.setPointerCapture(e.pointerId)
@@ -403,6 +466,156 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
   const canUndo = strokes.length > 0
   const canRedo = redoDepth > 0
 
+  // ---------- long-press / right-click menu (extra quick path) ----------
+
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+
+  const exportPNG = () => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    canvas.toBlob((blob) => {
+      if (!blob) {
+        toast.error('导出失败，请重试')
+        return
+      }
+      downloadBlob(blob, `涂鸦-${Date.now()}.png`)
+      toast.success('已导出 PNG 图片')
+    }, 'image/png')
+  }
+
+  const cycleTool = () => {
+    if (tool === 'eraser') {
+      setTool(lastToolRef.current)
+      return
+    }
+    const idx = TOOL_CYCLE.indexOf(tool)
+    setTool(TOOL_CYCLE[(idx + 1) % TOOL_CYCLE.length])
+  }
+
+  const toggleEraser = () => {
+    if (tool === 'eraser') {
+      setTool(lastToolRef.current)
+    } else {
+      lastToolRef.current = tool
+      setTool('eraser')
+    }
+  }
+
+  const selectTool = (t: DoodleTool) => {
+    if (t !== 'eraser') lastToolRef.current = t
+    setTool(t)
+  }
+
+  const COLOR_NAMES: Record<string, string> = {
+    [LIGHT_INK]: '墨黑',
+    [DARK_INK]: '月白',
+    '#ef4444': '红',
+    '#f97316': '橙',
+    '#eab308': '黄',
+    '#22c55e': '绿',
+    '#14b8a6': '青',
+    '#3b82f6': '蓝',
+    '#ec4899': '粉',
+  }
+
+  const paletteActions: MenuAction[] = [
+    ...presetColors.map((c) => ({
+      key: `color:${c}`,
+      label: COLOR_NAMES[c] ?? c,
+      icon: <span className="size-3 rounded-full border border-black/10" style={{ backgroundColor: c }} />,
+    })),
+    ...customColors
+      .filter((c) => !presetColors.includes(c)) // avoid duplicate action keys
+      .map((c) => ({
+        key: `color:${c}`,
+        label: COLOR_NAMES[c] ?? '自定义',
+        icon: <span className="size-3 rounded-full border border-black/10" style={{ backgroundColor: c }} />,
+      })),
+  ]
+
+  const defaultCanvasMenuActions: MenuAction[] = [
+    { key: 'switch-tool', label: '切换画笔', icon: <PenTool className="size-3.5" strokeWidth={1.75} /> },
+    {
+      key: 'eraser',
+      label: tool === 'eraser' ? '退出橡皮' : '切换橡皮',
+      icon: <Eraser className="size-3.5" strokeWidth={1.75} />,
+    },
+    { key: 'width-2', label: '宽度 2', icon: <span className="size-1.5 rounded-full bg-current" /> },
+    { key: 'width-4', label: '宽度 4', icon: <span className="size-2.5 rounded-full bg-current" /> },
+    { key: 'width-8', label: '宽度 8', icon: <span className="size-3.5 rounded-full bg-current" /> },
+    { key: 'width-14', label: '宽度 14', icon: <span className="size-4 rounded-full bg-current" /> },
+    {
+      key: 'colors',
+      label: colorsExpanded ? '收起颜色' : '常用颜色',
+      icon: <Palette className="size-3.5" strokeWidth={1.75} />,
+      keepOpen: true,
+    },
+    ...(colorsExpanded ? paletteActions : []),
+    { key: 'undo', label: '撤销', icon: <Undo2 className="size-3.5" strokeWidth={1.75} />, disabled: !canUndo },
+    { key: 'redo', label: '重做', icon: <Redo2 className="size-3.5" strokeWidth={1.75} />, disabled: !canRedo },
+    {
+      key: 'clear',
+      label: '清空',
+      icon: <Trash2 className="size-3.5" strokeWidth={1.75} />,
+      danger: true,
+      disabled: strokes.length === 0,
+    },
+    { key: 'export', label: '导出PNG', icon: <Download className="size-3.5" strokeWidth={1.75} /> },
+  ]
+
+  const resolvedMenuActions = menuActions ?? defaultCanvasMenuActions
+
+  const handleMenuAction = (key: string) => {
+    switch (key) {
+      case 'switch-tool':
+        cycleTool()
+        break
+      case 'eraser':
+        toggleEraser()
+        break
+      case 'width-2':
+        setWidth(2)
+        break
+      case 'width-4':
+        setWidth(4)
+        break
+      case 'width-8':
+        setWidth(8)
+        break
+      case 'width-14':
+        setWidth(14)
+        break
+      case 'colors':
+        setColorsExpanded((v) => !v)
+        break
+      case 'undo':
+        undo()
+        break
+      case 'redo':
+        redo()
+        break
+      case 'clear':
+        clearAll()
+        break
+      case 'export':
+        exportPNG()
+        break
+      default:
+        if (key.startsWith('color:')) {
+          applyColor(key.slice(6))
+        }
+    }
+  }
+
   return (
     <div
       ref={wrapRef}
@@ -415,15 +628,22 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
       )}
       aria-hidden={!active}
     >
-      <canvas
-        ref={canvasRef}
-        className={cn('absolute inset-0 h-full w-full', active && 'cursor-crosshair touch-none')}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
-        onPointerCancel={handlePointerCancel}
-        onLostPointerCapture={handlePointerUp}
-      />
+      <LongPressMenu
+        asChild
+        actions={resolvedMenuActions}
+        onAction={handleMenuAction}
+        onOpen={cancelStroke}
+      >
+        <canvas
+          ref={canvasRef}
+          className={cn('absolute inset-0 h-full w-full', active && 'cursor-crosshair touch-none')}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerCancel}
+          onLostPointerCapture={handlePointerUp}
+        />
+      </LongPressMenu>
 
       {active && (
         <div className="absolute inset-x-2 bottom-2 z-20 rounded-2xl border border-border bg-background/95 p-2 shadow-xl backdrop-blur">
@@ -438,7 +658,7 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
                   type="button"
                   aria-pressed={isActive}
                   title={t.label}
-                  onClick={() => setTool(t.key)}
+                  onClick={() => selectTool(t.key)}
                   className={cn(
                     'flex w-11 shrink-0 flex-col items-center gap-0.5 rounded-xl py-1 text-[10px] transition-colors',
                     isActive
@@ -489,9 +709,23 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
           <div className="no-scrollbar mt-1.5 flex items-center gap-1.5 overflow-x-auto px-1" role="toolbar" aria-label="涂鸦颜色">
             {presetColors.map((c, i) => (
               <button
-                key={c}
+                key={`preset-${c}`}
                 type="button"
                 aria-label={i === 0 ? '默认墨色' : `颜色 ${c}`}
+                aria-pressed={color === c}
+                onClick={() => setColor(c)}
+                className={cn(
+                  'size-5 shrink-0 rounded-full border border-black/10 shadow-sm transition-transform dark:border-white/25',
+                  color === c ? 'scale-110 ring-2 ring-emerald-600 ring-offset-1 ring-offset-background' : 'hover:scale-110',
+                )}
+                style={{ backgroundColor: c }}
+              />
+            ))}
+            {customColors.map((c, i) => (
+              <button
+                key={`custom-${c}-${i}`}
+                type="button"
+                aria-label={`自定义颜色 ${c}`}
                 aria-pressed={color === c}
                 onClick={() => setColor(c)}
                 className={cn(
@@ -516,7 +750,7 @@ export function DoodleCanvas({ strokes, onStrokesChange, active }: DoodleCanvasP
               <input
                 type="color"
                 value={color}
-                onChange={(e) => setColor(e.target.value)}
+                onChange={(e) => pickCustomColor(e.target.value)}
                 aria-label="自定义颜色"
                 className="absolute inset-0 size-full cursor-pointer opacity-0"
               />

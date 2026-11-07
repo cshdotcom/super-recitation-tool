@@ -1,14 +1,23 @@
 'use client'
 
 import * as React from 'react'
-import { Mic, Square, Loader2, RotateCcw, CheckCircle2, XCircle } from 'lucide-react'
+import { Mic, Square, Loader2, RotateCcw, CheckCircle2, XCircle, Star } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
-import type { SettingsData } from '@/lib/types'
+import type { SettingsData, VoiceProvider } from '@/lib/types'
 import { similarity, normalize } from '@/lib/cloze'
+import { saveVoicePref } from '@/lib/voice-prefs'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 
 // ---------- minimal local types for the Web Speech recognition API ----------
 // (kept local so we don't depend on lib.dom SpeechRecognition typings)
@@ -66,6 +75,8 @@ interface AsrRecorderProps {
   originalText: string
   keywords: string[]
   settings: SettingsData
+  /** Feature context key for per-context voice defaults (VOICE_CONTEXTS). */
+  context?: string
 }
 
 interface AsrResult {
@@ -79,8 +90,15 @@ export function AsrRecorder({
   originalText,
   keywords,
   settings,
+  context = 'asr',
 }: AsrRecorderProps) {
-  const provider = settings.asrProvider
+  // Per-context ASR defaults captured once on mount (fall back to global).
+  const [seeded] = React.useState(() => settings.voicePrefs?.[context]?.asr)
+  const [provider, setProvider] = React.useState<VoiceProvider>(
+    () => seeded?.provider ?? settings.asrProvider,
+  )
+  // Recognition language (browser provider): zh-CN / en-US / auto(中英混合).
+  const [lang, setLang] = React.useState<string>(() => seeded?.lang ?? 'zh-CN')
 
   const [recording, setRecording] = React.useState(false)
   const [loading, setLoading] = React.useState(false)
@@ -281,7 +299,7 @@ export function AsrRecorder({
     recordingRef.current = true
 
     const recog = new Ctor()
-    recog.lang = 'zh-CN'
+    recog.lang = lang === 'auto' ? '' : lang
     recog.continuous = true
     recog.interimResults = true
     recog.maxAlternatives = 1
@@ -381,6 +399,15 @@ export function AsrRecorder({
 
   const browserUnavailable = provider === 'browser' && !supported
 
+  const handleSaveDefault = () => {
+    void saveVoicePref(context, {
+      asr: {
+        provider,
+        ...(provider === 'browser' ? { lang } : {}),
+      },
+    })
+  }
+
   const scoreColor =
     result == null
       ? ''
@@ -392,6 +419,46 @@ export function AsrRecorder({
 
   return (
     <div className="flex flex-col gap-4">
+      {/* provider + language pickers */}
+      <div className="flex flex-col gap-3 rounded-xl border border-border bg-muted/30 p-3">
+        <div className="flex items-center gap-2">
+          <Label className="shrink-0 text-xs text-muted-foreground">识别引擎</Label>
+          <Select value={provider} onValueChange={(v) => setProvider(v as VoiceProvider)}>
+            <SelectTrigger className="h-8 flex-1 rounded-lg text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="zai">AI云端（z-ai）</SelectItem>
+              <SelectItem value="custom">第三方 API</SelectItem>
+              <SelectItem value="browser">浏览器内置</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        {provider === 'browser' && (
+          <div className="flex items-center gap-2">
+            <Label className="shrink-0 text-xs text-muted-foreground">换语言</Label>
+            <Select value={lang} onValueChange={setLang}>
+              <SelectTrigger className="h-8 flex-1 rounded-lg text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="zh-CN">中文普通话</SelectItem>
+                <SelectItem value="en-US">English (US)</SelectItem>
+                <SelectItem value="auto">中英混合（自动）</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+        )}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={handleSaveDefault}
+          className="h-7 w-full rounded-full text-xs text-muted-foreground"
+        >
+          <Star className="size-3" /> 设为默认
+        </Button>
+      </div>
+
       <div className="flex flex-col items-center gap-3 py-4">
         {!browserUnavailable ? (
           <>

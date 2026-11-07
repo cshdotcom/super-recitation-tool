@@ -1,10 +1,13 @@
 'use client'
 
 import * as React from 'react'
+import { Copy, Eraser, Eye, Flag, Volume2 } from 'lucide-react'
+import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
 import { splitParagraphs, tokenize } from '@/lib/cloze'
 import type { ClozeStyle } from '@/lib/types'
+import { LongPressMenu, type MenuAction } from '@/components/recitation/long-press-menu'
 
 const WORD_SPLIT_RE = /([\u4e00-\u9fff\u3400-\u4dbf]+|[a-zA-Z0-9]+)/
 const WORD_FULL_RE = /^([\u4e00-\u9fff\u3400-\u4dbf]+|[a-zA-Z0-9]+)$/
@@ -41,6 +44,14 @@ interface ClozeTextProps {
   revealed: Set<number>
   onReveal: (idx: number) => void
   onToggleKeyword: (word: string) => void
+  /** Full override of the per-blank long-press menu actions. */
+  menuActions?: MenuAction[]
+  /** 取消挖空 — only adds the menu action when provided. */
+  onRemoveKeyword?: (word: string) => void
+  /** 标记难点 — only adds the menu action when provided. */
+  onMarkHard?: (word: string) => void
+  /** Fallback for custom keys when menuActions is overridden. */
+  onMenuAction?: (key: string, word: string, idx: number) => void
 }
 
 export function ClozeText({
@@ -57,11 +68,99 @@ export function ClozeText({
   revealed,
   onReveal,
   onToggleKeyword,
+  menuActions,
+  onRemoveKeyword,
+  onMarkHard,
+  onMenuAction,
 }: ClozeTextProps) {
   const containerRef = React.useRef<HTMLDivElement>(null)
   const draggingRef = React.useRef(false)
   const touchedRef = React.useRef<Set<string>>(new Set())
   const [page, setPage] = React.useState(0)
+  // 查看答案 (per-blank menu): single blanks revealed for 2s, independent of
+  // the global showAnswers toggle.
+  const [tempRevealed, setTempRevealed] = React.useState<Set<number>>(new Set())
+  const tempTimersRef = React.useRef<Map<number, number>>(new Map())
+
+  React.useEffect(() => {
+    const timers = tempTimersRef.current
+    return () => {
+      timers.forEach((t) => window.clearTimeout(t))
+      timers.clear()
+    }
+  }, [])
+
+  const tempReveal = (idx: number) => {
+    setTempRevealed((prev) => {
+      const n = new Set(prev)
+      n.add(idx)
+      return n
+    })
+    const prevTimer = tempTimersRef.current.get(idx)
+    if (prevTimer) window.clearTimeout(prevTimer)
+    const t = window.setTimeout(() => {
+      tempTimersRef.current.delete(idx)
+      setTempRevealed((prev) => {
+        const n = new Set(prev)
+        n.delete(idx)
+        return n
+      })
+    }, 2000)
+    tempTimersRef.current.set(idx, t)
+  }
+
+  // 朗读该词 — browser speechSynthesis only, no server call.
+  const speakWord = (word: string) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      toast.error('当前浏览器不支持朗读')
+      return
+    }
+    try {
+      window.speechSynthesis.cancel()
+      const u = new SpeechSynthesisUtterance(word)
+      u.lang = 'zh-CN'
+      u.rate = 0.9
+      window.speechSynthesis.speak(u)
+    } catch {
+      toast.error('朗读失败，请重试')
+    }
+  }
+
+  // 复制词语
+  const copyWord = (word: string) => {
+    navigator.clipboard
+      ?.writeText(word)
+      .then(() => toast.success(`已复制「${word}」`))
+      .catch(() => toast.error('复制失败，请重试'))
+  }
+
+  const handleBlankMenuAction = (key: string, word: string, idx: number) => {
+    switch (key) {
+      case 'reveal':
+        tempReveal(idx)
+        break
+      case 'speak':
+        speakWord(word)
+        break
+      case 'copy':
+        copyWord(word)
+        break
+      case 'remove':
+        if (onRemoveKeyword) {
+          onRemoveKeyword(word)
+          toast.success(`已取消挖空「${word}」`)
+        }
+        break
+      case 'mark':
+        if (onMarkHard) {
+          onMarkHard(word)
+          toast.success(`已标记难点「${word}」`)
+        }
+        break
+      default:
+        onMenuAction?.(key, word, idx)
+    }
+  }
 
   const keywordSet = React.useMemo(() => new Set(keywords), [keywords])
 
@@ -125,11 +224,27 @@ export function ClozeText({
       blankIdx += 1
       const idx = blankIdx
       const isRevealed = revealed.has(idx)
-      const visible = showAnswers || isRevealed
+      const tempOn = tempRevealed.has(idx)
+      const visible = showAnswers || isRevealed || tempOn
+      const effRevealed = isRevealed || tempOn
       const isCircle = style === 'circle'
-      return (
+
+      const blankActions: MenuAction[] =
+        menuActions ??
+        [
+          { key: 'reveal', label: '查看答案', icon: <Eye className="size-3.5" strokeWidth={1.75} /> },
+          { key: 'speak', label: '朗读该词', icon: <Volume2 className="size-3.5" strokeWidth={1.75} /> },
+          { key: 'copy', label: '复制词语', icon: <Copy className="size-3.5" strokeWidth={1.75} /> },
+          ...(onRemoveKeyword
+            ? [{ key: 'remove', label: '取消挖空', icon: <Eraser className="size-3.5" strokeWidth={1.75} /> }]
+            : []),
+          ...(onMarkHard
+            ? [{ key: 'mark', label: '标记难点', icon: <Flag className="size-3.5" strokeWidth={1.75} /> }]
+            : []),
+        ]
+
+      const blank = (
         <span
-          key={`b-${idx}`}
           role="button"
           tabIndex={0}
           aria-label={visible ? `已显示：${text}` : '点击显示答案'}
@@ -155,20 +270,20 @@ export function ClozeText({
                   'inline-block rounded-[50%] border-2 px-2 text-center',
                   !visible && 'border-foreground/50 text-transparent',
                   visible &&
-                    isRevealed &&
+                    effRevealed &&
                     'border-emerald-500/60 bg-amber-200/70 text-foreground dark:bg-amber-500/30',
                   visible &&
-                    !isRevealed &&
+                    !effRevealed &&
                     'border-emerald-500/40 bg-emerald-500/10 text-foreground/90',
                 )
               : cn(
                   'border-b-2',
                   !visible && 'border-dashed border-foreground/50 text-transparent',
                   visible &&
-                    isRevealed &&
+                    effRevealed &&
                     'border-emerald-500/60 bg-amber-200/70 text-foreground dark:bg-amber-500/30',
                   visible &&
-                    !isRevealed &&
+                    !effRevealed &&
                     'border-emerald-500/40 bg-emerald-500/10 text-foreground/90',
                 ),
           )}
@@ -176,6 +291,16 @@ export function ClozeText({
         >
           {text}
         </span>
+      )
+
+      return (
+        <LongPressMenu
+          key={`b-${idx}`}
+          actions={blankActions}
+          onAction={(key) => handleBlankMenuAction(key, text, idx)}
+        >
+          {blank}
+        </LongPressMenu>
       )
     }
 

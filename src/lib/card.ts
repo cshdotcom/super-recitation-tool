@@ -59,6 +59,7 @@ export function serializeCard(c: {
   keywords: string
   strokes: string
   plan: string
+  mindmaps?: string | null
   createdAt: Date
   updatedAt: Date
 }): CardData {
@@ -83,6 +84,12 @@ export function serializeCard(c: {
     }
   } catch {}
 
+  let mindmaps: unknown[] = []
+  try {
+    const parsed = JSON.parse(c.mindmaps || '[]')
+    if (Array.isArray(parsed)) mindmaps = parsed
+  } catch {}
+
   return {
     id: c.id,
     title: c.title,
@@ -90,6 +97,7 @@ export function serializeCard(c: {
     keywords,
     strokes,
     plan,
+    mindmaps: mindmaps as CardData['mindmaps'],
     createdAt: c.createdAt.toISOString(),
     updatedAt: c.updatedAt.toISOString(),
   }

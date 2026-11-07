@@ -14,6 +14,8 @@ import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { similarity } from '@/lib/cloze'
 import { splitSentences } from '@/lib/sentences'
+import { useSettingsLite } from '@/lib/voice-prefs'
+import { useQuickTts, VoiceSpeedBar } from '@/components/recitation/tts-player'
 import { Button } from '@/components/ui/button'
 
 interface EarbackPanelProps {
@@ -27,15 +29,14 @@ interface EarbackResult {
 
 // 耳返背书：逐句朗读 + 跟读对比打分
 export function EarbackPanel({ content }: EarbackPanelProps) {
+  const settings = useSettingsLite()
+  const tts = useQuickTts('earback', settings)
   const sentences = React.useMemo(() => splitSentences(content), [content])
   const [idx, setIdx] = React.useState(0)
-  const [speaking, setSpeaking] = React.useState(false)
   const [recording, setRecording] = React.useState(false)
   const [loading, setLoading] = React.useState(false)
   const [result, setResult] = React.useState<EarbackResult | null>(null)
 
-  const audioRef = React.useRef<HTMLAudioElement | null>(null)
-  const audioUrlRef = React.useRef<string | null>(null)
   const mediaRecorderRef = React.useRef<MediaRecorder | null>(null)
   const chunksRef = React.useRef<Blob[]>([])
   const streamRef = React.useRef<MediaStream | null>(null)
@@ -47,46 +48,20 @@ export function EarbackPanel({ content }: EarbackPanelProps) {
     setResult(null)
   }, [content])
 
-  // cleanup media + audio on unmount
+  // cleanup media on unmount
   React.useEffect(() => {
     return () => {
       streamRef.current?.getTracks().forEach((t) => t.stop())
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current)
     }
   }, [])
 
-  const handleSpeak = async () => {
+  const handleSpeak = () => {
     if (!current.trim()) return
-    setSpeaking(true)
-    const tid = toast.loading('正在生成这句语音…')
-    try {
-      const res = await fetch('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: current, speed: 0.9 }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.error || '生成语音失败')
-      }
-      const blob = await res.blob()
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current)
-      const url = URL.createObjectURL(blob)
-      audioUrlRef.current = url
-      const audio = new Audio(url)
-      audioRef.current = audio
-      toast.success('开始朗读', { id: tid })
-      await audio.play().catch(() => {
-        /* user can press play via controls below */
-      })
-    } catch (err) {
-      toast.error(
-        '朗读失败：' + (err instanceof Error ? err.message : '未知错误'),
-        { id: tid },
-      )
-    } finally {
-      setSpeaking(false)
+    if (tts.speaking) {
+      tts.stop()
+      return
     }
+    tts.speak(current)
   }
 
   const stopStream = () => {
@@ -217,6 +192,11 @@ export function EarbackPanel({ content }: EarbackPanelProps) {
         <p className="text-xl font-medium leading-loose">{current}</p>
       </div>
 
+      {/* voice + speed picker (音色/倍速，可设为默认) */}
+      <div className="flex justify-center">
+        <VoiceSpeedBar context="earback" pref={tts.pref} onChange={tts.setPref} />
+      </div>
+
       {/* controls */}
       <div className="flex items-center justify-center gap-6">
         <Button
@@ -235,15 +215,15 @@ export function EarbackPanel({ content }: EarbackPanelProps) {
 
         <Button
           className="h-11 flex-1 rounded-full bg-emerald-600 text-white hover:bg-emerald-700"
-          onClick={() => void handleSpeak()}
-          disabled={speaking || recording || loading}
+          onClick={handleSpeak}
+          disabled={recording || loading}
         >
-          {speaking ? (
-            <Loader2 className="size-4 animate-spin" />
+          {tts.speaking ? (
+            <Square className="size-4" />
           ) : (
             <Volume2 className="size-4" strokeWidth={1.75} />
           )}
-          朗读这句
+          {tts.speaking ? '停止朗读' : '朗读这句'}
         </Button>
 
         <button
@@ -281,7 +261,9 @@ export function EarbackPanel({ content }: EarbackPanelProps) {
           ? '录音中… 再次点击麦克风结束'
           : loading
             ? '识别中…'
-            : '先听朗读，再点麦克风跟读这句话'}
+            : tts.speaking
+              ? '正在朗读，可点击停止'
+              : '先听朗读，再点麦克风跟读这句话'}
       </p>
 
       {/* result */}
@@ -306,11 +288,6 @@ export function EarbackPanel({ content }: EarbackPanelProps) {
             </Button>
           )}
         </div>
-      )}
-
-      {/* hidden audio element for replay */}
-      {audioUrlRef.current && (
-        <audio src={audioUrlRef.current} controls className="w-full" />
       )}
     </div>
   )

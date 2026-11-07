@@ -1,6 +1,8 @@
 'use client'
 
 import * as React from 'react'
+import { useRouter } from 'next/navigation'
+import { useTheme } from 'next-themes'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -9,22 +11,22 @@ import { HomeView } from '@/components/recitation/home-view'
 import { ReaderView } from '@/components/recitation/reader-view'
 import { ImportSheet, type ImportPayload } from '@/components/recitation/import-sheet'
 import { SettingsSheet } from '@/components/recitation/settings-sheet'
-import { LoginView } from '@/components/recitation/login-view'
 import { AccountSheet } from '@/components/recitation/account-sheet'
-import { SharedCardView } from '@/components/recitation/shared-card-view'
 
 export default function Page() {
+  const router = useRouter()
+  const { setTheme } = useTheme()
+
   const [view, setView] = React.useState<'home' | 'reader'>('home')
   const [cards, setCards] = React.useState<CardData[]>([])
   const [currentCard, setCurrentCard] = React.useState<CardData | null>(null)
   const [settings, setSettings] = React.useState<SettingsData | null>(null)
   const [loading, setLoading] = React.useState(true)
 
-  // ---------- auth / share ----------
-  const [account, setAccount] = React.useState<AccountData | null>(null)
-  const [registered, setRegistered] = React.useState(false)
+  // ---------- auth ----------
+  const [authed, setAuthed] = React.useState(false)
   const [authLoading, setAuthLoading] = React.useState(true)
-  const [shareToken, setShareToken] = React.useState<string | null>(null)
+  const [account, setAccount] = React.useState<AccountData | null>(null)
   const [accountOpen, setAccountOpen] = React.useState(false)
   const dataLoadedRef = React.useRef(false)
 
@@ -47,29 +49,40 @@ export default function Page() {
         fetch('/api/settings').then((r) => r.json()),
       ])
       setCards(((cardsRes && cardsRes.cards) as CardData[]) || [])
-      setSettings((settingsRes as SettingsData) || null)
+      const s = settingsRes as SettingsData | null
+      setSettings(s || null)
+      // Sync the app theme (白天/夜间/护眼/羊皮纸) from the server settings.
+      if (s?.theme) setTheme(s.theme)
     } catch (err) {
       toast.error('加载数据失败：' + (err instanceof Error ? err.message : String(err)))
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [setTheme])
 
-  // ---------- auth bootstrap: resolve ?share= + session ----------
+  // ---------- auth bootstrap ----------
   React.useEffect(() => {
     let alive = true
+    // Legacy ?share= links redirect to the standalone /share/[token] route.
     const shareParam = new URLSearchParams(window.location.search).get('share')
-    setShareToken(shareParam)
+    if (shareParam) {
+      router.replace(`/share/${encodeURIComponent(shareParam)}`)
+      return
+    }
 
     fetch('/api/auth/me')
       .then((r) => r.json())
       .then((res) => {
         if (!alive) return
-        setRegistered(!!res?.registered)
-        if (res?.account) setAccount(res.account as AccountData)
+        if (res?.account) {
+          setAccount(res.account as AccountData)
+          setAuthed(true)
+        } else {
+          router.replace('/login')
+        }
       })
       .catch(() => {
-        if (alive) setRegistered(false)
+        if (alive) router.replace('/login')
       })
       .finally(() => {
         if (alive) setAuthLoading(false)
@@ -78,15 +91,14 @@ export default function Page() {
     return () => {
       alive = false
     }
-  }, [])
+  }, [router])
 
-  // Load cards/settings once authed (skipped while viewing a share link;
-  // re-runs after exiting the share view or after a fresh login).
+  // Load cards/settings once authed.
   React.useEffect(() => {
-    if (!account || dataLoadedRef.current || shareToken) return
+    if (!authed || dataLoadedRef.current) return
     dataLoadedRef.current = true
     void loadInitialData()
-  }, [account, shareToken, loadInitialData])
+  }, [authed, loadInitialData])
 
   // Cleanup the debounced card-save timer on unmount.
   React.useEffect(() => {
@@ -95,26 +107,14 @@ export default function Page() {
     }
   }, [])
 
-  // ---------- auth handlers ----------
-  const handleAuthed = React.useCallback((acc: AccountData) => {
-    setRegistered(true)
-    setAccount(acc)
-  }, [])
-
+  // ---------- logout ----------
   const handleLogout = React.useCallback(() => {
-    dataLoadedRef.current = false
-    setAccount(null)
-    setCards([])
-    setSettings(null)
-    setCurrentCard(null)
-    setView('home')
-    setAccountOpen(false)
-  }, [])
-
-  const handleShareExit = React.useCallback(() => {
-    window.history.replaceState(null, '', window.location.pathname)
-    setShareToken(null)
-  }, [])
+    void fetch('/api/auth/logout', { method: 'POST' }).finally(() => {
+      dataLoadedRef.current = false
+      setAccount(null)
+      router.replace('/login')
+    })
+  }, [router])
 
   // ---------- card CRUD ----------
   const handleImport = React.useCallback(async (payload: ImportPayload) => {
@@ -178,7 +178,7 @@ export default function Page() {
 
   const handleUpdateCard = React.useCallback((next: CardData) => {
     // Optimistic local update, then debounced PATCH (700ms) persisting
-    // title/content/keywords/strokes/plan.
+    // title/content/keywords/strokes/plan/mindmaps.
     setCurrentCard((cur) => (cur && cur.id === next.id ? next : cur))
     setCards((prev) => prev.map((c) => (c.id === next.id ? next : c)))
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
@@ -193,6 +193,7 @@ export default function Page() {
             keywords: next.keywords,
             strokes: next.strokes,
             plan: next.plan,
+            mindmaps: next.mindmaps,
           }),
         })
         if (!res.ok) {
@@ -245,6 +246,7 @@ export default function Page() {
   const handleChangeSettings = React.useCallback(
     (patch: Partial<SettingsData>) => {
       setSettings((prev) => (prev ? { ...prev, ...patch } : prev))
+      if (patch.theme) setTheme(patch.theme)
       void fetch('/api/settings', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
@@ -253,7 +255,7 @@ export default function Page() {
         toast.error('设置保存失败，请重试')
       })
     },
-    [],
+    [setTheme],
   )
 
   // ---------- navigation ----------
@@ -287,7 +289,7 @@ export default function Page() {
   }, [])
 
   // ---------- gated rendering ----------
-  if (authLoading) {
+  if (authLoading || !authed) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">
         <Loader2 className="size-6 animate-spin" />
@@ -295,25 +297,9 @@ export default function Page() {
     )
   }
 
-  if (shareToken) {
-    return (
-      <div className="flex min-h-screen flex-col bg-background text-foreground">
-        <SharedCardView token={shareToken} onExit={handleShareExit} />
-      </div>
-    )
-  }
-
-  if (!account) {
-    return (
-      <div className="flex min-h-screen flex-col bg-background text-foreground">
-        <LoginView registered={registered} onAuthed={handleAuthed} />
-      </div>
-    )
-  }
-
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
-      {view === 'home' ? (
+      {view === 'home' && account ? (
         <HomeView
           cards={cards}
           loading={loading}
@@ -323,6 +309,7 @@ export default function Page() {
           onNew={handleNewCard}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenAccount={() => setAccountOpen(true)}
+          onLogout={handleLogout}
         />
       ) : currentCard && settings ? (
         <ReaderView
@@ -338,7 +325,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t bg-background">
         <div className="mx-auto flex max-w-2xl items-center justify-center px-4 py-2.5 text-[11px] text-muted-foreground">
-          超级背书工具 · AI 挖空 · AI 出题 · TTS 朗读 · 语音识别
+          背书吧 · AI 挖空 · AI 出题 · TTS 朗读 · 语音识别
         </div>
       </footer>
 
@@ -364,9 +351,9 @@ export default function Page() {
       />
 
       <AccountSheet
-        open={accountOpen}
+        open={accountOpen && !!account}
         onOpenChange={setAccountOpen}
-        account={account}
+        account={account!}
         onAccountChange={setAccount}
         onLogout={handleLogout}
       />

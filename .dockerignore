@@ -1,0 +1,17 @@
+node_modules
+.next
+.git
+.github
+agent-ctx
+scripts
+db
+data
+upload
+dev.log
+server.log
+Dockerfile
+docker-compose.yml
+.dockerignore
+README*
+*.db
+*.log

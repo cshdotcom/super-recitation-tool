@@ -129,3 +129,139 @@
 .no-scrollbar::-webkit-scrollbar {
   display: none;
 }
+
+/* ---------- 护眼绿 (eye-care green) ---------- */
+.green {
+  --background: oklch(0.945 0.038 148);
+  --foreground: oklch(0.24 0.03 150);
+  --card: oklch(0.975 0.03 150);
+  --card-foreground: oklch(0.24 0.03 150);
+  --popover: oklch(0.975 0.03 150);
+  --popover-foreground: oklch(0.24 0.03 150);
+  --primary: oklch(0.32 0.05 155);
+  --primary-foreground: oklch(0.97 0.03 150);
+  --secondary: oklch(0.9 0.045 148);
+  --secondary-foreground: oklch(0.28 0.04 152);
+  --muted: oklch(0.9 0.045 148);
+  --muted-foreground: oklch(0.5 0.04 152);
+  --accent: oklch(0.9 0.045 148);
+  --accent-foreground: oklch(0.28 0.04 152);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.82 0.045 150);
+  --input: oklch(0.82 0.045 150);
+  --ring: oklch(0.6 0.06 152);
+  --sidebar: oklch(0.96 0.035 149);
+  --sidebar-foreground: oklch(0.24 0.03 150);
+  --sidebar-primary: oklch(0.32 0.05 155);
+  --sidebar-primary-foreground: oklch(0.97 0.03 150);
+  --sidebar-accent: oklch(0.9 0.045 148);
+  --sidebar-accent-foreground: oklch(0.28 0.04 152);
+  --sidebar-border: oklch(0.82 0.045 150);
+  --sidebar-ring: oklch(0.6 0.06 152);
+}
+
+/* ---------- 羊皮纸 (sepia paper) ---------- */
+.sepia {
+  --background: oklch(0.93 0.045 82);
+  --foreground: oklch(0.32 0.045 65);
+  --card: oklch(0.96 0.04 84);
+  --card-foreground: oklch(0.32 0.045 65);
+  --popover: oklch(0.96 0.04 84);
+  --popover-foreground: oklch(0.32 0.045 65);
+  --primary: oklch(0.4 0.06 60);
+  --primary-foreground: oklch(0.96 0.04 84);
+  --secondary: oklch(0.88 0.05 80);
+  --secondary-foreground: oklch(0.35 0.05 68);
+  --muted: oklch(0.88 0.05 80);
+  --muted-foreground: oklch(0.52 0.045 70);
+  --accent: oklch(0.88 0.05 80);
+  --accent-foreground: oklch(0.35 0.05 68);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.78 0.05 78);
+  --input: oklch(0.78 0.05 78);
+  --ring: oklch(0.6 0.06 74);
+  --sidebar: oklch(0.94 0.043 82);
+  --sidebar-foreground: oklch(0.32 0.045 65);
+  --sidebar-primary: oklch(0.4 0.06 60);
+  --sidebar-primary-foreground: oklch(0.96 0.04 84);
+  --sidebar-accent: oklch(0.88 0.05 80);
+  --sidebar-accent-foreground: oklch(0.35 0.05 68);
+  --sidebar-border: oklch(0.78 0.05 78);
+  --sidebar-ring: oklch(0.6 0.06 74);
+}
+
+/* ---------- highlight.js: dark-mode token colors ----------
+   github.css (light) is imported by rich-content.tsx; these overrides
+   recolor tokens to the github-dark palette when the app is in dark mode.
+   The code block surface itself comes from Tailwind (bg-muted), so only
+   token colors + the .hljs base color are overridden here. */
+.dark .hljs {
+  color: #e6edf3;
+  background: transparent;
+}
+.dark .hljs-comment,
+.dark .hljs-quote {
+  color: #8b949e;
+  font-style: italic;
+}
+.dark .hljs-keyword,
+.dark .hljs-selector-tag,
+.dark .hljs-doctag,
+.dark .hljs-template-tag {
+  color: #ff7b72;
+}
+.dark .hljs-string,
+.dark .hljs-regexp,
+.dark .hljs-meta .hljs-string,
+.dark .hljs-template-variable {
+  color: #a5d6ff;
+}
+.dark .hljs-number,
+.dark .hljs-literal,
+.dark .hljs-variable,
+.dark .hljs-attr,
+.dark .hljs-attribute {
+  color: #79c0ff;
+}
+.dark .hljs-title,
+.dark .hljs-title.class_,
+.dark .hljs-title.function_,
+.dark .hljs-name,
+.dark .hljs-section {
+  color: #d2a8ff;
+}
+.dark .hljs-built_in,
+.dark .hljs-type,
+.dark .hljs-symbol,
+.dark .hljs-selector-id,
+.dark .hljs-selector-class,
+.dark .hljs-selector-attr,
+.dark .hljs-selector-pseudo {
+  color: #ffa657;
+}
+.dark .hljs-meta,
+.dark .hljs-meta .hljs-keyword,
+.dark .hljs-punctuation {
+  color: #e6edf3;
+}
+.dark .hljs-tag {
+  color: #7ee787;
+}
+.dark .hljs-deletion {
+  color: #ffdcd7;
+  background: #67060c;
+}
+.dark .hljs-addition {
+  color: #aff5b4;
+  background: #033a16;
+}
+.dark .hljs-emphasis {
+  font-style: italic;
+}
+.dark .hljs-strong {
+  font-weight: 600;
+}
+.dark .hljs-link {
+  color: #a5d6ff;
+  text-decoration: underline;
+}

@@ -85,11 +85,34 @@ export function ImportSheet({
   }
 
   const handleTextFile = async (file: File) => {
+    if (file.size > 15 * 1024 * 1024) {
+      toast.error('文件过大，最大支持 15MB')
+      return
+    }
+    setOcrLoading('file')
+    const toastId = toast.loading(`正在解析「${file.name}」…`)
     try {
-      const content = await file.text()
-      startInput('file', content)
-    } catch {
-      toast.error('读取文件失败')
+      const fd = new FormData()
+      fd.append('file', file)
+      const res = await fetch('/api/parse', { method: 'POST', body: fd })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        throw new Error(data.error || '文件解析失败')
+      }
+      const payload = data as { title?: string; content?: string }
+      if (!payload.content?.trim()) {
+        throw new Error('未能从文件中提取到文字')
+      }
+      toast.success('文件解析完成', { id: toastId })
+      startInput('file', payload.content)
+      if (payload.title) setTitle(payload.title)
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : '文件解析失败，请重试',
+        { id: toastId },
+      )
+    } finally {
+      setOcrLoading(null)
     }
   }
 
@@ -193,7 +216,7 @@ export function ImportSheet({
             <input
               id="import-file-input"
               type="file"
-              accept=".txt,.md,text/plain"
+              accept=".pdf,.docx,.txt,.md,.markdown,text/*,application/pdf"
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0]

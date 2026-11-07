@@ -3,20 +3,32 @@
 import * as React from 'react'
 import {
   Braces,
+  ChevronRight,
   Cpu,
   Database,
   Globe,
   KeyRound,
   Loader2,
   Mic,
+  Palette,
   Trash2,
   Volume2,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { CardData, SettingsData, ToolToggles, VoiceProvider } from '@/lib/types'
+import type {
+  CardData,
+  SettingsData,
+  ToolToggles,
+  VoicePref,
+  VoiceProvider,
+} from '@/lib/types'
+import { TTS_VOICES, VOICE_CONTEXTS } from '@/lib/types'
 import { cn } from '@/lib/utils'
+import { clampSpeed, saveVoicePref } from '@/lib/voice-prefs'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
+import { ThemePicker } from '@/components/recitation/more-sheet'
+import { VoiceSpeedBar, type QuickTtsPref } from '@/components/recitation/tts-player'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -32,6 +44,13 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 
 interface SettingsSheetProps {
@@ -63,6 +82,213 @@ const TOOL_TOGGLES: { key: keyof ToolToggles; label: string; desc: string }[] = 
   { key: 'copywrite', label: '摹写', desc: '默写并逐字检查' },
   { key: 'wheel', label: '轮盘抽背', desc: '随机抽句背诵' },
 ]
+
+// ---------- 各功能默认音色 ----------
+
+const VOICE_CTX_LABELS: Record<string, string> = {
+  reader: 'AI朗读',
+  tts: '朗读文本',
+  asr: '背诵识别',
+  supervise: 'AI督背',
+  quiz: '出题',
+  ask: 'AI问问',
+  earback: '磨耳朵',
+  copywrite: '默写',
+}
+
+function seedTtsDraft(pref?: VoicePref): QuickTtsPref {
+  const p = pref?.tts
+  const provider = p?.provider ?? 'zai'
+  return {
+    provider,
+    voice:
+      provider === 'zai'
+        ? p?.voice && TTS_VOICES.some((v) => v.value === p.voice)
+          ? p.voice
+          : 'tongtong'
+        : p?.voice ?? '',
+    speed: clampSpeed(p?.speed ?? 1),
+    voiceURI: p?.voiceURI ?? '',
+  }
+}
+
+function seedAsrDraft(pref?: VoicePref): { provider: VoiceProvider; lang: string } {
+  return {
+    provider: pref?.asr?.provider ?? 'zai',
+    lang: pref?.asr?.lang ?? 'zh-CN',
+  }
+}
+
+function prefSummary(pref?: VoicePref): string {
+  if (!pref?.tts && !pref?.asr) return '未设置 · 跟随全局'
+  if (pref.asr) {
+    const p = pref.asr
+    const engine =
+      p.provider === 'browser' ? '浏览器' : p.provider === 'custom' ? '第三方' : 'AI云端'
+    const lang =
+      p.lang === 'en-US'
+        ? ' · English'
+        : p.lang === 'auto'
+          ? ' · 中英混合'
+          : p.lang && p.lang !== 'zh-CN'
+            ? ` · ${p.lang}`
+            : ''
+    return `${engine}${lang}`
+  }
+  const p = pref.tts
+  if (!p) return '未设置 · 跟随全局'
+  const voice =
+    p.provider === 'zai'
+      ? TTS_VOICES.find((v) => v.value === p.voice)?.label.split('·')[0]?.trim() ??
+        p.voice
+      : p.provider === 'custom'
+        ? p.voice || '第三方音色'
+        : '浏览器语音'
+  return `${voice} · ${p.speed}x`
+}
+
+/** One expandable row in 「各功能默认音色」. */
+function VoiceDefaultRow({
+  ctx,
+  label,
+  saved,
+  onSaved,
+}: {
+  ctx: string
+  label: string
+  saved?: VoicePref
+  onSaved: (ctx: string, pref: VoicePref) => void
+}) {
+  const isAsr = ctx === 'asr'
+  const [open, setOpen] = React.useState(false)
+  const [ttsDraft, setTtsDraft] = React.useState<QuickTtsPref>(() => seedTtsDraft(saved))
+  const [asrDraft, setAsrDraft] = React.useState(() => seedAsrDraft(saved))
+  const [asrSaving, setAsrSaving] = React.useState(false)
+
+  // Re-seed drafts from the saved pref each time the row expands.
+  React.useEffect(() => {
+    if (!open) return
+    setTtsDraft(seedTtsDraft(saved))
+    setAsrDraft(seedAsrDraft(saved))
+  }, [open, saved])
+
+  const handleAsrSave = async () => {
+    setAsrSaving(true)
+    const ok = await saveVoicePref(ctx, {
+      asr: {
+        provider: asrDraft.provider,
+        ...(asrDraft.provider === 'browser' ? { lang: asrDraft.lang } : {}),
+      },
+    })
+    setAsrSaving(false)
+    if (ok) {
+      onSaved(ctx, {
+        asr: {
+          provider: asrDraft.provider,
+          ...(asrDraft.provider === 'browser' ? { lang: asrDraft.lang } : {}),
+        },
+      })
+    }
+  }
+
+  const handleTtsSaved = (p: QuickTtsPref) => {
+    onSaved(ctx, {
+      tts: {
+        provider: p.provider,
+        voice: p.provider === 'browser' ? '' : p.voice.trim(),
+        speed: p.speed,
+        ...(p.provider === 'browser' ? { voiceURI: p.voiceURI } : {}),
+      },
+    })
+  }
+
+  return (
+    <div className="border-b border-border/60 last:border-b-0">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-accent/50"
+      >
+        <div className="min-w-0">
+          <p className="text-sm font-bold">{label}</p>
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            {prefSummary(saved)}
+          </p>
+        </div>
+        <ChevronRight
+          className={cn(
+            'size-4 shrink-0 text-muted-foreground/60 transition-transform',
+            open && 'rotate-90',
+          )}
+          strokeWidth={1.75}
+        />
+      </button>
+      {open && (
+        <div className="px-4 pb-4">
+          {isAsr ? (
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center gap-2">
+                <Label className="shrink-0 text-xs text-muted-foreground">引擎</Label>
+                <Select
+                  value={asrDraft.provider}
+                  onValueChange={(v) =>
+                    setAsrDraft((d) => ({ ...d, provider: v as VoiceProvider }))
+                  }
+                >
+                  <SelectTrigger className="h-8 flex-1 rounded-lg text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="zai">AI云端（z-ai）</SelectItem>
+                    <SelectItem value="browser">浏览器内置</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              {asrDraft.provider === 'browser' && (
+                <div className="flex items-center gap-2">
+                  <Label className="shrink-0 text-xs text-muted-foreground">语言</Label>
+                  <Select
+                    value={asrDraft.lang}
+                    onValueChange={(v) => setAsrDraft((d) => ({ ...d, lang: v }))}
+                  >
+                    <SelectTrigger className="h-8 flex-1 rounded-lg text-xs">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="zh-CN">中文普通话</SelectItem>
+                      <SelectItem value="en-US">English (US)</SelectItem>
+                      <SelectItem value="auto">中英混合（自动）</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={asrSaving}
+                onClick={() => void handleAsrSave()}
+                className="h-8 w-full rounded-full text-xs"
+              >
+                {asrSaving && <Loader2 className="size-3.5 animate-spin" />}
+                保存为默认
+              </Button>
+            </div>
+          ) : (
+            <VoiceSpeedBar
+              inline
+              context={ctx}
+              pref={ttsDraft}
+              onChange={setTtsDraft}
+              onSaved={handleTtsSaved}
+              saveLabel="保存为默认"
+            />
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 
 // Reusable radio row for the voice provider pickers.
 function VoiceProviderOptions({
@@ -164,6 +390,9 @@ export function SettingsSheet({
   })
   const [saving, setSaving] = React.useState(false)
   const [savingVoice, setSavingVoice] = React.useState(false)
+  // Locally-saved per-context voice defaults (refreshes the summaries right
+  // away; the server PATCH happens inside saveVoicePref).
+  const [savedVoicePrefs, setSavedVoicePrefs] = React.useState<Record<string, VoicePref>>({})
 
   React.useEffect(() => {
     if (open && settings) {
@@ -220,7 +449,7 @@ export function SettingsSheet({
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = '超级背书-全部数据.json'
+    a.download = '背书吧-全部数据.json'
     a.click()
     URL.revokeObjectURL(url)
     toast.success('已导出全部数据')
@@ -234,6 +463,20 @@ export function SettingsSheet({
         </div>
       ) : (
         <div className="mt-4 flex-1 space-y-5 overflow-y-auto pb-6">
+          {/* ---------- 界面主题 ---------- */}
+          <section>
+            <p className="mb-2 flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
+              <Palette className="size-3.5" strokeWidth={1.75} /> 界面主题
+            </p>
+            <div className="rounded-2xl border border-border bg-card px-4 py-4">
+              <ThemePicker
+                value={settings.theme}
+                onChange={(t) => onChangeSettings({ theme: t })}
+              />
+              <p className="mt-2.5 px-1 text-[11px] text-muted-foreground/70">已自动保存</p>
+            </div>
+          </section>
+
           {/* ---------- 快捷编辑栏 ---------- */}
           <section>
             <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">快捷编辑栏</p>
@@ -459,6 +702,27 @@ export function SettingsSheet({
                 {savingVoice && <Loader2 className="size-4 animate-spin" />}
                 保存语音设置
               </Button>
+            </div>
+          </section>
+
+          {/* ---------- 各功能默认音色 ---------- */}
+          <section>
+            <p className="mb-1 px-1 text-xs font-medium text-muted-foreground">各功能默认音色</p>
+            <p className="mb-2 px-1 text-[11px] text-muted-foreground/70">
+              为每个功能单独设置音色/引擎/倍速，未设置时跟随全局
+            </p>
+            <div className="rounded-2xl border border-border bg-card">
+              {VOICE_CONTEXTS.map((ctx) => (
+                <VoiceDefaultRow
+                  key={ctx}
+                  ctx={ctx}
+                  label={VOICE_CTX_LABELS[ctx] ?? ctx}
+                  saved={savedVoicePrefs[ctx] ?? settings.voicePrefs?.[ctx]}
+                  onSaved={(c, pref) =>
+                    setSavedVoicePrefs((prev) => ({ ...prev, [c]: pref }))
+                  }
+                />
+              ))}
             </div>
           </section>
 

@@ -145,7 +145,7 @@ export function AccountSheet({
   const handleSavePassword = async () => {
     if (!pwForm.current) return toast.error('请输入当前密码')
     if (!pwForm.next) return toast.error('请输入新密码')
-    if (pwForm.next.length < 4) return toast.error('新密码至少需要 4 位')
+    if (pwForm.next.length < 6) return toast.error('新密码至少需要 6 位')
     if (pwForm.next !== pwForm.confirm) return toast.error('两次输入的新密码不一致')
 
     setSavingPw(true)
@@ -293,7 +293,7 @@ export function AccountSheet({
                   type="password"
                   value={pwForm.next}
                   onChange={(e) => setPwForm((f) => ({ ...f, next: e.target.value }))}
-                  placeholder="至少 4 位"
+                  placeholder="至少 6 位"
                   autoComplete="new-password"
                   className="h-10 rounded-xl"
                 />

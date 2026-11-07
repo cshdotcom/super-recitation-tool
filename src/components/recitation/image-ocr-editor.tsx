@@ -61,6 +61,7 @@ interface ImageItem {
 type CropMode = 'full' | 'crop'
 
 const ASPECT_PRESETS = [
+  { label: '自由', value: undefined as number | undefined },
   { label: '1:1', value: 1 },
   { label: '4:3', value: 4 / 3 },
   { label: '3:4', value: 3 / 4 },
@@ -83,7 +84,7 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
   const [images, setImages] = React.useState<ImageItem[]>([])
   const [activeId, setActiveId] = React.useState<string | null>(null)
   const [mode, setMode] = React.useState<CropMode>('crop')
-  const [aspect, setAspect] = React.useState<number>(4 / 3)
+  const [aspect, setAspect] = React.useState<number | undefined>(4 / 3)
   const [recognizing, setRecognizing] = React.useState(false)
   const [progress, setProgress] = React.useState<{ done: number; total: number } | null>(null)
 

@@ -69,6 +69,25 @@ export async function PATCH(req: NextRequest) {
     if (body?.pageMode === 'scroll' || body?.pageMode === 'paged') {
       data.pageMode = body.pageMode
     }
+    // App theme: light | dark | green(护眼) | sepia(羊皮纸) | system
+    if (
+      typeof body?.theme === 'string' &&
+      ['light', 'dark', 'green', 'sepia', 'system'].includes(body.theme)
+    ) {
+      data.theme = body.theme
+    }
+    // Per-context voice defaults: shallow-merge the submitted context keys.
+    if (body?.voicePrefs && typeof body.voicePrefs === 'object') {
+      const current = await db.settings.findUnique({ where: { id: ID } })
+      let merged: Record<string, unknown> = {}
+      try {
+        if (current?.voicePrefs) merged = JSON.parse(current.voicePrefs)
+      } catch {}
+      for (const [ctx, pref] of Object.entries(body.voicePrefs as Record<string, unknown>)) {
+        if (pref && typeof pref === 'object') merged[ctx] = pref
+      }
+      data.voicePrefs = JSON.stringify(merged)
+    }
     if (typeof body?.aiProvider === 'string') {
       data.aiProvider = body.aiProvider === 'custom' ? 'custom' : 'zai'
     }

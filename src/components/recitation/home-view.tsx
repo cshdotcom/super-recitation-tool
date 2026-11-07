@@ -5,6 +5,7 @@ import { formatDistanceToNow } from 'date-fns'
 import { zhCN } from 'date-fns/locale'
 import {
   BookOpenText,
+  LogOut,
   Plus,
   Settings as SettingsIcon,
   Trash2,
@@ -37,6 +38,7 @@ interface HomeViewProps {
   onNew: () => void
   onOpenSettings: () => void
   onOpenAccount: () => void
+  onLogout: () => void
 }
 
 export function HomeView({
@@ -48,6 +50,7 @@ export function HomeView({
   onNew,
   onOpenSettings,
   onOpenAccount,
+  onLogout,
 }: HomeViewProps) {
   return (
     <>
@@ -55,7 +58,7 @@ export function HomeView({
         <div className="mx-auto flex h-14 max-w-2xl items-center gap-2 px-4">
           <div className="flex items-center gap-2 text-lg font-bold">
             <BookOpenText className="size-5 text-emerald-600" strokeWidth={1.75} />
-            超级背书
+            背书吧
           </div>
           <div className="ml-auto flex items-center gap-1">
             <button
@@ -74,6 +77,15 @@ export function HomeView({
               </Avatar>
             </button>
             <ThemeToggle />
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="退出登录"
+              className="text-muted-foreground"
+              onClick={onLogout}
+            >
+              <LogOut className="size-5" strokeWidth={1.75} />
+            </Button>
             <Button
               variant="ghost"
               size="icon"

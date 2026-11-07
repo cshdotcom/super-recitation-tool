@@ -132,7 +132,7 @@ export function LoginView({ registered, onAuthed }: LoginViewProps) {
           <div className="flex size-14 items-center justify-center rounded-2xl bg-emerald-600/10">
             <BookOpenText className="size-8 text-emerald-600" strokeWidth={1.75} />
           </div>
-          <h1 className="mt-4 text-2xl font-bold tracking-tight">超级背书</h1>
+          <h1 className="mt-4 text-2xl font-bold tracking-tight">背书吧</h1>
           <p className="mt-1 text-sm text-muted-foreground">
             AI 挖空 · AI 出题 · TTS 朗读 · 语音识别
           </p>

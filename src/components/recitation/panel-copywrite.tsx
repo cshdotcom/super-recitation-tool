@@ -1,12 +1,14 @@
 'use client'
 
 import * as React from 'react'
-import { Check, ChevronLeft, ChevronRight, Eye, EyeOff, RotateCcw } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, Eye, EyeOff, RotateCcw, Square, Volume2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
 import { normalize, similarity } from '@/lib/cloze'
 import { splitSentences } from '@/lib/sentences'
+import { useSettingsLite } from '@/lib/voice-prefs'
+import { useQuickTts, VoiceSpeedBar } from '@/components/recitation/tts-player'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 
@@ -21,6 +23,8 @@ interface CopywriteResult {
 
 // 摹写：看句子默写，逐字检查
 export function CopywritePanel({ content }: CopywritePanelProps) {
+  const settings = useSettingsLite()
+  const tts = useQuickTts('copywrite', settings)
   const sentences = React.useMemo(() => splitSentences(content), [content])
   const [idx, setIdx] = React.useState(0)
   const [input, setInput] = React.useState('')
@@ -35,6 +39,11 @@ export function CopywritePanel({ content }: CopywritePanelProps) {
     setResult(null)
     setShowOriginal(true)
   }, [content])
+
+  React.useEffect(() => {
+    // 切换句子时停止上一句的朗读
+    tts.stop()
+  }, [idx])
 
   const handleCheck = () => {
     if (!input.trim()) {
@@ -121,6 +130,25 @@ export function CopywritePanel({ content }: CopywritePanelProps) {
           原文已隐藏，凭记忆默写吧
         </div>
       )}
+
+      {/* 朗读这句 + 音色/倍速选择（可设为默认） */}
+      <div className="flex items-center justify-between gap-2">
+        <VoiceSpeedBar context="copywrite" pref={tts.pref} onChange={tts.setPref} />
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 shrink-0 rounded-full text-xs"
+          disabled={!current.trim()}
+          onClick={() => (tts.speaking ? tts.stop() : tts.speak(current))}
+        >
+          {tts.speaking ? (
+            <Square className="size-3.5" />
+          ) : (
+            <Volume2 className="size-3.5" />
+          )}
+          {tts.speaking ? '停止朗读' : '朗读这句'}
+        </Button>
+      </div>
 
       <Textarea
         value={input}

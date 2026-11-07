@@ -53,6 +53,7 @@ import { DoodleCanvas } from '@/components/recitation/doodle-canvas'
 import { MoreSheet, type ClozeTemplate } from '@/components/recitation/more-sheet'
 import { PlanDialog } from '@/components/recitation/plan-dialog'
 import { ShareDialog } from '@/components/recitation/share-dialog'
+import { TtsPlayer } from '@/components/recitation/tts-player'
 import { ToolsSheet } from '@/components/recitation/tools-sheet'
 
 type ReaderMode = null | 'chunk' | 'doodle' | 'brush' | 'manual'
@@ -414,6 +415,30 @@ export function ReaderView({
               >
                 <Pencil className="size-5" strokeWidth={1.75} />
               </Button>
+              {/* AI 朗读控制（朗读控制栏：音色/倍速/上下句/定时/循环） */}
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label="AI朗读"
+                    className="text-foreground/80"
+                  >
+                    <Volume2 className="size-5" strokeWidth={1.75} />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  align="end"
+                  className="max-h-[70vh] w-80 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-2xl p-4"
+                >
+                  <p className="mb-3 text-sm font-bold">AI朗读</p>
+                  <TtsPlayer
+                    text={card.content}
+                    settings={settings}
+                    context="reader"
+                  />
+                </PopoverContent>
+              </Popover>
               <Button
                 variant="ghost"
                 size="icon"

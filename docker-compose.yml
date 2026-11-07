@@ -1,0 +1,14 @@
+services:
+  beishuba:
+    build: .
+    image: ghcr.io/cshdotcom/beishuba:latest
+    container_name: beishuba
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=file:/app/data/beishuba.db
+      - NODE_ENV=production
+    volumes:
+      # All persistent user data (SQLite DB) lives here on the host.
+      - ./data:/app/data
+    restart: unless-stopped
