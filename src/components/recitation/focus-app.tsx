@@ -508,7 +508,7 @@ export function FocusApp({ onBack }: FocusAppProps) {
       <button
         type="button"
         onClick={() => openEdit(null)}
-        className="z-10 shrink-0 rounded-full px-2 py-1 text-base font-bold text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        className="z-10 ml-auto shrink-0 rounded-full px-2 py-1 text-base font-bold text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         新建
       </button>
@@ -517,7 +517,7 @@ export function FocusApp({ onBack }: FocusAppProps) {
         type="button"
         onClick={save}
         disabled={!name.trim() || saving}
-        className="z-10 shrink-0 rounded-full px-2 py-1 text-base font-bold text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
+        className="z-10 ml-auto shrink-0 rounded-full px-2 py-1 text-base font-bold text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
       >
         {saving ? <Loader2 className="size-4 animate-spin" /> : '完成'}
       </button>

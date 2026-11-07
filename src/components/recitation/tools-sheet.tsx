@@ -17,14 +17,41 @@ import type { CardData, SettingsData, ToolToggles } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import { ToolTogglesSheet } from '@/components/recitation/tool-toggles-sheet'
-import { TtsPlayer } from '@/components/recitation/tts-player'
-import { AsrRecorder } from '@/components/recitation/asr-recorder'
-import { QuizPanel } from '@/components/recitation/quiz-panel'
-import { ChatTool } from '@/components/recitation/chat-tool'
-import { MindmapView } from '@/components/recitation/mindmap-view'
-import { EarbackPanel } from '@/components/recitation/panel-earback'
-import { CopywritePanel } from '@/components/recitation/panel-copywrite'
-import { WheelPanel } from '@/components/recitation/panel-wheel'
+import NextDynamic from 'next/dynamic'
+
+// 重面板懒加载（打开对应工具时才编译/加载）。
+const TtsPlayer = NextDynamic(
+  () => import('@/components/recitation/tts-player').then((m) => m.TtsPlayer),
+  { ssr: false, loading: () => <div className="h-64 animate-pulse rounded-xl bg-muted" /> },
+)
+const AsrRecorder = NextDynamic(
+  () => import('@/components/recitation/asr-recorder').then((m) => m.AsrRecorder),
+  { ssr: false, loading: () => <div className="h-64 animate-pulse rounded-xl bg-muted" /> },
+)
+const QuizPanel = NextDynamic(
+  () => import('@/components/recitation/quiz-panel').then((m) => m.QuizPanel),
+  { ssr: false, loading: () => <div className="h-64 animate-pulse rounded-xl bg-muted" /> },
+)
+const ChatTool = NextDynamic(
+  () => import('@/components/recitation/chat-tool').then((m) => m.ChatTool),
+  { ssr: false, loading: () => <div className="h-64 animate-pulse rounded-xl bg-muted" /> },
+)
+const MindmapView = NextDynamic(
+  () => import('@/components/recitation/mindmap-view').then((m) => m.MindmapView),
+  { ssr: false, loading: () => <div className="h-64 animate-pulse rounded-xl bg-muted" /> },
+)
+const EarbackPanel = NextDynamic(
+  () => import('@/components/recitation/panel-earback').then((m) => m.EarbackPanel),
+  { ssr: false, loading: () => null },
+)
+const CopywritePanel = NextDynamic(
+  () => import('@/components/recitation/panel-copywrite').then((m) => m.CopywritePanel),
+  { ssr: false, loading: () => null },
+)
+const WheelPanel = NextDynamic(
+  () => import('@/components/recitation/panel-wheel').then((m) => m.WheelPanel),
+  { ssr: false, loading: () => null },
+)
 
 export type ToolKey = keyof Omit<ToolToggles, 'aiChunk' | 'aiCloze' | 'doodle' | 'brush' | 'manualCloze' | 'ruleCloze'>
 

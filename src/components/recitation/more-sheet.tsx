@@ -312,7 +312,7 @@ export function MoreSheet({
                       }}
                       className="rounded-xl border border-border bg-background py-2 text-xs text-muted-foreground transition-colors hover:border-emerald-600/40 hover:text-emerald-600"
                     >
-                      隔{n}词
+                      隔{n}字
                     </button>
                   ))}
                 </div>
@@ -352,7 +352,7 @@ export function MoreSheet({
                     }}
                     className="rounded-xl border border-border bg-background py-2 text-xs text-muted-foreground transition-colors hover:border-emerald-600/40 hover:text-emerald-600"
                   >
-                    每隔3词
+                    每隔3字
                   </button>
                 </div>
               </ActionRow>

@@ -54,19 +54,41 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { ClozeEditorBar } from '@/components/recitation/cloze-editor-bar'
-import { ClozeStyleSheet } from '@/components/recitation/cloze-style-sheet'
-import { ClozeText } from '@/components/recitation/cloze-text'
-import { DoodleCanvas } from '@/components/recitation/doodle-canvas'
 import { MoreSheet, type ClozeTemplate } from '@/components/recitation/more-sheet'
 import { NotebookPen } from 'lucide-react'
 import { PlanDialog } from '@/components/recitation/plan-dialog'
-import { TocSheet } from '@/components/recitation/toc-sheet'
 import { ProgressSheet } from '@/components/recitation/progress-sheet'
 import { ReviewScoreBar } from '@/components/recitation/review-score-bar'
 import { ShareDialog } from '@/components/recitation/share-dialog'
-import { TtsPlayer } from '@/components/recitation/tts-player'
-import { ToolsSheet } from '@/components/recitation/tools-sheet'
+import NextDynamic from 'next/dynamic'
+
+// 重组件懒加载：拆小首页/阅读页的编译图，避免 dev 编译内存峰值过高。
+const DoodleCanvas = NextDynamic(
+  () => import('@/components/recitation/doodle-canvas').then((m) => m.DoodleCanvas),
+  { ssr: false, loading: () => null },
+)
+const TtsPlayer = NextDynamic(
+  () => import('@/components/recitation/tts-player').then((m) => m.TtsPlayer),
+  { ssr: false, loading: () => <div className="h-64 animate-pulse rounded-xl bg-muted" /> },
+)
+const ClozeEditorBar = NextDynamic(
+  () => import('@/components/recitation/cloze-editor-bar').then((m) => m.ClozeEditorBar),
+  { ssr: false, loading: () => null },
+)
+const ClozeStyleSheet = NextDynamic(
+  () => import('@/components/recitation/cloze-style-sheet').then((m) => m.ClozeStyleSheet),
+  { ssr: false, loading: () => null },
+)
+const ToolsSheet = NextDynamic(
+  () => import('@/components/recitation/tools-sheet').then((m) => m.ToolsSheet),
+  { ssr: false, loading: () => null },
+)
+const TocSheet = NextDynamic(
+  () => import('@/components/recitation/toc-sheet').then((m) => m.TocSheet),
+  { ssr: false, loading: () => null },
+)
+// 字级挖空渲染 + 自定义选择菜单（核心阅读组件，静态导入保证首屏无闪烁）
+import { ClozeText } from '@/components/recitation/cloze-text'
 
 type ReaderMode = null | 'chunk' | 'doodle' | 'brush' | 'manual' | 'editor'
 

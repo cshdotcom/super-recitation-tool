@@ -185,6 +185,14 @@ export function ClozeText({
   // 挖空选中 button — replaces the native selection callout.
   // ===========================================================================
   const menuEnabled = (selectionMode || selectMenuEnabled) && !brushMode
+  // 触屏设备才禁用原生选择（用自定义长按选字）；桌面保留原生拖选，
+  // 右键菜单直接读取原生 selection。
+  const [isTouchDevice] = React.useState(
+    () =>
+      typeof window !== 'undefined' &&
+      ('ontouchstart' in window || (navigator.maxTouchPoints ?? 0) > 0),
+  )
+  const suppressNativeSelect = menuEnabled && isTouchDevice
   const [selHL, setSelHL] = React.useState<Set<number>>(new Set())
   const [selMenu, setSelMenu] = React.useState<{
     x: number
@@ -722,7 +730,6 @@ export function ClozeText({
           }}
           className={cn(
             'cursor-pointer align-middle',
-            'select-none [-webkit-touch-callout:none]',
             style !== 'blur' && 'transition-colors',
             styleCls,
             hlCls(true),
@@ -794,7 +801,6 @@ export function ClozeText({
                     data-char="1"
                     data-ci={ci}
                     className={cn(
-                      'select-none [-webkit-touch-callout:none]',
                       hlCls(false),
                     )}
                   >
@@ -827,7 +833,6 @@ export function ClozeText({
                   data-char="1"
                   data-ci={ci}
                   className={cn(
-                    'select-none [-webkit-touch-callout:none]',
                     hlCls(false),
                   )}
                 >
@@ -842,7 +847,6 @@ export function ClozeText({
                 data-ci={ci}
                 data-word={brushMode ? w.text : undefined}
                 className={cn(
-                  'select-none [-webkit-touch-callout:none]',
                   brushMode && 'cursor-crosshair rounded-sm transition-colors hover:bg-accent/70',
                   manualMode && 'cursor-text rounded-sm transition-colors hover:bg-accent/70',
                   hlCls(false),
@@ -951,7 +955,7 @@ export function ClozeText({
       className={cn(
         'leading-loose text-zinc-800 dark:text-zinc-200',
         brushMode && 'touch-none select-none',
-        menuEnabled && 'select-none [-webkit-touch-callout:none]',
+        suppressNativeSelect && 'select-none [-webkit-touch-callout:none]',
       )}
       style={{ fontSize: `${fontSize}px` }}
       onPointerDown={(e) => {

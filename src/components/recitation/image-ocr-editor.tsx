@@ -493,6 +493,8 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
             识别全部并合并
           </Button>
         </div>
+
+        <DialogTitle className="sr-only">图片识别 多张合并</DialogTitle>
       </DialogContent>
 
       <input
@@ -506,7 +508,6 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
           e.target.value = ''
         }}
       />
-      <DialogTitle className="sr-only">图片识别 多张合并</DialogTitle>
     </Dialog>
   )
 }

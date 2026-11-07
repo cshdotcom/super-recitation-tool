@@ -12,16 +12,58 @@ import { ReaderView } from '@/components/recitation/reader-view'
 import { ImportSheet, type ImportPayload } from '@/components/recitation/import-sheet'
 import { SettingsSheet } from '@/components/recitation/settings-sheet'
 import { AccountSheet } from '@/components/recitation/account-sheet'
-import { WrongQuestionsView } from '@/components/recitation/wrong-questions-view'
-import { QuizReportView } from '@/components/recitation/quiz-report-view'
-import { FavoritesView } from '@/components/recitation/favorites-view'
-import { ReviewStatsView } from '@/components/recitation/review-stats-view'
-import { PlanEditorView } from '@/components/recitation/plan-editor-view'
-import { PlanManagerView } from '@/components/recitation/plan-manager-view'
-import { ReviewOverviewView } from '@/components/recitation/review-overview-view'
-import { MaterialEditor } from '@/components/recitation/material-editor'
-import { FocusApp } from '@/components/recitation/focus-app'
-import { RecycleBinView } from '@/components/recitation/recycle-bin-view'
+import NextDynamic from 'next/dynamic'
+
+// 全部视图懒加载：拆小编译图，避免 dev 编译内存峰值触发 OOM。
+const WrongQuestionsView = NextDynamic(
+  () => import('@/components/recitation/wrong-questions-view').then((m) => m.WrongQuestionsView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const QuizReportView = NextDynamic(
+  () => import('@/components/recitation/quiz-report-view').then((m) => m.QuizReportView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const FavoritesView = NextDynamic(
+  () => import('@/components/recitation/favorites-view').then((m) => m.FavoritesView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const ReviewStatsView = NextDynamic(
+  () => import('@/components/recitation/review-stats-view').then((m) => m.ReviewStatsView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const PlanEditorView = NextDynamic(
+  () => import('@/components/recitation/plan-editor-view').then((m) => m.PlanEditorView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const PlanManagerView = NextDynamic(
+  () => import('@/components/recitation/plan-manager-view').then((m) => m.PlanManagerView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const ReviewOverviewView = NextDynamic(
+  () => import('@/components/recitation/review-overview-view').then((m) => m.ReviewOverviewView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const MaterialEditor = NextDynamic(
+  () => import('@/components/recitation/material-editor').then((m) => m.MaterialEditor),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const FocusApp = NextDynamic(
+  () => import('@/components/recitation/focus-app').then((m) => m.FocusApp),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const RecycleBinView = NextDynamic(
+  () => import('@/components/recitation/recycle-bin-view').then((m) => m.RecycleBinView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+
+function PageSkeleton() {
+  return (
+    <div className="mx-auto w-full max-w-2xl flex-1 px-4 pt-10">
+      <div className="h-10 w-40 animate-pulse rounded-xl bg-muted" />
+      <div className="mt-6 h-40 animate-pulse rounded-2xl bg-muted" />
+    </div>
+  )
+}
 
 type View =
   | 'home'
@@ -222,6 +264,7 @@ export default function Page() {
             strokes: next.strokes,
             plan: next.plan,
             mindmaps: next.mindmaps,
+            blocks: next.blocks,
           }),
         })
         if (!res.ok) {
