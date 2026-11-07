@@ -1,0 +1,34 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A recitation / memorization card.
+// `keywords` is a JSON-encoded string[] of words that should be blanked out (挖空).
+model Card {
+  id        String   @id @default(cuid())
+  title     String
+  content   String
+  keywords  String   @default("[]")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Singleton settings row (id = "singleton").
+model Settings {
+  id         String  @id
+  clozeStyle String  @default("underline") // underline | highlight
+  showAnswers Boolean @default(false)
+  tools      String  @default("")          // JSON-encoded ToolToggles
+  aiProvider String  @default("zai")       // zai | custom
+  aiBaseURL  String?
+  aiApiKey   String?
+  aiModel    String?
+}
