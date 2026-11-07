@@ -101,7 +101,15 @@ export function ToolsSheet({
           />
         )
       case 'quiz':
-        return <QuizPanel content={content} keywords={card.keywords} />
+        return (
+          <QuizPanel
+            content={content}
+            keywords={card.keywords}
+            cardId={card.id}
+            cardTitle={card.title}
+            autoRemove={settings.quizAutoRemove}
+          />
+        )
       case 'supervise':
         return <ChatTool mode="supervise" content={content} />
       case 'ask':

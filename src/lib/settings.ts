@@ -34,6 +34,7 @@ export function parseSettings(row: {
   asrBaseURL?: string | null
   asrApiKey?: string | null
   asrModel?: string | null
+  quizAutoRemove?: number | null
 } | null): SettingsData {
   let tools: ToolToggles = { ...DEFAULT_TOOLS }
   try {
@@ -41,8 +42,9 @@ export function parseSettings(row: {
   } catch {}
 
   let clozeStyle: ClozeStyle = 'circle'
-  if (row?.clozeStyle === 'underline') clozeStyle = 'underline'
-  // legacy 'highlight' maps to the new 圈圈 (circle) style
+  if (['circle', 'underline', 'blur', 'star', 'blank', 'highlight'].includes(row?.clozeStyle || '')) {
+    clozeStyle = row!.clozeStyle as ClozeStyle
+  }
 
   let pageMode: PageMode = 'scroll'
   if (row?.pageMode === 'paged') pageMode = 'paged'
@@ -85,6 +87,10 @@ export function parseSettings(row: {
     asrBaseURL: row?.asrBaseURL ?? '',
     asrApiKey: row?.asrApiKey ?? '',
     asrModel: row?.asrModel ?? '',
+    quizAutoRemove:
+      typeof row?.quizAutoRemove === 'number' && [1, 2, 3, 5].includes(row.quizAutoRemove)
+        ? (row.quizAutoRemove as 1 | 2 | 3 | 5)
+        : 2,
   }
 }
 

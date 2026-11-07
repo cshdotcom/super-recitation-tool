@@ -1,6 +1,7 @@
 'use client'
 
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 import { Copy, Eraser, Eye, Flag, Volume2 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -44,6 +45,11 @@ interface ClozeTextProps {
   revealed: Set<number>
   onReveal: (idx: number) => void
   onToggleKeyword: (word: string) => void
+  /** 挖空编辑模式: watch text selection → 挖空选中 floating button; tapping a
+   * blank removes it instead of revealing the answer. */
+  selectionMode?: boolean
+  /** Called with the trimmed selected text when 挖空选中 is tapped. */
+  onSelectCloze?: (text: string) => void
   /** Full override of the per-blank long-press menu actions. */
   menuActions?: MenuAction[]
   /** 取消挖空 — only adds the menu action when provided. */
@@ -68,12 +74,15 @@ export function ClozeText({
   revealed,
   onReveal,
   onToggleKeyword,
+  selectionMode = false,
+  onSelectCloze,
   menuActions,
   onRemoveKeyword,
   onMarkHard,
   onMenuAction,
 }: ClozeTextProps) {
   const containerRef = React.useRef<HTMLDivElement>(null)
+  const rootRef = React.useRef<HTMLDivElement>(null)
   const draggingRef = React.useRef(false)
   const touchedRef = React.useRef<Set<string>>(new Set())
   const [page, setPage] = React.useState(0)
@@ -162,6 +171,104 @@ export function ClozeText({
     }
   }
 
+  // ---- 挖空编辑模式 (selectionMode): watch text selection inside the root
+  // element and surface a floating 挖空选中 pill near the selection. ----
+  const [selAction, setSelAction] = React.useState<{
+    x: number
+    y: number
+    above: boolean
+    text: string
+  } | null>(null)
+  const selBtnRef = React.useRef<HTMLButtonElement>(null)
+  const selDebounceRef = React.useRef<number | null>(null)
+  const [selMounted, setSelMounted] = React.useState(false)
+  React.useEffect(() => setSelMounted(true), [])
+
+  const evaluateSelection = React.useCallback(() => {
+    if (!selectionMode) {
+      setSelAction(null)
+      return
+    }
+    const sel = document.getSelection()
+    const text = (sel?.toString() ?? '').trim()
+    const container = rootRef.current
+    if (
+      !sel ||
+      sel.isCollapsed ||
+      sel.rangeCount === 0 ||
+      text.length < 1 ||
+      text.length > 50 ||
+      !container ||
+      !sel.anchorNode ||
+      !sel.focusNode ||
+      !container.contains(sel.anchorNode) ||
+      !container.contains(sel.focusNode)
+    ) {
+      setSelAction(null)
+      return
+    }
+    let rect: DOMRect | null = null
+    try {
+      rect = sel.getRangeAt(0).getBoundingClientRect()
+    } catch {
+      rect = null
+    }
+    if (!rect || (rect.width === 0 && rect.height === 0)) {
+      setSelAction(null)
+      return
+    }
+    const above = rect.top > 64
+    const x = Math.min(Math.max(rect.left + rect.width / 2, 80), window.innerWidth - 80)
+    const y = above ? rect.top - 10 : rect.bottom + 10
+    setSelAction({ x, y, above, text })
+  }, [selectionMode])
+
+  const handleSelectionTouchEnd = React.useCallback(() => {
+    // The selection may still settle after touchend; the debounced
+    // selectionchange listener below corrects any drift.
+    window.setTimeout(evaluateSelection, 0)
+  }, [evaluateSelection])
+
+  const handleSelectCloze = () => {
+    if (!selAction) return
+    const text = selAction.text
+    setSelAction(null)
+    document.getSelection()?.removeAllRanges()
+    onSelectCloze?.(text)
+  }
+
+  React.useEffect(() => {
+    if (!selectionMode) {
+      setSelAction(null)
+      return
+    }
+    const onSelectionChange = () => {
+      if (selDebounceRef.current !== null) window.clearTimeout(selDebounceRef.current)
+      selDebounceRef.current = window.setTimeout(() => {
+        selDebounceRef.current = null
+        evaluateSelection()
+      }, 250)
+    }
+    const onDocPointerDown = (e: PointerEvent) => {
+      const target = e.target as Node | null
+      if (target && selBtnRef.current?.contains(target)) return
+      setSelAction(null)
+    }
+    const hide = () => setSelAction(null)
+    document.addEventListener('selectionchange', onSelectionChange)
+    document.addEventListener('pointerdown', onDocPointerDown)
+    window.addEventListener('scroll', hide, true)
+    window.addEventListener('resize', hide)
+    return () => {
+      document.removeEventListener('selectionchange', onSelectionChange)
+      document.removeEventListener('pointerdown', onDocPointerDown)
+      window.removeEventListener('scroll', hide, true)
+      window.removeEventListener('resize', hide)
+      if (selDebounceRef.current !== null) window.clearTimeout(selDebounceRef.current)
+      selDebounceRef.current = null
+    }
+  }, [selectionMode, evaluateSelection])
+
   const keywordSet = React.useMemo(() => new Set(keywords), [keywords])
 
   // ---- brush drag handlers (work for both mouse and touch) ----
@@ -227,7 +334,129 @@ export function ClozeText({
       const tempOn = tempRevealed.has(idx)
       const visible = showAnswers || isRevealed || tempOn
       const effRevealed = isRevealed || tempOn
-      const isCircle = style === 'circle'
+
+      // Shared answer-state tints: amber once this blank's answer is shown as
+      // revealed, emerald when answers are globally on but not peeked here.
+      const revealedCls = 'bg-amber-200/70 text-foreground dark:bg-amber-500/30'
+      const peekedCls = 'bg-emerald-500/10 text-foreground/90'
+
+      let styleCls = ''
+      let inner: React.ReactNode = text
+      switch (style) {
+        case 'circle':
+          styleCls = cn(
+            'inline-block rounded-[50%] border-2 px-2 text-center',
+            !visible && 'border-foreground/50 text-transparent',
+            visible && effRevealed && cn('border-emerald-500/60', revealedCls),
+            visible && !effRevealed && cn('border-emerald-500/40', peekedCls),
+          )
+          break
+        case 'underline':
+          styleCls = cn(
+            'border-b-2',
+            !visible && 'border-dashed border-foreground/50 text-transparent',
+            visible && effRevealed && cn('border-emerald-500/60', revealedCls),
+            visible && !effRevealed && cn('border-emerald-500/40', peekedCls),
+          )
+          break
+        case 'blur':
+          // Text stays in place but blurred; the blur lifts (with a filter
+          // transition) when the answer shows.
+          styleCls = cn(
+            'rounded-sm',
+            !visible && 'opacity-80',
+            visible && effRevealed && revealedCls,
+            visible && !effRevealed && peekedCls,
+          )
+          break
+        case 'star':
+          styleCls = cn(
+            !visible && 'text-foreground/45',
+            visible && effRevealed && cn('rounded-sm', revealedCls),
+            visible && !effRevealed && cn('rounded-sm', peekedCls),
+          )
+          // One * per character (JSX-level swap; data-word keeps the real text).
+          if (!visible) inner = '*'.repeat(Array.from(text).length)
+          break
+        case 'blank':
+          styleCls = cn(
+            'rounded',
+            !visible && 'bg-muted-foreground/15 text-transparent',
+            visible && effRevealed && revealedCls,
+            visible && !effRevealed && peekedCls,
+          )
+          break
+        case 'highlight':
+          styleCls = cn(
+            'rounded',
+            !visible && 'bg-amber-300/60 text-transparent',
+            visible && effRevealed && revealedCls,
+            visible && !effRevealed && peekedCls,
+          )
+          break
+      }
+
+      const blank = (
+        <span
+          key={`b-${idx}`}
+          role="button"
+          tabIndex={0}
+          aria-label={
+            selectionMode
+              ? `已挖空：${text}，点击取消挖空`
+              : visible
+                ? `已显示：${text}`
+                : '点击显示答案'
+          }
+          data-word={text}
+          onClick={(e) => {
+            e.stopPropagation()
+            if (!brushMode) {
+              if (selectionMode) onToggleKeyword(text)
+              else onReveal(idx)
+            }
+          }}
+          onDoubleClick={
+            selectionMode
+              ? undefined
+              : (e) => {
+                  e.stopPropagation()
+                  onToggleKeyword(text)
+                }
+          }
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              if (!brushMode) {
+                if (selectionMode) onToggleKeyword(text)
+                else onReveal(idx)
+              }
+            }
+          }}
+          className={cn(
+            'cursor-pointer align-middle',
+            selectionMode ? 'select-text' : 'select-none',
+            style !== 'blur' && 'transition-colors',
+            styleCls,
+          )}
+          style={{
+            minWidth: '1.5em',
+            ...(style === 'blur'
+              ? {
+                  filter: !visible ? 'blur(5px)' : 'blur(0px)',
+                  transition:
+                    'filter 200ms ease, opacity 200ms ease, background-color 200ms ease, color 200ms ease',
+                }
+              : {}),
+          }}
+        >
+          {inner}
+        </span>
+      )
+
+      // 编辑模式: render blanks bare so native long-press text selection works
+      // (the long-press menu would swallow it); tapping a blank toggles it off.
+      if (selectionMode) return blank
 
       const blankActions: MenuAction[] =
         menuActions ??
@@ -242,56 +471,6 @@ export function ClozeText({
             ? [{ key: 'mark', label: '标记难点', icon: <Flag className="size-3.5" strokeWidth={1.75} /> }]
             : []),
         ]
-
-      const blank = (
-        <span
-          role="button"
-          tabIndex={0}
-          aria-label={visible ? `已显示：${text}` : '点击显示答案'}
-          data-word={text}
-          onClick={(e) => {
-            e.stopPropagation()
-            if (!brushMode) onReveal(idx)
-          }}
-          onDoubleClick={(e) => {
-            e.stopPropagation()
-            onToggleKeyword(text)
-          }}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault()
-              if (!brushMode) onReveal(idx)
-            }
-          }}
-          className={cn(
-            'cursor-pointer select-none align-middle transition-colors',
-            isCircle
-              ? cn(
-                  'inline-block rounded-[50%] border-2 px-2 text-center',
-                  !visible && 'border-foreground/50 text-transparent',
-                  visible &&
-                    effRevealed &&
-                    'border-emerald-500/60 bg-amber-200/70 text-foreground dark:bg-amber-500/30',
-                  visible &&
-                    !effRevealed &&
-                    'border-emerald-500/40 bg-emerald-500/10 text-foreground/90',
-                )
-              : cn(
-                  'border-b-2',
-                  !visible && 'border-dashed border-foreground/50 text-transparent',
-                  visible &&
-                    effRevealed &&
-                    'border-emerald-500/60 bg-amber-200/70 text-foreground dark:bg-amber-500/30',
-                  visible &&
-                    !effRevealed &&
-                    'border-emerald-500/40 bg-emerald-500/10 text-foreground/90',
-                ),
-          )}
-          style={{ minWidth: '1.5em' }}
-        >
-          {text}
-        </span>
-      )
 
       return (
         <LongPressMenu
@@ -330,6 +509,11 @@ export function ClozeText({
             if (!w.isWord) return <span key={`w-${i}`}>{w.text}</span>
             if (keywordSet.has(w.text)) {
               return renderBlank(w.text)
+            }
+            if (selectionMode) {
+              // 编辑模式: plain words stay plain — new blanks are added via the
+              // selection floating button, not dblclick.
+              return <span key={`w-${i}`}>{w.text}</span>
             }
             return (
               <span
@@ -438,6 +622,7 @@ export function ClozeText({
 
   return (
     <div
+      ref={rootRef}
       className={cn(
         'leading-loose text-zinc-800 dark:text-zinc-200',
         brushMode && 'touch-none select-none',
@@ -448,8 +633,30 @@ export function ClozeText({
       onPointerUp={() => {
         draggingRef.current = false
       }}
+      onMouseUp={selectionMode ? evaluateSelection : undefined}
+      onTouchEnd={selectionMode ? handleSelectionTouchEnd : undefined}
     >
       {buildContent()}
+      {selMounted &&
+        selectionMode &&
+        selAction &&
+        createPortal(
+          <button
+            ref={selBtnRef}
+            type="button"
+            aria-label="挖空选中"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={handleSelectCloze}
+            style={{ left: selAction.x, top: selAction.y }}
+            className={cn(
+              'fixed left-0 top-0 z-50 -translate-x-1/2 whitespace-nowrap rounded-full bg-zinc-900/95 px-4 py-2 text-sm font-medium text-white shadow-xl backdrop-blur',
+              selAction.above ? '-translate-y-full' : 'translate-y-0',
+            )}
+          >
+            挖空选中
+          </button>,
+          document.body,
+        )}
     </div>
   )
 }

@@ -80,7 +80,11 @@ export function serializeCard(c: {
   try {
     const parsed = JSON.parse(c.plan || 'null')
     if (parsed && typeof parsed === 'object' && typeof parsed.goal === 'number') {
-      plan = { goal: parsed.goal }
+      plan = {
+        goal: parsed.goal,
+        ...(typeof parsed.dailyNew === 'number' ? { dailyNew: parsed.dailyNew } : {}),
+        ...(typeof parsed.reviewTimes === 'number' ? { reviewTimes: parsed.reviewTimes } : {}),
+      }
     }
   } catch {}
 

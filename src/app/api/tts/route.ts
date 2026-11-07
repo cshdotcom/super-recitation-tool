@@ -269,20 +269,41 @@ export async function POST(req: NextRequest) {
     }
 
     // provider === 'zai' — built-in pipeline (audio/wav).
+    // The upstream occasionally rate-limits (429): retry each chunk a few
+    // times with a short backoff before giving up.
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
     const voice = rawVoice || 'tongtong'
     const zai = await getZAI()
     const pcms: Buffer[] = []
     let fmt: FmtInfo | null = null
 
     for (const chunk of chunks) {
-      const r = await zai.audio.tts.create({
-        input: chunk,
-        voice,
-        speed,
-        response_format: 'wav',
-        stream: false,
-      })
-      const buf = Buffer.from(new Uint8Array(await r.arrayBuffer()))
+      let buf: Buffer | null = null
+      let lastErr: unknown = null
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const r = await zai.audio.tts.create({
+            input: chunk,
+            voice,
+            speed,
+            response_format: 'wav',
+            stream: false,
+          })
+          buf = Buffer.from(new Uint8Array(await r.arrayBuffer()))
+          break
+        } catch (e) {
+          lastErr = e
+          const m = e instanceof Error ? e.message : String(e)
+          // Only retry on rate-limit / transient failures.
+          if (!/429|Too many|timeout|ECONN|502|503/i.test(m)) throw e
+          await sleep(800 * (attempt + 1))
+        }
+      }
+      if (!buf) {
+        throw lastErr instanceof Error
+          ? new Error(`语音合成繁忙，请稍后再试（${lastErr.message.slice(0, 80)}）`)
+          : new Error('语音合成繁忙，请稍后再试')
+      }
       const parsed = parseWav(buf)
       if (!fmt) fmt = parsed.fmt
       pcms.push(parsed.pcm)

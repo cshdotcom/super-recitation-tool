@@ -62,7 +62,7 @@ export async function PATCH(
         .filter((s): s is Stroke => s !== null)
       data.strokes = JSON.stringify(validStrokes)
     }
-    // 今日计划 plan: { goal: number } | null
+    // 背书计划 plan: { goal, dailyNew?, reviewTimes? } | null
     if (body?.plan !== undefined) {
       if (body.plan === null) {
         data.plan = ''
@@ -71,7 +71,16 @@ export async function PATCH(
         typeof body.plan.goal === 'number' &&
         Number.isFinite(body.plan.goal)
       ) {
-        data.plan = JSON.stringify({ goal: Math.min(200, Math.max(1, Math.round(body.plan.goal))) })
+        const planObj: Record<string, number> = {
+          goal: Math.min(200, Math.max(1, Math.round(body.plan.goal))),
+        }
+        if (typeof body.plan.dailyNew === 'number' && Number.isFinite(body.plan.dailyNew)) {
+          planObj.dailyNew = Math.min(50, Math.max(1, Math.round(body.plan.dailyNew)))
+        }
+        if (typeof body.plan.reviewTimes === 'number' && Number.isFinite(body.plan.reviewTimes)) {
+          planObj.reviewTimes = Math.min(20, Math.max(1, Math.round(body.plan.reviewTimes)))
+        }
+        data.plan = JSON.stringify(planObj)
       }
     }
     // 思维导图 mindmaps: array of MindmapDoc objects (persisted JSON)

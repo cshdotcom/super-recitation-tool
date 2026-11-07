@@ -14,6 +14,7 @@ import {
   BookOpen,
   FileStack,
   SlidersHorizontal,
+  Star,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -30,6 +31,11 @@ import { BottomSheet } from '@/components/recitation/bottom-sheet'
 interface QuizPanelProps {
   content: string
   keywords: string[]
+  /** 错题/收藏上报归属卡 */
+  cardId?: string
+  cardTitle?: string
+  /** 答对后自动移除错题 — 答对N次后 */
+  autoRemove?: number
 }
 
 type QuizScope = 'chapter' | 'book' | 'custom'
@@ -49,11 +55,13 @@ const TYPE_LABEL: Record<QuizQuestion['type'], string> = {
   choice: '选择',
 }
 
-export function QuizPanel({ content, keywords }: QuizPanelProps) {
+export function QuizPanel({ content, keywords, cardId, cardTitle, autoRemove = 2 }: QuizPanelProps) {
   const [questions, setQuestions] = React.useState<QuizQuestion[]>([])
   const [loading, setLoading] = React.useState(false)
   const [answers, setAnswers] = React.useState<Record<number, string>>({})
   const [revealed, setRevealed] = React.useState<Set<number>>(new Set())
+  const [favorites, setFavorites] = React.useState<Set<number>>(new Set())
+  const [quizStart, setQuizStart] = React.useState<number>(Date.now())
 
   // ---- scope selection (请选择出题范围 sheet, opens first every time) ----
   const [scopeOpen, setScopeOpen] = React.useState(false)
@@ -99,6 +107,8 @@ export function QuizPanel({ content, keywords }: QuizPanelProps) {
       setQuestions(qs)
       setAnswers({})
       setRevealed(new Set())
+      setFavorites(new Set())
+      setQuizStart(Date.now())
       toast.success(`已生成 ${qs.length} 道题`, { id: tid })
     } catch (err) {
       toast.error(
@@ -181,6 +191,28 @@ export function QuizPanel({ content, keywords }: QuizPanelProps) {
       else next.add(idx)
       return next
     })
+    // 第一次看答案时判定对错并上报错题/答题报告（服务端持久化）。
+    const q = questions[idx]
+    if (q && !revealed.has(idx)) {
+      const ans = (answers[idx] || '').trim()
+      const right = !!ans && ans === q.answer.trim()
+      void fetch('/api/quiz-items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cardId,
+          cardTitle,
+          type: q.type,
+          question: q.question,
+          answer: q.answer,
+          options: q.options ?? [],
+          result: right ? 'right' : 'wrong',
+          autoRemove,
+          durationSec: Math.min(600, Math.round((Date.now() - quizStart) / 1000)),
+        }),
+      }).catch(() => {})
+      if (!right) toast.warning('已加入错题本')
+    }
   }
 
   const setAnswer = (idx: number, val: string) => {
@@ -194,6 +226,34 @@ export function QuizPanel({ content, keywords }: QuizPanelProps) {
       else next.add(i)
       return next
     })
+  }
+
+  // 收藏题目：POST upsert（favorite:true/false），本地 optimistic 更新。
+  const toggleFavorite = (idx: number) => {
+    const q = questions[idx]
+    if (!q) return
+    const willFav = !favorites.has(idx)
+    setFavorites((prev) => {
+      const next = new Set(prev)
+      if (willFav) next.add(idx)
+      else next.delete(idx)
+      return next
+    })
+    void fetch('/api/quiz-items', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cardId,
+        cardTitle,
+        type: q.type,
+        question: q.question,
+        answer: q.answer,
+        options: q.options ?? [],
+        favorite: willFav,
+      }),
+    })
+      .then(() => toast.success(willFav ? '已收藏题目' : '已取消收藏'))
+      .catch(() => toast.error('收藏失败，请重试'))
   }
 
   // Auto-evaluate choice questions (counted only when revealed)
@@ -303,6 +363,23 @@ export function QuizPanel({ content, keywords }: QuizPanelProps) {
                     >
                       {TYPE_LABEL[q.type]}
                     </Badge>
+                    <button
+                      type="button"
+                      aria-label={favorites.has(idx) ? '取消收藏' : '收藏题目'}
+                      onClick={() => toggleFavorite(idx)}
+                      className={cn(
+                        'shrink-0 rounded-full p-1.5 transition-colors',
+                        favorites.has(idx)
+                          ? 'text-amber-400 hover:text-amber-500'
+                          : 'text-muted-foreground/50 hover:text-amber-400',
+                      )}
+                    >
+                      <Star
+                        className="size-4"
+                        strokeWidth={1.75}
+                        fill={favorites.has(idx) ? 'currentColor' : 'none'}
+                      />
+                    </button>
                   </div>
 
                   {isChoice && q.options ? (
@@ -398,6 +475,7 @@ export function QuizPanel({ content, keywords }: QuizPanelProps) {
           onClick={() => {
             setAnswers({})
             setRevealed(new Set())
+            setQuizStart(Date.now())
           }}
           className="w-full text-muted-foreground"
         >

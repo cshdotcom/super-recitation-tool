@@ -52,6 +52,8 @@ model Settings {
   asrBaseURL  String?
   asrApiKey   String?
   asrModel    String?
+  // 错题本：答对后自动移除错题 — 答对N次后 (1/2/3/5)
+  quizAutoRemove Int @default(2)
 }
 
 // The single app account. Registration is only allowed while this table is
@@ -80,4 +82,38 @@ model Share {
   cardId    String
   expiresAt DateTime?
   createdAt DateTime  @default(now())
+}
+
+// A quiz question stored on the server: 错题本 (wrong questions) + 收藏题目.
+// Every wrong answer creates/updates a row (wrongCount++). A correct answer
+// bumps rightStreak; once it reaches the user's "答对N次后移除" threshold the
+// row is auto-removed (removed=true). favorite=true rows show in 收藏题目.
+model QuizItem {
+  id          String   @id @default(uuid())
+  cardId      String
+  cardTitle   String   @default("")
+  type        String   // fill | short | choice
+  question    String
+  answer      String
+  options     String   @default("[]") // JSON string[] for choice
+  wrongCount  Int      @default(0)
+  rightCount  Int      @default(0)
+  rightStreak Int      @default(0)
+  favorite    Boolean  @default(false)
+  removed     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// One row per review/score action (熟悉/模糊/忘记) or quiz answer, so all
+// statistics (今日复习/连续复习/今日用时/掌握情况/复习日历/答题报告) are
+// aggregated from server data.
+// action: familiar | fuzzy | forget | quiz-right | quiz-wrong
+model ReviewLog {
+  id          String   @id @default(uuid())
+  cardId      String
+  cardTitle   String   @default("")
+  action      String
+  durationSec Int      @default(0)
+  createdAt   DateTime @default(now())
 }

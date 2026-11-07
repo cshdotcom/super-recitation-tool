@@ -4,10 +4,14 @@ import * as React from 'react'
 import { formatDistanceToNow } from 'date-fns'
 import { zhCN } from 'date-fns/locale'
 import {
+  BarChart3,
   BookOpenText,
+  BookX,
+  ClipboardList,
   LogOut,
   Plus,
   Settings as SettingsIcon,
+  Star,
   Trash2,
 } from 'lucide-react'
 
@@ -39,6 +43,11 @@ interface HomeViewProps {
   onOpenSettings: () => void
   onOpenAccount: () => void
   onLogout: () => void
+  /** 学习工具入口（可选，默认空函数） */
+  onOpenWrong?: () => void
+  onOpenReport?: () => void
+  onOpenFavorites?: () => void
+  onOpenReviewStats?: () => void
 }
 
 export function HomeView({
@@ -51,6 +60,10 @@ export function HomeView({
   onOpenSettings,
   onOpenAccount,
   onLogout,
+  onOpenWrong = () => {},
+  onOpenReport = () => {},
+  onOpenFavorites = () => {},
+  onOpenReviewStats = () => {},
 }: HomeViewProps) {
   return (
     <>
@@ -127,6 +140,31 @@ export function HomeView({
             ))}
           </div>
         )}
+
+        {/* 学习工具入口 */}
+        <section className="mt-6">
+          <h2 className="text-sm text-muted-foreground">学习工具</h2>
+          <div className="mt-2 grid grid-cols-4 gap-2">
+            {(
+              [
+                { label: '错题本', icon: BookX, onClick: onOpenWrong },
+                { label: '答题报告', icon: ClipboardList, onClick: onOpenReport },
+                { label: '收藏题目', icon: Star, onClick: onOpenFavorites },
+                { label: '复习统计', icon: BarChart3, onClick: onOpenReviewStats },
+              ] as const
+            ).map((tool) => (
+              <button
+                key={tool.label}
+                type="button"
+                onClick={tool.onClick}
+                className="flex flex-col items-center gap-1.5 rounded-xl border border-border bg-card py-3 text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <tool.icon className="size-5" strokeWidth={1.75} aria-hidden />
+                <span className="text-[11px]">{tool.label}</span>
+              </button>
+            ))}
+          </div>
+        </section>
       </main>
 
       {/* Fixed bottom-center black pill button */}

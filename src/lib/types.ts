@@ -1,9 +1,77 @@
 // Shared types used by both backend API routes and the frontend.
 
-export type ClozeStyle = 'circle' | 'underline'
+// 挖空显示样式 — matches the 挖空显示样式 sheet:
+//   underline 下划线 | blur 模糊 | star 星号 | blank 空白 | highlight 高亮 | circle 圈圈
+export type ClozeStyle = 'circle' | 'underline' | 'blur' | 'star' | 'blank' | 'highlight'
+
+export const CLOZE_STYLE_OPTIONS: { value: ClozeStyle; label: string }[] = [
+  { value: 'underline', label: '下划线' },
+  { value: 'blur', label: '模糊' },
+  { value: 'star', label: '星号' },
+  { value: 'blank', label: '空白' },
+  { value: 'highlight', label: '高亮' },
+  { value: 'circle', label: '圈圈' },
+]
 
 export interface CardPlan {
+  /** 今日计划：每日目标次数（保留旧语义） */
   goal: number
+  /** 每日计划：新学章节量 (制作背书计划) */
+  dailyNew?: number
+  /** 每日计划：复习遍数 (复习5遍) */
+  reviewTimes?: number
+}
+
+// ---------- review (熟悉/模糊/忘记) ----------
+export type ReviewAction = 'familiar' | 'fuzzy' | 'forget'
+export const REVIEW_ACTIONS: { value: ReviewAction; label: string }[] = [
+  { value: 'familiar', label: '熟悉' },
+  { value: 'fuzzy', label: '模糊' },
+  { value: 'forget', label: '忘记' },
+]
+
+/** Per-card mastery derived from the latest review action. */
+export type Mastery = 'familiar' | 'fuzzy' | 'forget' | 'none'
+
+export interface ReviewStats {
+  todayCount: number      // 今日复习次数
+  streakDays: number      // 连续复习天数
+  todaySeconds: number    // 今日用时（分钟显示时除以60）
+  mastery: Record<Mastery, number> // 掌握情况（按卡片）
+  calendar: Record<string, number> // 'YYYY-MM-DD' -> 复习次数（近一年）
+}
+
+// ---------- quiz items (错题本 / 收藏题目) ----------
+export interface QuizItemData {
+  id: string
+  cardId: string
+  cardTitle: string
+  type: QuizType
+  question: string
+  answer: string
+  options: string[]
+  wrongCount: number
+  rightCount: number
+  favorite: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export interface WrongStats {
+  rate: number        // 错题率（今日答错/今日答题 %）
+  wrongCount: number  // 错题数
+  todayWrong: number  // 今日错题
+  multiWrong: number  // 多次做错（wrongCount>=2）
+  buckets: { fivePlus: number; three: number; two: number; one: number }
+}
+
+/** 答对后自动移除错题 — 答对N次后 */
+export type AutoRemoveThreshold = 1 | 2 | 3 | 5
+
+export interface QuizReportStats {
+  todayAnswered: number // 今日练习题数
+  todaySeconds: number  // 今日练习时长（秒）
+  days: { date: string; answered: number; wrong: number }[] // 近30天报告详情
 }
 
 // ---------- doodle strokes ----------
@@ -150,6 +218,8 @@ export interface SettingsData {
   asrBaseURL: string
   asrApiKey: string
   asrModel: string
+  /** 错题本：答对后自动移除 — 答对N次后 */
+  quizAutoRemove: 1 | 2 | 3 | 5
 }
 
 export interface ChatMessage {
@@ -166,6 +236,9 @@ export interface QuizQuestion {
   question: string
   answer: string
   options?: string[]
+  /** 收藏/错题上报用 */
+  cardId?: string
+  cardTitle?: string
 }
 
 export interface MindNode {

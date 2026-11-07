@@ -6,22 +6,42 @@ import { useTheme } from 'next-themes'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { AccountData, CardData, SettingsData } from '@/lib/types'
+import type { AccountData, CardData, Mastery, SettingsData } from '@/lib/types'
 import { HomeView } from '@/components/recitation/home-view'
 import { ReaderView } from '@/components/recitation/reader-view'
 import { ImportSheet, type ImportPayload } from '@/components/recitation/import-sheet'
 import { SettingsSheet } from '@/components/recitation/settings-sheet'
 import { AccountSheet } from '@/components/recitation/account-sheet'
+import { WrongQuestionsView } from '@/components/recitation/wrong-questions-view'
+import { QuizReportView } from '@/components/recitation/quiz-report-view'
+import { FavoritesView } from '@/components/recitation/favorites-view'
+import { ReviewStatsView } from '@/components/recitation/review-stats-view'
+import { PlanEditorView } from '@/components/recitation/plan-editor-view'
+import { ReviewOverviewView } from '@/components/recitation/review-overview-view'
+
+type View =
+  | 'home'
+  | 'reader'
+  | 'wrong'
+  | 'report'
+  | 'favorites'
+  | 'review-stats'
+  | 'plan-editor'
+  | 'review-overview'
 
 export default function Page() {
   const router = useRouter()
   const { setTheme } = useTheme()
 
-  const [view, setView] = React.useState<'home' | 'reader'>('home')
+  const [view, setView] = React.useState<View>('home')
   const [cards, setCards] = React.useState<CardData[]>([])
   const [currentCard, setCurrentCard] = React.useState<CardData | null>(null)
   const [settings, setSettings] = React.useState<SettingsData | null>(null)
   const [loading, setLoading] = React.useState(true)
+  // 复习总览：每张卡的掌握状态（进入视图时拉取）
+  const [overviewStatuses, setOverviewStatuses] = React.useState<
+    Record<string, { mastery: Mastery; chapters: number }>
+  >({})
 
   // ---------- auth ----------
   const [authed, setAuthed] = React.useState(false)
@@ -269,6 +289,11 @@ export default function Page() {
     setCurrentCard(null)
   }, [])
 
+  // 计划管理（本书进度弹窗 → 制作背书计划）
+  const handleOpenPlanEditor = React.useCallback(() => {
+    if (currentCard) setView('plan-editor')
+  }, [currentCard])
+
   const handleEditContent = React.useCallback(() => {
     if (!currentCard) return
     setImportDraft({ title: currentCard.title, content: currentCard.content })
@@ -281,6 +306,30 @@ export default function Page() {
     setEditingCardId(null)
     setImportOpen(true)
   }, [])
+
+  // 复习总览：拉取每卡掌握状态
+  React.useEffect(() => {
+    if (view !== 'review-overview') return
+    const ctrl = new AbortController()
+    fetch(`/api/review?perCard=1&tzOffset=${new Date().getTimezoneOffset()}`, {
+      signal: ctrl.signal,
+    })
+      .then((r) => r.json())
+      .then((res: { statuses?: Record<string, string> }) => {
+        const map: Record<string, { mastery: Mastery; chapters: number }> = {}
+        for (const c of cards) {
+          const a = res?.statuses?.[c.id]
+          map[c.id] = {
+            mastery:
+              a === 'familiar' || a === 'fuzzy' || a === 'forget' ? a : 'none',
+            chapters: 1,
+          }
+        }
+        setOverviewStatuses(map)
+      })
+      .catch(() => {})
+    return () => ctrl.abort()
+  }, [view, cards])
 
   const handleCancelImport = React.useCallback(() => {
     setImportOpen(false)
@@ -310,8 +359,12 @@ export default function Page() {
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenAccount={() => setAccountOpen(true)}
           onLogout={handleLogout}
+          onOpenWrong={() => setView('wrong')}
+          onOpenReport={() => setView('report')}
+          onOpenFavorites={() => setView('favorites')}
+          onOpenReviewStats={() => setView('review-stats')}
         />
-      ) : currentCard && settings ? (
+      ) : view === 'reader' && currentCard && settings ? (
         <ReaderView
           key={currentCard.id}
           card={currentCard}
@@ -320,6 +373,43 @@ export default function Page() {
           onChangeSettings={handleChangeSettings}
           onBack={handleBack}
           onEditContent={handleEditContent}
+          onOpenOverview={() => setView('review-overview')}
+          onOpenPlanEditor={handleOpenPlanEditor}
+        />
+      ) : view === 'wrong' ? (
+        <WrongQuestionsView onBack={() => setView('home')} />
+      ) : view === 'report' ? (
+        <QuizReportView onBack={() => setView('home')} />
+      ) : view === 'favorites' ? (
+        <FavoritesView onBack={() => setView('home')} />
+      ) : view === 'review-stats' ? (
+        <ReviewStatsView onBack={() => setView('home')} />
+      ) : view === 'plan-editor' && currentCard ? (
+        <PlanEditorView
+          card={currentCard}
+          mastered={0}
+          learned={0}
+          onBack={() => setView('reader')}
+          onConfirm={(plan) => {
+            if (currentCard) {
+              handleUpdateCard({ ...currentCard, plan })
+              toast.success(
+                `计划已保存：新学 ${plan.dailyNew} 章/日 · 复习 ${plan.reviewTimes} 遍`,
+              )
+            }
+            setView('reader')
+          }}
+        />
+      ) : view === 'review-overview' ? (
+        <ReviewOverviewView
+          cards={cards}
+          statuses={overviewStatuses}
+          onBack={() => setView(currentCard ? 'reader' : 'home')}
+          onOpenCard={(c) => {
+            setCurrentCard(c)
+            setView('reader')
+          }}
+          onNew={handleNewCard}
         />
       ) : null}
 

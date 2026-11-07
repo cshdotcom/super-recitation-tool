@@ -44,11 +44,12 @@ export async function PATCH(req: NextRequest) {
     const data: Record<string, string | boolean | number> = {}
 
     if (typeof body?.clozeStyle === 'string') {
-      // Accept the new 圈圈/下划线 styles; legacy 'highlight' maps to 圈圈.
-      data.clozeStyle =
-        body.clozeStyle === 'underline'
-          ? 'underline'
-          : 'circle'
+      // 挖空显示样式：下划线/模糊/星号/空白/高亮/圈圈
+      data.clozeStyle = ['underline', 'blur', 'star', 'blank', 'highlight', 'circle'].includes(
+        body.clozeStyle,
+      )
+        ? body.clozeStyle
+        : 'circle'
     }
     if (typeof body?.showAnswers === 'boolean') {
       data.showAnswers = body.showAnswers
@@ -131,6 +132,10 @@ export async function PATCH(req: NextRequest) {
     }
     if (typeof body?.asrModel === 'string') {
       data.asrModel = body.asrModel
+    }
+    // 错题本：答对后自动移除 — 答对N次后 (1/2/3/5)
+    if (typeof body?.quizAutoRemove === 'number' && [1, 2, 3, 5].includes(body.quizAutoRemove)) {
+      data.quizAutoRemove = body.quizAutoRemove
     }
 
     if (Object.keys(data).length === 0) {
