@@ -22,6 +22,31 @@ export interface CardPlan {
   reviewTimes?: number
 }
 
+// ---------- 文字编辑工具 (Q&A material blocks) ----------
+export interface MaterialBlock {
+  /** 核心论点（正面） */
+  front: string
+  /** 完整内容（背面） */
+  back: string
+  /** 已隐藏（折叠不显示） */
+  hidden?: boolean
+}
+
+// ---------- 专注内容 ----------
+export interface FocusContentData {
+  id: string
+  name: string
+  minutes: number
+  /** preset key (bg-silk...) 或 dataURL */
+  bg: string
+  ord: number
+  todaySeconds: number
+  totalSeconds: number
+  focusCount: number
+  createdAt: string
+  updatedAt: string
+}
+
 // ---------- review (熟悉/模糊/忘记) ----------
 export type ReviewAction = 'familiar' | 'fuzzy' | 'forget'
 export const REVIEW_ACTIONS: { value: ReviewAction; label: string }[] = [
@@ -102,6 +127,8 @@ export interface CardData {
   strokes: Stroke[] // 涂鸦笔迹 (persisted)
   plan: CardPlan | null
   mindmaps: MindmapDoc[] // 已保存的思维导图
+  blocks: MaterialBlock[] // 文字编辑工具 Q&A blocks
+  deletedAt: string | null
   createdAt: string
   updatedAt: string
 }
@@ -272,6 +299,17 @@ export interface ShareInfo {
   /** ISO date or null = 无限 (never expires). */
   expiresAt: string | null
   createdAt: string
+}
+
+// ---------- 复习计划模板 ----------
+export interface ReviewPlanData {
+  id: string
+  name: string
+  /** 复习时间安排（天数偏移，0 = 现在/当天） */
+  days: number[]
+  builtIn: boolean
+  createdAt: string
+  updatedAt: string
 }
 
 // TTS voice options supported by the z-ai SDK.

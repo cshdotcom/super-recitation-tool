@@ -1,19 +1,40 @@
 // Card collection endpoints (require login).
-// GET    /api/cards          -> list all cards (newest first)
-// POST   /api/cards          -> create a new card
-// DELETE /api/cards          -> delete ALL cards (storage management)
+// GET    /api/cards           -> list active (non-deleted) cards (newest first)
+// GET    /api/cards?trash=1   -> list trashed cards (deletedAt desc); auto-purges
+//                               cards soft-deleted more than 30 days ago first
+// POST   /api/cards           -> create a new card
+// POST   /api/cards           -> { action: 'restore-all' } restores every trashed card
+// DELETE /api/cards           -> delete ALL cards, active + trashed (storage management)
+// DELETE /api/cards?trash=1   -> empty the recycle bin (permanently delete trashed only)
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getSessionUser } from '@/lib/auth'
 import { serializeCard } from '@/lib/card'
 
-export async function GET() {
+const TRASH_TTL_MS = 30 * 86400 * 1000 // 回收站保留 30 天，过期自动彻底删除
+
+export async function GET(req: NextRequest) {
   try {
     const user = await getSessionUser()
     if (!user) {
       return NextResponse.json({ error: '未登录' }, { status: 401 })
     }
-    const cards = await db.card.findMany({ orderBy: { updatedAt: 'desc' } })
+    const isTrash = req.nextUrl.searchParams.get('trash') === '1'
+    if (isTrash) {
+      // 回收站视图：先把删除超过 30 天的卡片彻底清掉，再列出剩余的已删卡片
+      await db.card.deleteMany({
+        where: { deletedAt: { lt: new Date(Date.now() - TRASH_TTL_MS) } },
+      })
+      const cards = await db.card.findMany({
+        where: { deletedAt: { not: null } },
+        orderBy: { deletedAt: 'desc' },
+      })
+      return NextResponse.json({ cards: cards.map(serializeCard) })
+    }
+    const cards = await db.card.findMany({
+      where: { deletedAt: null },
+      orderBy: { updatedAt: 'desc' },
+    })
     return NextResponse.json({ cards: cards.map(serializeCard) })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -29,6 +50,17 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: '未登录' }, { status: 401 })
     }
     const body = await req.json().catch(() => ({}))
+    // 动作型请求（回收站「全部恢复」）：{ action: 'restore-all' }
+    if (typeof body?.action === 'string') {
+      if (body.action !== 'restore-all') {
+        return NextResponse.json({ error: '未知操作' }, { status: 400 })
+      }
+      const res = await db.card.updateMany({
+        where: { deletedAt: { not: null } },
+        data: { deletedAt: null },
+      })
+      return NextResponse.json({ restored: res.count })
+    }
     const content: string = typeof body?.content === 'string' ? body.content : ''
     if (!content.trim()) {
       return NextResponse.json({ error: '内容不能为空' }, { status: 400 })
@@ -54,13 +86,19 @@ export async function POST(req: NextRequest) {
   }
 }
 
-export async function DELETE() {
+export async function DELETE(req: NextRequest) {
   try {
     const user = await getSessionUser()
     if (!user) {
       return NextResponse.json({ error: '未登录' }, { status: 401 })
     }
-    await db.card.deleteMany({})
+    // ?trash=1 -> 只清空回收站（彻底删除已软删的卡片）；默认清空全部卡片
+    const isTrash = req.nextUrl.searchParams.get('trash') === '1'
+    if (isTrash) {
+      await db.card.deleteMany({ where: { deletedAt: { not: null } } })
+    } else {
+      await db.card.deleteMany({})
+    }
     return NextResponse.json({ ok: true })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)

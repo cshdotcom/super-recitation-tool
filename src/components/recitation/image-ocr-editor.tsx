@@ -84,7 +84,8 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
   const [images, setImages] = React.useState<ImageItem[]>([])
   const [activeId, setActiveId] = React.useState<string | null>(null)
   const [mode, setMode] = React.useState<CropMode>('crop')
-  const [aspect, setAspect] = React.useState<number | undefined>(4 / 3)
+  // 自由裁剪: default aspect = free (crop frame can be stretched freely).
+  const [aspect, setAspect] = React.useState<number | undefined>(undefined)
   const [recognizing, setRecognizing] = React.useState(false)
   const [progress, setProgress] = React.useState<{ done: number; total: number } | null>(null)
 
@@ -96,7 +97,7 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
       setImages([])
       setActiveId(null)
       setMode('crop')
-      setAspect(4 / 3)
+      setAspect(undefined)
       setRecognizing(false)
       setProgress(null)
     }

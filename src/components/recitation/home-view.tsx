@@ -4,14 +4,17 @@ import * as React from 'react'
 import { formatDistanceToNow } from 'date-fns'
 import { zhCN } from 'date-fns/locale'
 import {
+  ArchiveRestore,
   BarChart3,
   BookOpenText,
   BookX,
+  CalendarClock,
   ClipboardList,
   LogOut,
   Plus,
   Settings as SettingsIcon,
   Star,
+  Timer,
   Trash2,
 } from 'lucide-react'
 
@@ -48,6 +51,9 @@ interface HomeViewProps {
   onOpenReport?: () => void
   onOpenFavorites?: () => void
   onOpenReviewStats?: () => void
+  onOpenFocus?: () => void
+  onOpenTrash?: () => void
+  onOpenPlans?: () => void
 }
 
 export function HomeView({
@@ -64,6 +70,9 @@ export function HomeView({
   onOpenReport = () => {},
   onOpenFavorites = () => {},
   onOpenReviewStats = () => {},
+  onOpenFocus = () => {},
+  onOpenTrash = () => {},
+  onOpenPlans = () => {},
 }: HomeViewProps) {
   return (
     <>
@@ -147,6 +156,9 @@ export function HomeView({
           <div className="mt-2 grid grid-cols-4 gap-2">
             {(
               [
+                { label: '专注', icon: Timer, onClick: onOpenFocus },
+                { label: '复习计划', icon: CalendarClock, onClick: onOpenPlans },
+                { label: '回收站', icon: ArchiveRestore, onClick: onOpenTrash },
                 { label: '错题本', icon: BookX, onClick: onOpenWrong },
                 { label: '答题报告', icon: ClipboardList, onClick: onOpenReport },
                 { label: '收藏题目', icon: Star, onClick: onOpenFavorites },

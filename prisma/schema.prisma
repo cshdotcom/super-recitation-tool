@@ -13,6 +13,9 @@ datasource db {
 //              { pts:[x,y][], color, width, tool } objects (涂鸦)
 // `plan`     : JSON {"goal":number} daily recitation plan (今日计划)
 // `mindmaps` : JSON MindmapDoc[] saved mind maps for this card (思维导图)
+// `blocks`   : JSON MaterialBlock[] 文字编辑工具 Q&A blocks
+//              [{ front, back, hidden }] (核心论点/完整内容)
+// `deletedAt`: soft-delete timestamp — set when moved to 回收站, null = active
 model Card {
   id        String   @id @default(uuid())
   title     String
@@ -21,6 +24,8 @@ model Card {
   strokes   String   @default("[]")
   plan      String   @default("")
   mindmaps  String   @default("[]")
+  blocks    String   @default("[]")
+  deletedAt DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -103,6 +108,38 @@ model QuizItem {
   removed     Boolean  @default(false)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
+}
+
+// 专注内容 (focus timer presets): name + default duration + background image
+// (preset key like "bg-silk" or a small client-compressed dataURL).
+model FocusContent {
+  id        String   @id @default(uuid())
+  name      String
+  minutes   Int      @default(25)
+  bg        String   @default("")
+  ord       Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// One row per completed focus session — powers 今日 X 分钟 / 已专注 N 次 stats.
+model FocusLog {
+  id        String   @id @default(uuid())
+  contentId String
+  seconds   Int      @default(0)
+  createdAt DateTime @default(now())
+}
+
+// 复习计划模板 (review plan schedules). 标准艾宾浩斯 is seeded builtIn=true;
+// custom plans are created from 复习计划管理. `days` = JSON number[] — review
+// offsets in days (0 = 现在/当天).
+model ReviewPlan {
+  id        String   @id @default(uuid())
+  name      String
+  days      String   @default("[]")
+  builtIn   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 // One row per review/score action (熟悉/模糊/忘记) or quiz answer, so all

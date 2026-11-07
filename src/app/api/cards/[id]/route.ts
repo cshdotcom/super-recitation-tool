@@ -1,7 +1,8 @@
 // Single-card endpoints (require login).
-// GET    /api/cards/:id   -> fetch one card
-// PATCH  /api/cards/:id   -> partial update (title/content/keywords/strokes/plan/mindmaps)
-// DELETE /api/cards/:id   -> remove
+// GET    /api/cards/:id          -> fetch one card
+// PATCH  /api/cards/:id          -> partial update (title/content/keywords/strokes/plan/mindmaps/blocks)
+// DELETE /api/cards/:id          -> soft delete (moves the card to the recycle bin, deletedAt=now)
+// DELETE /api/cards/:id?hard=1   -> permanent delete (recycle bin 彻底删除)
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getSessionUser } from '@/lib/auth'
@@ -90,6 +91,25 @@ export async function PATCH(
       )
       data.mindmaps = JSON.stringify(docs.slice(0, 50))
     }
+    // 文字编辑工具 Q&A blocks: [{ front, back, hidden? }] (persisted JSON string).
+    // Sanitized: max 200 blocks, front/back strings capped at 20000 chars,
+    // hidden stored only when it is exactly true.
+    if (Array.isArray(body?.blocks)) {
+      const list = (body.blocks as unknown[]).slice(0, 200)
+      const blocks = list.map((raw) => {
+        const b = (raw && typeof raw === 'object' ? raw : {}) as {
+          front?: unknown
+          back?: unknown
+          hidden?: unknown
+        }
+        return {
+          front: typeof b.front === 'string' ? b.front.slice(0, 20000) : '',
+          back: typeof b.back === 'string' ? b.back.slice(0, 20000) : '',
+          ...(b.hidden === true ? { hidden: true } : {}),
+        }
+      })
+      data.blocks = JSON.stringify(blocks)
+    }
 
     const updated = await db.card.update({
       where: { id },
@@ -104,7 +124,7 @@ export async function PATCH(
 }
 
 export async function DELETE(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -113,7 +133,17 @@ export async function DELETE(
       return NextResponse.json({ error: '未登录' }, { status: 401 })
     }
     const { id } = await params
-    await db.card.delete({ where: { id } })
+    const card = await db.card.findUnique({ where: { id }, select: { id: true } })
+    if (!card) {
+      return NextResponse.json({ error: '卡片不存在' }, { status: 404 })
+    }
+    // ?hard=1 -> 彻底删除；默认软删除（进入回收站，30 天后自动清除）
+    const hard = req.nextUrl.searchParams.get('hard') === '1'
+    if (hard) {
+      await db.card.delete({ where: { id } })
+    } else {
+      await db.card.update({ where: { id }, data: { deletedAt: new Date() } })
+    }
     return NextResponse.json({ ok: true })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)

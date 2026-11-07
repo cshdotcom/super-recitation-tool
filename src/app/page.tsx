@@ -6,7 +6,7 @@ import { useTheme } from 'next-themes'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { AccountData, CardData, Mastery, SettingsData } from '@/lib/types'
+import type { AccountData, CardData, Mastery, MaterialBlock, SettingsData } from '@/lib/types'
 import { HomeView } from '@/components/recitation/home-view'
 import { ReaderView } from '@/components/recitation/reader-view'
 import { ImportSheet, type ImportPayload } from '@/components/recitation/import-sheet'
@@ -17,7 +17,11 @@ import { QuizReportView } from '@/components/recitation/quiz-report-view'
 import { FavoritesView } from '@/components/recitation/favorites-view'
 import { ReviewStatsView } from '@/components/recitation/review-stats-view'
 import { PlanEditorView } from '@/components/recitation/plan-editor-view'
+import { PlanManagerView } from '@/components/recitation/plan-manager-view'
 import { ReviewOverviewView } from '@/components/recitation/review-overview-view'
+import { MaterialEditor } from '@/components/recitation/material-editor'
+import { FocusApp } from '@/components/recitation/focus-app'
+import { RecycleBinView } from '@/components/recitation/recycle-bin-view'
 
 type View =
   | 'home'
@@ -28,6 +32,10 @@ type View =
   | 'review-stats'
   | 'plan-editor'
   | 'review-overview'
+  | 'plan-manager'
+  | 'material-editor'
+  | 'focus'
+  | 'trash'
 
 export default function Page() {
   const router = useRouter()
@@ -239,7 +247,7 @@ export default function Page() {
       }
       setCards((prev) => prev.filter((c) => c.id !== id))
       setCurrentCard((cur) => (cur && cur.id === id ? null : cur))
-      toast.success('已删除', { id: tid })
+      toast.success('已移入回收站', { id: tid })
     } catch (err) {
       toast.error('删除失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
     }
@@ -363,6 +371,9 @@ export default function Page() {
           onOpenReport={() => setView('report')}
           onOpenFavorites={() => setView('favorites')}
           onOpenReviewStats={() => setView('review-stats')}
+          onOpenFocus={() => setView('focus')}
+          onOpenTrash={() => setView('trash')}
+          onOpenPlans={() => setView('plan-manager')}
         />
       ) : view === 'reader' && currentCard && settings ? (
         <ReaderView
@@ -373,6 +384,7 @@ export default function Page() {
           onChangeSettings={handleChangeSettings}
           onBack={handleBack}
           onEditContent={handleEditContent}
+          onOpenMaterialEditor={() => setView('material-editor')}
           onOpenOverview={() => setView('review-overview')}
           onOpenPlanEditor={handleOpenPlanEditor}
         />
@@ -400,6 +412,24 @@ export default function Page() {
             setView('reader')
           }}
         />
+      ) : view === 'plan-manager' ? (
+        <PlanManagerView onBack={() => setView('home')} />
+      ) : view === 'material-editor' && currentCard ? (
+        <MaterialEditor
+          card={currentCard}
+          onBack={() => setView('reader')}
+          onSave={(blocks: MaterialBlock[]) => {
+            if (currentCard) {
+              handleUpdateCard({ ...currentCard, blocks })
+              toast.success(`文字编辑已保存，共 ${blocks.length} 块`)
+            }
+            setView('reader')
+          }}
+        />
+      ) : view === 'focus' ? (
+        <FocusApp onBack={() => setView('home')} />
+      ) : view === 'trash' ? (
+        <RecycleBinView onBack={() => setView('home')} />
       ) : view === 'review-overview' ? (
         <ReviewOverviewView
           cards={cards}

@@ -60,6 +60,8 @@ export function serializeCard(c: {
   strokes: string
   plan: string
   mindmaps?: string | null
+  blocks?: string | null
+  deletedAt?: Date | null
   createdAt: Date
   updatedAt: Date
 }): CardData {
@@ -94,6 +96,20 @@ export function serializeCard(c: {
     if (Array.isArray(parsed)) mindmaps = parsed
   } catch {}
 
+  // 文字编辑工具 Q&A blocks
+  let blocks: CardData['blocks'] = []
+  try {
+    const parsed = JSON.parse(c.blocks || '[]')
+    if (Array.isArray(parsed)) {
+      blocks = parsed
+        .filter(
+          (b): b is CardData['blocks'][number] =>
+            b && typeof b === 'object' && typeof (b as { front?: unknown }).front === 'string' && typeof (b as { back?: unknown }).back === 'string',
+        )
+        .map((b) => ({ front: b.front, back: b.back, ...(b.hidden ? { hidden: true } : {}) }))
+    }
+  } catch {}
+
   return {
     id: c.id,
     title: c.title,
@@ -102,6 +118,8 @@ export function serializeCard(c: {
     strokes,
     plan,
     mindmaps: mindmaps as CardData['mindmaps'],
+    blocks,
+    deletedAt: c.deletedAt ? c.deletedAt.toISOString() : null,
     createdAt: c.createdAt.toISOString(),
     updatedAt: c.updatedAt.toISOString(),
   }

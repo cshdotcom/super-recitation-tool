@@ -27,16 +27,31 @@ export function tokenize(content: string, keywords: string[]): Segment[] {
     .map((p) => ({ text: p, isBlank: kwset.has(p) }))
 }
 
-// Rule-based cloze: pick every Nth "word" (CJK run or latin token) as a keyword.
+// Rule-based cloze — 挖空单位是「字」：every Nth CJK character (or latin word)
+// is picked as a keyword. Punctuation/whitespace is skipped when counting.
 export function ruleCloze(content: string, step: number): string[] {
   if (step < 2) return []
-  const tokenPattern = new RegExp(`[${CJK}]+|[a-zA-Z0-9]+`, 'g')
-  const tokens = content.match(tokenPattern) || []
+  const charPattern = new RegExp(`[${CJK}]|[a-zA-Z0-9]+`, 'g')
+  const tokens = content.match(charPattern) || []
   const kws: string[] = []
   for (let i = 0; i < tokens.length; i++) {
-    if ((i + 1) % step === 0) kws.push(tokens[i])
+    if ((i + 1) % step === 0) {
+      // A latin token stays whole; a CJK match is a single char already.
+      kws.push(tokens[i])
+    }
   }
   return Array.from(new Set(kws))
+}
+
+// Split text into 字级 tokens: each CJK character is its own token, latin
+// sequences stay whole words. Used by 挖空刷 / 手动挖空 / selection.
+export function splitCharTokens(text: string): { text: string; isChar: boolean }[] {
+  const SPLIT = new RegExp(`([${CJK}]|[a-zA-Z0-9]+)`, 'g')
+  const FULL = new RegExp(`^([${CJK}]|[a-zA-Z0-9]+)$`)
+  return text
+    .split(SPLIT)
+    .filter((p) => p !== '' && p !== undefined)
+    .map((p) => ({ text: p, isChar: FULL.test(p) }))
 }
 
 export function splitParagraphs(content: string): string[] {

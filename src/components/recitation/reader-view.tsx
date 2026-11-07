@@ -59,7 +59,9 @@ import { ClozeStyleSheet } from '@/components/recitation/cloze-style-sheet'
 import { ClozeText } from '@/components/recitation/cloze-text'
 import { DoodleCanvas } from '@/components/recitation/doodle-canvas'
 import { MoreSheet, type ClozeTemplate } from '@/components/recitation/more-sheet'
+import { NotebookPen } from 'lucide-react'
 import { PlanDialog } from '@/components/recitation/plan-dialog'
+import { TocSheet } from '@/components/recitation/toc-sheet'
 import { ProgressSheet } from '@/components/recitation/progress-sheet'
 import { ReviewScoreBar } from '@/components/recitation/review-score-bar'
 import { ShareDialog } from '@/components/recitation/share-dialog'
@@ -75,6 +77,8 @@ interface ReaderViewProps {
   onChangeSettings: (patch: Partial<SettingsData>) => void
   onBack: () => void
   onEditContent: () => void
+  /** 打开文字编辑工具（新材料 Q&A 块编辑器） */
+  onOpenMaterialEditor?: () => void
   /** 打开复习总览（本书进度弹窗入口） */
   onOpenOverview?: () => void
   /** 打开制作背书计划（本书进度弹窗 → 计划管理） */
@@ -132,6 +136,7 @@ export function ReaderView({
   onChangeSettings,
   onBack,
   onEditContent,
+  onOpenMaterialEditor,
   onOpenOverview,
   onOpenPlanEditor,
 }: ReaderViewProps) {
@@ -140,6 +145,8 @@ export function ReaderView({
   const [mode, setMode] = React.useState<ReaderMode>(null)
   const [chunks, setChunks] = React.useState<string[] | null>(null)
   const [chunksLoading, setChunksLoading] = React.useState(false)
+  // 目录/搜本书
+  const [tocOpen, setTocOpen] = React.useState(false)
   const [originalOpen, setOriginalOpen] = React.useState(false)
   const [aiTitle, setAiTitle] = React.useState<string | null>(null)
   const [aiTitleLoading, setAiTitleLoading] = React.useState(false)
@@ -276,6 +283,29 @@ export function ReaderView({
     [card, onUpdateCard, pushKwHistory, bumpProgress],
   )
 
+  // 自定义选择菜单（长按/右键）→ 挖空选中（阅读模式，字级）
+  const handleSelectionCloze = React.useCallback(
+    (text: string) => {
+      const t = text.trim()
+      if (!t) return
+      if (card.keywords.includes(t)) return
+      pushKwHistory(card.keywords)
+      onUpdateCard({ ...card, keywords: [...card.keywords, t] })
+      bumpProgress()
+    },
+    [card, onUpdateCard, pushKwHistory, bumpProgress],
+  )
+
+  const handleSelectionUncloze = React.useCallback(
+    (text: string) => {
+      const t = text.trim()
+      if (!t || !card.keywords.includes(t)) return
+      pushKwHistory(card.keywords)
+      onUpdateCard({ ...card, keywords: card.keywords.filter((k) => k !== t) })
+    },
+    [card, onUpdateCard, pushKwHistory],
+  )
+
   // ---------- review scoring (熟悉/模糊/忘记) ----------
   const handleScore = React.useCallback(
     async (action: ReviewAction) => {
@@ -376,13 +406,13 @@ export function ReaderView({
     (step: number) => {
       const kws = ruleCloze(card.content, step)
       if (kws.length === 0) {
-        toast.warning('未找到可挖空的词语')
+        toast.warning('未找到可挖空的字')
         return
       }
       pushKwHistory(card.keywords)
       onUpdateCard({ ...card, keywords: kws })
       setMode(null)
-      toast.success(`规则挖空完成：每隔 ${step} 词，共 ${kws.length} 处`)
+      toast.success(`规则挖空完成：每隔 ${step} 字，共 ${kws.length} 处`)
     },
     [card, onUpdateCard, pushKwHistory],
   )
@@ -391,13 +421,16 @@ export function ReaderView({
     (template: ClozeTemplate) => {
       let kws: string[] = []
       if (template === 'sentence-start') {
-        // First word token of every sentence.
-        const tokenRe = /[\u4e00-\u9fff\u3400-\u4dbf]+|[a-zA-Z0-9]+/g
+        // 首字挖空：第一「字」of every sentence (字级挖空).
+        const tokenRe = /[\u4e00-\u9fff\u3400-\u4dbf]|[a-zA-Z0-9]+/g
         const sentences = card.content.split(/(?<=[。！？；!?;\n])/)
         const set = new Set<string>()
         for (const s of sentences) {
           const m = s.trim().match(tokenRe)
-          if (m && m[0]) set.add(m[0])
+          if (m && m[0]) {
+            // A CJK match is exactly one 字; a latin token stays whole.
+            set.add(m[0])
+          }
         }
         kws = Array.from(set)
       } else if (template === 'numbers') {
@@ -589,9 +622,9 @@ export function ReaderView({
                 <Button
                   variant="ghost"
                   size="icon"
-                  aria-label="卡片列表"
+                  aria-label="目录/搜本书"
                   className="text-foreground/80"
-                  onClick={onBack}
+                  onClick={() => setTocOpen(true)}
                 >
                   <ListTree className="size-5" strokeWidth={1.75} />
                 </Button>
@@ -605,6 +638,15 @@ export function ReaderView({
                   onClick={onEditContent}
                 >
                   <Pencil className="size-5" strokeWidth={1.75} />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="文字编辑工具"
+                  className="text-foreground/80"
+                  onClick={() => onOpenMaterialEditor?.()}
+                >
+                  <NotebookPen className="size-5" strokeWidth={1.75} />
                 </Button>
                 {/* AI 朗读控制（朗读控制栏：音色/倍速/上下句/定时/循环） */}
                 <Popover>
@@ -737,6 +779,9 @@ export function ReaderView({
               manualMode={mode === 'manual' || mode === 'editor'}
               selectionMode={mode === 'editor'}
               onSelectCloze={handleSelectCloze}
+              selectMenuEnabled
+              onSelectionCloze={handleSelectionCloze}
+              onSelectionUncloze={handleSelectionUncloze}
               chunks={mode === 'chunk' ? chunks : null}
               pages={mode === 'chunk' ? null : pages}
               onPageChange={(p, total) => setPage(p)}
@@ -1028,12 +1073,12 @@ export function ReaderView({
         onManualMode={() => {
           setMoreOpen(false)
           setMode((cur) => (cur === 'editor' ? null : 'editor'))
-          toast.info('挖空编辑：长按选择文字挖空，点击已挖空的词取消')
+          toast.info('挖空编辑：长按选择文字挖空，点击已挖空的字取消')
         }}
         onBrushMode={() => {
           setMoreOpen(false)
           setMode((cur) => (cur === 'brush' ? null : 'brush'))
-          toast.info('挖空刷：按住并滑过词语即可挖空')
+          toast.info('挖空刷：按住并滑过要挖空的字即可')
         }}
       />
 
@@ -1060,6 +1105,26 @@ export function ReaderView({
       />
 
       <ShareDialog card={card} open={shareOpen} onOpenChange={setShareOpen} />
+
+      {/* 目录/搜本书（顶部栏目录按钮） */}
+      <TocSheet
+        open={tocOpen}
+        onOpenChange={setTocOpen}
+        card={card}
+        chunks={mode === 'chunk' && chunks && chunks.length > 0 ? chunks : null}
+        onJump={(idx) => {
+          const root = document
+            .querySelector('section[aria-label="正文"]')
+          if (!root) return
+          if (mode === 'chunk') {
+            const el = root.querySelector(`[data-toc-chunk="${idx}"]`)
+            el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+          } else {
+            const els = root.querySelectorAll('[data-toc-para]')
+            els[idx]?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+          }
+        }}
+      />
 
       {/* 挖空显示样式（编辑模式顶栏入口） */}
       <ClozeStyleSheet
