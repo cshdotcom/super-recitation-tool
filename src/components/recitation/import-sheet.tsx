@@ -15,6 +15,7 @@ import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import { CameraCapture } from '@/components/recitation/camera-capture'
+import { ImageOcrEditor } from '@/components/recitation/image-ocr-editor'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -58,6 +59,7 @@ export function ImportSheet({
   const [aiLoading, setAiLoading] = React.useState(false)
   const [ocrLoading, setOcrLoading] = React.useState<EntryKey | null>(null)
   const [cameraOpen, setCameraOpen] = React.useState(false)
+  const [imageEditorOpen, setImageEditorOpen] = React.useState(false)
 
   // Reset / prefill when opened.
   React.useEffect(() => {
@@ -91,45 +93,21 @@ export function ImportSheet({
     }
   }
 
-  const handleImageFile = async (file: File) => {
-    setOcrLoading('image')
-    const tid = toast.loading('正在识别图片文字…')
-    try {
-      const fd = new FormData()
-      fd.append('file', file)
-      const res = await fetch('/api/ocr', { method: 'POST', body: fd })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.error || '识别失败')
-      }
-      const data = (await res.json()) as { text?: string }
-      const content = (data.text || '').trim()
-      if (!content) {
-        toast.warning('未识别到文字', { id: tid })
-        return
-      }
-      toast.success(`识别到 ${content.length} 字`, { id: tid })
-      startInput('image', content)
-    } catch (err) {
-      toast.error('识别失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
-    } finally {
-      setOcrLoading(null)
-    }
-  }
-
   const handleEntry = (key: EntryKey) => {
     if (key === 'camera') {
       setCameraOpen(true)
+      return
+    }
+    if (key === 'image') {
+      setImageEditorOpen(true)
       return
     }
     if (key === 'paste') {
       startInput('paste')
       return
     }
-    // file / image are handled by hidden inputs via refs below
-    const el = document.getElementById(
-      key === 'file' ? 'import-file-input' : 'import-image-input',
-    ) as HTMLInputElement | null
+    // file is handled by hidden input below
+    const el = document.getElementById('import-file-input') as HTMLInputElement | null
     el?.click()
   }
 
@@ -223,17 +201,6 @@ export function ImportSheet({
                 e.target.value = ''
               }}
             />
-            <input
-              id="import-image-input"
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={(e) => {
-                const f = e.target.files?.[0]
-                if (f) void handleImageFile(f)
-                e.target.value = ''
-              }}
-            />
 
             {/* black pill button */}
             <Button
@@ -305,6 +272,12 @@ export function ImportSheet({
         open={cameraOpen}
         onOpenChange={setCameraOpen}
         onText={(text) => startInput('camera', text)}
+      />
+
+      <ImageOcrEditor
+        open={imageEditorOpen}
+        onOpenChange={setImageEditorOpen}
+        onText={(merged) => startInput('image', merged)}
       />
     </>
   )

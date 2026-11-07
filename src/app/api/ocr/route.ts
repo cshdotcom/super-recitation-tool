@@ -1,41 +1,113 @@
 // OCR via the z-ai vision model.
-// POST /api/ocr   (multipart/form-data, field name "file")
+// Supports two input shapes:
+//   1) multipart/form-data, field "file"  (backward compatible, no crop)
+//   2) application/json: { image: dataURI, crop?: { x, y, width, height } }
+// When `crop` is provided (pixel coords on the natural image, as produced by
+// react-easy-crop's onCropComplete `croppedAreaPixels`), the image is cropped
+// server-side with sharp before being sent to the vision model.
+import sharp from 'sharp'
 import { NextRequest, NextResponse } from 'next/server'
 import { getZAI } from '@/lib/zai'
 
+interface CropBox {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+interface OcrJsonBody {
+  image?: string
+  crop?: CropBox
+}
+
+// Parse a data URI ("data:image/jpeg;base64,....") into { buffer, mime }.
+function parseDataURI(dataURI: string): { buffer: Buffer; mime: string } {
+  const match = /^data:([^;]+);base64,(.*)$/s.exec(dataURI.trim())
+  if (!match) throw new Error('图片格式不正确，需为 data URI')
+  const mime = match[1] || 'image/jpeg'
+  const buffer = Buffer.from(match[2], 'base64')
+  return { buffer, mime }
+}
+
+async function runVision(buffer: Buffer, mime: string): Promise<string> {
+  const zai = await getZAI()
+  const response = await zai.chat.completions.createVision({
+    model: 'glm-4.6v',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: '请识别并提取这张图片中的全部文字内容，保持原有的段落结构和标点符号。只返回提取的纯文字内容，不要加任何解释、前后缀或引号。',
+          },
+          {
+            type: 'image_url',
+            image_url: { url: `data:${mime};base64,${buffer.toString('base64')}` },
+          },
+        ],
+      },
+    ],
+    thinking: { type: 'disabled' },
+  })
+  return response.choices?.[0]?.message?.content ?? ''
+}
+
 export async function POST(req: NextRequest) {
   try {
-    const formData = await req.formData()
-    const file = formData.get('file') as File | null
-    if (!file) {
-      return NextResponse.json({ error: '未提供图片' }, { status: 400 })
-    }
-    const arrayBuffer = await file.arrayBuffer()
-    const buffer = Buffer.from(arrayBuffer)
-    const base64 = buffer.toString('base64')
-    const mime = file.type || 'image/jpeg'
+    let buffer: Buffer
+    let mime: string
+    let crop: CropBox | undefined
 
-    const zai = await getZAI()
-    const response = await zai.chat.completions.createVision({
-      model: 'glm-4.6v',
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: '请识别并提取这张图片中的全部文字内容，保持原有的段落结构和标点符号。只返回提取的纯文字内容，不要加任何解释、前后缀或引号。',
-            },
-            {
-              type: 'image_url',
-              image_url: { url: `data:${mime};base64,${base64}` },
-            },
-          ],
-        },
-      ],
-      thinking: { type: 'disabled' },
-    })
-    const text = response.choices?.[0]?.message?.content ?? ''
+    const contentType = req.headers.get('content-type') || ''
+
+    if (contentType.includes('application/json')) {
+      const body = (await req.json()) as OcrJsonBody
+      if (!body.image) {
+        return NextResponse.json({ error: '未提供图片' }, { status: 400 })
+      }
+      const parsed = parseDataURI(body.image)
+      buffer = parsed.buffer
+      mime = parsed.mime
+      crop = body.crop
+    } else {
+      const formData = await req.formData()
+      const file = formData.get('file') as File | null
+      if (!file) {
+        return NextResponse.json({ error: '未提供图片' }, { status: 400 })
+      }
+      buffer = Buffer.from(await file.arrayBuffer())
+      mime = file.type || 'image/jpeg'
+    }
+
+    // Crop server-side when a crop box is supplied.
+    if (
+      crop &&
+      crop.width > 0 &&
+      crop.height > 0 &&
+      Number.isFinite(crop.x) &&
+      Number.isFinite(crop.y)
+    ) {
+      const left = Math.round(crop.x)
+      const top = Math.round(crop.y)
+      const width = Math.round(crop.width)
+      const height = Math.round(crop.height)
+      // Clamp to ≥1px to avoid sharp errors on tiny crops.
+      const safeWidth = Math.max(1, width)
+      const safeHeight = Math.max(1, height)
+      try {
+        buffer = await sharp(buffer)
+          .extract({ left, top, width: safeWidth, height: safeHeight })
+          .toBuffer()
+      } catch (extractErr) {
+        // Crop region exceeded image bounds or other sharp error — fall back to
+        // the full image rather than failing the whole OCR.
+        console.warn('[POST /api/ocr] crop extract failed, using full image:', extractErr)
+      }
+    }
+
+    const text = await runVision(buffer, mime)
     return NextResponse.json({ text })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
