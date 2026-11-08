@@ -206,3 +206,15 @@ model AppState {
   value     String   @default("")
   updatedAt DateTime @updatedAt
 }
+
+// 图片服务器 — 编辑器里以「链接方式」插入的图片可转存到服务端（POST /api/upload），
+// 之后正文引用 /api/upload/<id>，不再依赖外部图床（图片不丢、离线可用）。
+// data = base64（不含 data: 前缀）；mime 如 image/jpeg。GET /api/upload/:id 公开可读
+// （访客分享视图也要渲染图片，所以不做登录校验）。
+model Upload {
+  id        String   @id @default(uuid())
+  mime      String   @default("image/jpeg")
+  data      String
+  bytes     Int      @default(0)
+  createdAt DateTime @default(now())
+}

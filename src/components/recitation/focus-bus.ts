@@ -35,6 +35,7 @@ import {
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
+import { putState } from '@/lib/server-state'
 
 // ---------- 类型 ----------
 
@@ -151,6 +152,8 @@ function persistState(): void {
   } catch {
     // localStorage 不可用时忽略（会话仅在内存中）
   }
+  // 实时同步服务端（AppState 表为真源，localStorage 仅离线镜像）
+  void putState(FOCUS_BUS_STATE_KEY, JSON.stringify(state))
 }
 
 function dispatchEv(type: string, detail: unknown): void {
@@ -545,6 +548,8 @@ export function saveFocusSoundPrefs(patch: Partial<FocusSoundPrefs>): FocusSound
     } catch {
       toast.error('铃声设置保存失败（浏览器存储空间不足）')
     }
+    // 实时同步服务端
+    void putState(FOCUS_BUS_SOUND_KEY, JSON.stringify(next))
   }
   return next
 }

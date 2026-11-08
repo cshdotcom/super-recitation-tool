@@ -55,9 +55,8 @@ import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import { PhoneTapIll } from '@/components/recitation/illustrations'
 
+/** 自定义音色（第三方 API）名称 — useLocalStorage 本地 + 服务端自动同步。 */
 const CUSTOM_VOICE_KEY = 'tts-custom-voice'
-/** 服务端持久化 key（/api/state）— 自定义音色真源。 */
-const VOICE_STATE_KEY = 'ui:tts-custom-voice'
 
 /** Max chars per utterance — speechSynthesis silently drops long utterances. */
 const MAX_CHUNK_LEN = 120
@@ -195,6 +194,64 @@ function splitSpeechChunks(text: string, maxLen = MAX_CHUNK_LEN): string[] {
   return chunks
 }
 
+/**
+ * Shared /api/tts synthesis request — 主播放器 / 快捷朗读 / 选区朗读共用
+ * 同一请求体（custom 音色 trim + 空值回退 undefined），错误统一抛出。
+ */
+async function requestTtsAudio(
+  text: string,
+  opts: { provider: VoiceProvider; voice: string; speed: number },
+): Promise<Blob> {
+  const res = await fetch('/api/tts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      text,
+      voice: opts.provider === 'custom' ? opts.voice.trim() || undefined : opts.voice,
+      speed: opts.speed,
+      provider: opts.provider,
+    }),
+  })
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { error?: string }
+    throw new Error(err.error || '生成语音失败')
+  }
+  return res.blob()
+}
+
+/**
+ * Shared Web Speech playback: splitSpeechChunks 分块 + 可选系统音色；
+ * onEnd/onError 在最后一块结束时触发（请求代际校验留在调用方）。
+ */
+function speakChunksBrowser(
+  synth: SpeechSynthesis,
+  text: string,
+  opts: {
+    voice?: SpeechSynthesisVoice | null
+    speed: number
+    onEnd?: () => void
+    onError?: () => void
+  },
+): void {
+  const chunks = splitSpeechChunks(text)
+  chunks.forEach((chunk, i) => {
+    const u = new SpeechSynthesisUtterance(chunk)
+    if (opts.voice) {
+      u.voice = opts.voice
+      u.lang = opts.voice.lang
+    } else {
+      u.lang = 'zh-CN'
+    }
+    u.rate = opts.speed
+    u.pitch = 1
+    if (i === chunks.length - 1) {
+      u.onend = () => opts.onEnd?.()
+      u.onerror = () => opts.onError?.()
+    }
+    synth.speak(u)
+  })
+}
+
 /** zh voices first, then alphabetical — stable & readable list. */
 function sortVoices(a: SpeechSynthesisVoice, b: SpeechSynthesisVoice): number {
   const az = a.lang.toLowerCase().startsWith('zh') ? 0 : 1
@@ -231,6 +288,33 @@ function formatMMSS(totalSeconds: number): string {
 
 function formatSpeed(v: number): string {
   return v.toFixed(v === Math.floor(v) ? 1 : 2)
+}
+
+/**
+ * 朗读引擎描述（播放前告知用户将用什么朗读）：
+ * zai → 「童童（AI 音色）· 1.0x」；custom → 「自定义 TTS（nova）· 1.0x」；
+ * browser → 「系统语音 · 1.0x」（已选具体系统音色时显示其名称）。
+ */
+function describeTtsEngine(cfg: {
+  provider: VoiceProvider
+  voice: string
+  customVoice: string
+  voiceURI: string
+  voices: SpeechSynthesisVoice[]
+  speed: number
+}): string {
+  const sx = `${formatSpeed(cfg.speed)}x`
+  if (cfg.provider === 'zai') {
+    const label =
+      TTS_VOICES.find((v) => v.value === cfg.voice)?.label.split('·')[0]?.trim() || '童童'
+    return `${label}（AI 音色）· ${sx}`
+  }
+  if (cfg.provider === 'custom') {
+    const cv = cfg.customVoice.trim()
+    return cv ? `自定义 TTS（${cv}）· ${sx}` : `自定义 TTS · ${sx}`
+  }
+  const v = cfg.voices.find((x) => x.voiceURI === cfg.voiceURI)
+  return `${v ? v.name : '系统语音'} · ${sx}`
 }
 
 /**
@@ -387,7 +471,8 @@ export function TtsPlayer({
     }
     return 'tongtong'
   })
-  const [customVoice, setCustomVoice] = React.useState('')
+  // 自定义音色：useLocalStorage（本地 + 服务端自动同步），替代手写 localStorage。
+  const [customVoice, setCustomVoice] = useLocalStorage<string>(CUSTOM_VOICE_KEY, '')
 
   // ---- browser ----
   const [voiceURI, setVoiceURI] = React.useState<string>(
@@ -396,6 +481,9 @@ export function TtsPlayer({
   const voices = useBrowserVoices(provider === 'browser')
   const [speaking, setSpeaking] = React.useState(false)
   const speechGenRef = React.useRef(0)
+
+  // ---- 选中文本继续朗读：监听 'sb-read-selection' → 临时浮层（见文件末尾） ----
+  const selectionTts = useSelectionTtsHost(settings, context)
 
   // Ref mirrors —— 供合成/跳句回调读取最新值（避免闭包陈旧 & 依赖抖动）。
   const providerRef = React.useRef(provider)
@@ -439,7 +527,9 @@ export function TtsPlayer({
   const [pronRules, setPronRules] = React.useState<PronRule[]>([])
   const [pronVersion, setPronVersion] = React.useState(0)
   const pronRef = React.useRef<PronRule[]>([])
-  pronRef.current = pronRules
+  React.useEffect(() => {
+    pronRef.current = pronRules
+  }, [pronRules])
   React.useEffect(() => {
     let alive = true
     void getState([pronKey]).then((vals) => {
@@ -456,10 +546,13 @@ export function TtsPlayer({
   // ---- 发音设置 sheet ----
   const [pronOpen, setPronOpen] = React.useState(false)
   const [pronPrefill, setPronPrefill] = React.useState<PronRule | null>(null)
-  const openPronSheet = React.useCallback((prefill: PronRule | null) => {
-    setPronPrefill(prefill)
-    setPronOpen(true)
-  }, [])
+  const openPronSheet = React.useCallback(
+    (prefill: PronRule | null) => {
+      setPronPrefill(prefill)
+      setPronOpen(true)
+    },
+    [setPronPrefill, setPronOpen],
+  )
   const commitPronRules = React.useCallback(
     (rules: PronRule[]) => {
       setPronRules(rules)
@@ -494,30 +587,19 @@ export function TtsPlayer({
     setMounted(true)
   }, [])
 
-  // Restore persisted custom voice (SSR-safe); context pref wins.
-  // 服务端为真源：先读本地镜像立即回显，再拉服务端覆盖；本地旧值自动迁移。
+  // 自定义音色：useLocalStorage 负责水合与持久化（本地 + 服务端自动同步）。
+  // 上下文默认（设为默认）仍优先：水合后应用一次 seed 值。
   React.useEffect(() => {
-    let alive = true
-    const stored = localStorage.getItem(CUSTOM_VOICE_KEY) || ''
-    const next = seeded?.provider === 'custom' && seeded.voice ? seeded.voice : stored
-    customVoiceRef.current = next
-    setCustomVoice(next)
-    void getState([VOICE_STATE_KEY]).then((vals) => {
-      if (!alive) return
-      const sv = vals[VOICE_STATE_KEY]
-      if (typeof sv === 'string' && sv) {
-        if (!(seeded?.provider === 'custom' && seeded.voice)) {
-          customVoiceRef.current = sv
-          setCustomVoice(sv)
-        }
-      } else if (stored) {
-        void putState(VOICE_STATE_KEY, stored)
-      }
-    })
-    return () => {
-      alive = false
+    if (seeded?.provider === 'custom' && seeded.voice) {
+      customVoiceRef.current = seeded.voice
+      setCustomVoice(seeded.voice)
     }
-  }, [seeded])
+  }, [seeded, setCustomVoice])
+
+  // Ref mirror 跟随水合/服务端同步回填的最新值。
+  React.useEffect(() => {
+    customVoiceRef.current = customVoice
+  }, [customVoice])
 
   React.useEffect(() => {
     voicesRef.current = voices
@@ -556,6 +638,14 @@ export function TtsPlayer({
     setAudioPlaying(false)
     setSpeaking(false)
   }, [])
+
+  // 选区朗读（'sb-read-selection'）开始时主播放器让路：注册停止回调。
+  React.useEffect(() => {
+    mainChannelStoppers.add(stopAllPlayback)
+    return () => {
+      mainChannelStoppers.delete(stopAllPlayback)
+    }
+  }, [stopAllPlayback])
 
   const startTimer = React.useCallback(
     (minutes: number) => {
@@ -703,41 +793,30 @@ export function TtsPlayer({
     const gen = ++speechGenRef.current
     const selected =
       voicesRef.current.find((v) => v.voiceURI === voiceURIRef.current) ?? null
-    const chunks = splitSpeechChunks(s)
-    chunks.forEach((chunk, ci) => {
-      const u = new SpeechSynthesisUtterance(chunk)
-      if (selected) {
-        u.voice = selected
-        u.lang = selected.lang
-      } else {
-        u.lang = 'zh-CN'
-      }
-      u.rate = speedRef.current
-      u.pitch = 1
-      if (ci === chunks.length - 1) {
-        u.onend = () => {
-          if (speechGenRef.current !== gen) return
-          setSpeaking(false)
-          // 按播放模式推进
-          if (playModeRef.current === 'repeat-one') {
-            speakSentenceBrowser(idx)
-            return
-          }
-          if (idx >= len - 1) {
-            if (playModeRef.current === 'loop-all') {
-              moveTo(0)
-              speakSentenceBrowser(0)
-            }
-            return
-          }
-          moveTo(idx + 1)
-          speakSentenceBrowser(idx + 1)
+    speakChunksBrowser(synth, s, {
+      voice: selected,
+      speed: speedRef.current,
+      onEnd: () => {
+        if (speechGenRef.current !== gen) return
+        setSpeaking(false)
+        // 按播放模式推进
+        if (playModeRef.current === 'repeat-one') {
+          speakSentenceBrowser(idx)
+          return
         }
-        u.onerror = () => {
-          if (speechGenRef.current === gen) setSpeaking(false)
+        if (idx >= len - 1) {
+          if (playModeRef.current === 'loop-all') {
+            moveTo(0)
+            speakSentenceBrowser(0)
+          }
+          return
         }
-      }
-      synth.speak(u)
+        moveTo(idx + 1)
+        speakSentenceBrowser(idx + 1)
+      },
+      onError: () => {
+        if (speechGenRef.current === gen) setSpeaking(false)
+      },
     })
     setSpeaking(true)
   }
@@ -750,6 +829,10 @@ export function TtsPlayer({
 
   // ---- 核心：从第 idx 句开始播放（缓存命中直接播，否则 /api/tts 合成） ----
   const playSentenceAt = (idx: number) => {
+    // 主播放器开始播放：先停掉选区朗读，避免双声道。
+    cancelSelectionRead()
+    // 朗读按钮说明用什么播放：引擎组合首次（或变化后）toast 提示。
+    maybeAnnounceEngine()
     const s = sentences[idx]
     if (!s || !s.trim()) {
       toast.error('没有可朗读的内容')
@@ -774,24 +857,12 @@ export function TtsPlayer({
     setLoading(true)
     void (async () => {
       try {
-        const res = await fetch('/api/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: applyPronRules(s, pronRef.current),
-            voice:
-              providerRef.current === 'custom'
-                ? customVoiceRef.current.trim() || undefined
-                : voiceRef.current,
-            speed: speedRef.current,
-            provider: providerRef.current,
-          }),
+        const blob = await requestTtsAudio(applyPronRules(s, pronRef.current), {
+          provider: providerRef.current,
+          voice:
+            providerRef.current === 'custom' ? customVoiceRef.current : voiceRef.current,
+          speed: speedRef.current,
         })
-        if (!res.ok) {
-          const err = (await res.json().catch(() => ({}))) as { error?: string }
-          throw new Error(err.error || '生成语音失败')
-        }
-        const blob = await res.blob()
         if (genRef.current !== gen) return // 已被更新的播放请求取代
         const url = URL.createObjectURL(blob)
         cachePut(cacheKey, url)
@@ -847,7 +918,8 @@ export function TtsPlayer({
       return
     }
     if (audioUrl && loadedIdxRef.current === sentenceIdx) {
-      // 暂停在当前句：续播
+      // 暂停在当前句：续播（先停选区朗读，避免双声道）
+      cancelSelectionRead()
       audioRef.current?.play().catch(() => {
         /* ignore */
       })
@@ -908,12 +980,8 @@ export function TtsPlayer({
 
   const handleCustomVoiceChange = (v: string) => {
     customVoiceRef.current = v
+    // useLocalStorage：本地 + 服务端自动同步
     setCustomVoice(v)
-    // 服务端真源 + 本地镜像（离线兑底）
-    try {
-      localStorage.setItem(CUSTOM_VOICE_KEY, v)
-    } catch {}
-    void putState(VOICE_STATE_KEY, v)
   }
 
   const handleVoiceURIChange = (v: string) => {
@@ -957,6 +1025,22 @@ export function TtsPlayer({
         : voices.find((v) => v.voiceURI === voiceURI)?.name ?? '系统语音'
 
   const speedLabel = formatSpeed(speed)
+  // ---- 朗读引擎说明：控制区 chip + 首次播放 toast（如「童童（AI 音色）· 1.0x」） ----
+  const engineDesc = describeTtsEngine({
+    provider,
+    voice,
+    customVoice,
+    voiceURI,
+    voices,
+    speed,
+  })
+  const engineSig = `${provider}|${voice}|${customVoice.trim()}|${voiceURI}|${speed}`
+  const announcedEngineRef = React.useRef<string | null>(null)
+  const maybeAnnounceEngine = () => {
+    if (announcedEngineRef.current === engineSig) return
+    announcedEngineRef.current = engineSig
+    toast.info(`将使用：${engineDesc}`)
+  }
   const playing = isPlaying || loading
   const currentSentence = sentences[sentenceIdx] ?? '准备播放…'
   const nowPlayingLabel = `正在播放：${cardTitle ?? '全文'} · 第 ${Math.min(sentenceIdx + 1, Math.max(len, 1))}/${Math.max(len, 1)} 句`
@@ -973,7 +1057,10 @@ export function TtsPlayer({
               type="button"
               aria-label={isPlaying ? '暂停' : '播放'}
               onClick={handleMainToggle}
-              className="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-transform active:scale-95"
+              className={cn(
+                'flex size-10 shrink-0 items-center justify-center rounded-full text-primary-foreground shadow-md transition-all active:scale-95',
+                isPlaying ? 'bg-emerald-600' : 'bg-primary',
+              )}
             >
               {loading ? (
                 <Loader2 className="size-4.5 animate-spin" />
@@ -1040,6 +1127,10 @@ export function TtsPlayer({
         tabIndex={-1}
       />
       {miniBar}
+      {/* 选中文本朗读临时浮层（portal 到 body，位于迷你条上方） */}
+      {mounted && selectionTts.isRenderer && selectionTts.state.open ? (
+        <SelectionReadOverlay state={selectionTts.state} />
+      ) : null}
 
       {!collapsed && (
         <div className="flex flex-col">
@@ -1198,13 +1289,25 @@ export function TtsPlayer({
 
           {/* ---------- 播放器控制区（固定底部） ---------- */}
           <div className="sticky bottom-0 z-20 bg-background">
-            {/* 正在播放胶囊 */}
-            {playing && (
+            {/* 正在播放胶囊 / 朗读引擎说明 chip（点按也可查看将使用的引擎） */}
+            {playing ? (
               <div className="flex justify-center pb-2">
                 <div className="flex max-w-full items-center gap-1.5 rounded-full border border-border bg-background px-4 py-1.5 shadow-sm">
                   <AudioLines className="size-3.5 shrink-0 animate-pulse text-primary" />
                   <span className="truncate text-xs">{nowPlayingLabel}</span>
                 </div>
+              </div>
+            ) : (
+              <div className="flex justify-center pb-2">
+                <button
+                  type="button"
+                  onClick={() => toast.info(`将使用：${engineDesc}`)}
+                  aria-label={`朗读引擎：${engineDesc}，点击查看`}
+                  className="flex max-w-full items-center gap-1.5 rounded-full border border-border bg-muted/60 px-3.5 py-1.5 text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <Volume2 className="size-3.5 shrink-0" />
+                  <span className="truncate text-xs">将使用：{engineDesc}</span>
+                </button>
               </div>
             )}
 
@@ -1508,7 +1611,12 @@ export function TtsPlayer({
                 aria-label={isPlaying ? '暂停' : '播放'}
                 onClick={handleMainToggle}
                 disabled={loading || len === 0}
-                className="flex size-20 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-transform active:scale-95 disabled:opacity-60"
+                className={cn(
+                  'flex size-20 items-center justify-center rounded-full shadow-lg transition-all active:scale-95 disabled:opacity-60',
+                  isPlaying
+                    ? 'bg-emerald-600 text-white shadow-emerald-600/30'
+                    : 'bg-primary text-primary-foreground',
+                )}
               >
                 {loading ? (
                   <Loader2 className="size-8 animate-spin" />
@@ -1807,6 +1915,7 @@ export function useQuickTts(context: string, settings: SettingsData | null): Qui
         return
       }
       const t = globalPronReady ? applyPronRules(t0, globalPronCache) : t0
+      cancelSelectionRead() // 与选区朗读互斥，避免双声道
       if (pref.provider === 'browser') {
         const synth = window.speechSynthesis
         if (!synth) {
@@ -1817,25 +1926,15 @@ export function useQuickTts(context: string, settings: SettingsData | null): Qui
         const gen = ++genRef.current
         const selected =
           browserVoices.find((v) => v.voiceURI === pref.voiceURI) ?? null
-        const chunks = splitSpeechChunks(t)
-        chunks.forEach((chunk, i) => {
-          const u = new SpeechSynthesisUtterance(chunk)
-          if (selected) {
-            u.voice = selected
-            u.lang = selected.lang
-          } else {
-            u.lang = 'zh-CN'
-          }
-          u.rate = pref.speed
-          if (i === chunks.length - 1) {
-            u.onend = () => {
-              if (genRef.current === gen) setSpeaking(false)
-            }
-            u.onerror = () => {
-              if (genRef.current === gen) setSpeaking(false)
-            }
-          }
-          synth.speak(u)
+        speakChunksBrowser(synth, t, {
+          voice: selected,
+          speed: pref.speed,
+          onEnd: () => {
+            if (genRef.current === gen) setSpeaking(false)
+          },
+          onError: () => {
+            if (genRef.current === gen) setSpeaking(false)
+          },
         })
         setSpeaking(true)
         return
@@ -1848,24 +1947,11 @@ export function useQuickTts(context: string, settings: SettingsData | null): Qui
       void (async () => {
         const tid = toast.loading('正在生成语音…')
         try {
-          const res = await fetch('/api/tts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              text: t,
-              voice:
-                pref.provider === 'custom'
-                  ? pref.voice.trim() || undefined
-                  : pref.voice,
-              speed: pref.speed,
-              provider: pref.provider,
-            }),
+          const blob = await requestTtsAudio(t, {
+            provider: pref.provider,
+            voice: pref.voice,
+            speed: pref.speed,
           })
-          if (!res.ok) {
-            const err = await res.json().catch(() => ({}))
-            throw new Error(err.error || '生成语音失败')
-          }
-          const blob = await res.blob()
           if (genRef.current !== gen) {
             // stopped / superseded while generating — drop the result
             toast.dismiss(tid)
@@ -2141,6 +2227,7 @@ export function speakOnce(
     return
   }
   stopSpeakOnce()
+  cancelSelectionRead() // 与选区朗读互斥，避免双声道
   const gen = ++speakOnceGen
   const pref = seedQuickPref(opts.context, opts.settings)
   void ensureGlobalPronRules().then((rules) => {
@@ -2153,38 +2240,22 @@ export function speakOnce(
         return
       }
       synth.cancel()
-      const chunks = splitSpeechChunks(t)
-      chunks.forEach((chunk, i) => {
-        const u = new SpeechSynthesisUtterance(chunk)
-        u.lang = 'zh-CN'
-        u.rate = pref.speed
-        if (i === chunks.length - 1) {
-          u.onend = () => {
-            if (gen === speakOnceGen) opts.onEnd?.()
-          }
-        }
-        synth.speak(u)
+      speakChunksBrowser(synth, t, {
+        speed: pref.speed,
+        onEnd: () => {
+          if (gen === speakOnceGen) opts.onEnd?.()
+        },
       })
       return
     }
     void (async () => {
       try {
-        const res = await fetch('/api/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: t,
-            voice: pref.provider === 'custom' ? pref.voice.trim() || undefined : pref.voice,
-            speed: pref.speed,
-            provider: pref.provider,
-          }),
+        const blob = await requestTtsAudio(t, {
+          provider: pref.provider,
+          voice: pref.voice,
+          speed: pref.speed,
         })
-        if (!res.ok) {
-          const err = (await res.json().catch(() => ({}))) as { error?: string }
-          throw new Error(err.error || '生成语音失败')
-        }
         if (gen !== speakOnceGen) return
-        const blob = await res.blob()
         speakOnceUrl = URL.createObjectURL(blob)
         const audio = new Audio(speakOnceUrl)
         audio.playbackRate = pref.speed
@@ -2200,4 +2271,472 @@ export function speakOnce(
       }
     })()
   })
+}
+
+// ---------------------------------------------------------------------------
+// 选中文本继续朗读：临时迷你播放器（浮层）。
+// reader-view 选中文本后 dispatch 'sb-read-selection'（detail: { text }），
+// 本模块用与主播放器相同的引擎逻辑（/api/tts 或 speechSynthesis + 发音规则）
+// 逐小句朗读选区，并通过 'sb-read-selection-progress' 广播进度供原文高亮；
+// 全部读完 1s 后自动收起，取消后浮层立即消失。
+// ---------------------------------------------------------------------------
+
+/** 请求事件名：reader-view 选中文本朗读时派发，detail = { text: string }。 */
+export const READ_SELECTION_EVENT = 'sb-read-selection'
+/** 进度事件名：选区朗读时派发，供原文侧高亮当前小句。 */
+export const READ_SELECTION_PROGRESS_EVENT = 'sb-read-selection-progress'
+
+export interface ReadSelectionDetail {
+  text: string
+}
+
+export interface ReadSelectionProgressDetail {
+  /** 当前小句序号（0-based） */
+  index: number
+  /** 小句总数 */
+  total: number
+  /** 当前正在朗读的小句文本 */
+  text: string
+  /** 是否结束（全部完成或被取消） */
+  done: boolean
+  /** done 时有效：是否被用户取消 */
+  cancelled?: boolean
+}
+
+/** 派发选区朗读请求（reader-view 侧可直接调用，等价于 dispatch 事件）。 */
+export function dispatchReadSelection(text: string): void {
+  if (typeof window === 'undefined') return
+  window.dispatchEvent(
+    new CustomEvent<ReadSelectionDetail>(READ_SELECTION_EVENT, { detail: { text } }),
+  )
+}
+
+interface SelectionTtsState {
+  open: boolean
+  /** 原始选中文本 */
+  text: string
+  /** splitSentences 拆出的小句 */
+  parts: string[]
+  index: number
+  playing: boolean
+  loading: boolean
+  paused: boolean
+  /** 引擎描述（如「童童（AI 音色）· 1.0x」） */
+  engine: string
+}
+
+const SELECTION_TTS_CLOSED: SelectionTtsState = {
+  open: false,
+  text: '',
+  parts: [],
+  index: 0,
+  playing: false,
+  loading: false,
+  paused: false,
+  engine: '',
+}
+
+let selState: SelectionTtsState = SELECTION_TTS_CLOSED
+const selSubs = new Set<() => void>()
+
+function notifySelectionTts(): void {
+  for (const cb of selSubs) cb()
+}
+function subscribeSelectionTts(cb: () => void): () => void {
+  selSubs.add(cb)
+  return () => {
+    selSubs.delete(cb)
+  }
+}
+function getSelectionTtsSnapshot(): SelectionTtsState {
+  return selState
+}
+
+/** host（挂载点）提供的配置：settings + context（音色默认）+ 系统音色列表。 */
+interface SelectionHostConfig {
+  settings: SettingsData | null
+  context: string
+  voices: SpeechSynthesisVoice[]
+}
+
+interface SelectionHost {
+  id: number
+  getConfig: () => SelectionHostConfig
+}
+
+const selHosts: SelectionHost[] = []
+let selNextHostId = 1
+let selListenerInstalled = false
+
+/** 其它 TTS 通道（主播放器等）注册的停止回调：选区朗读开始前全部调用。 */
+const mainChannelStoppers = new Set<() => void>()
+
+/** 当前负责渲染浮层的 host（最后注册者优先；卸载后自动让位）。 */
+function selectionRendererId(): number {
+  return selHosts.length > 0 ? selHosts[selHosts.length - 1].id : 0
+}
+
+function ensureSelectionListener(): void {
+  if (selListenerInstalled || typeof window === 'undefined') return
+  selListenerInstalled = true
+  window.addEventListener(READ_SELECTION_EVENT, (e: Event) => {
+    const detail = (e as CustomEvent<ReadSelectionDetail>).detail
+    if (!detail || typeof detail.text !== 'string' || !detail.text.trim()) return
+    const host = selHosts[selHosts.length - 1]
+    if (!host) return
+    startSelectionReadInternal(detail.text, host.getConfig())
+  })
+}
+
+function registerSelectionHost(getConfig: () => SelectionHostConfig): number {
+  const host: SelectionHost = { id: selNextHostId++, getConfig }
+  selHosts.push(host)
+  ensureSelectionListener()
+  notifySelectionTts()
+  return host.id
+}
+
+function unregisterSelectionHost(id: number): void {
+  const i = selHosts.findIndex((h) => h.id === id)
+  if (i === -1) return
+  selHosts.splice(i, 1)
+  notifySelectionTts()
+  // 最后一个 host 卸载时若仍在朗读：立即取消，避免无人控制的音频。
+  if (selHosts.length === 0 && (selState.playing || selState.loading)) {
+    cancelSelectionRead()
+  }
+}
+
+// ---- 选区朗读引擎（模块级单例；复用主播放器的合成路径） ----
+let selAudio: HTMLAudioElement | null = null
+let selAudioUrl: string | null = null
+let selGen = 0
+let selPaused = false
+
+interface SelectionSession {
+  parts: string[]
+  pref: QuickTtsPref
+  voices: SpeechSynthesisVoice[]
+  rules: PronRule[]
+  gen: number
+}
+let selSession: SelectionSession | null = null
+
+function setSelState(patch: Partial<SelectionTtsState>): void {
+  if (patch.paused !== undefined) selPaused = patch.paused
+  selState = { ...selState, ...patch }
+  notifySelectionTts()
+}
+
+function dispatchSelProgress(detail: ReadSelectionProgressDetail): void {
+  window.dispatchEvent(
+    new CustomEvent<ReadSelectionProgressDetail>(READ_SELECTION_PROGRESS_EVENT, {
+      detail,
+    }),
+  )
+}
+
+function stopSelectionAudio(): void {
+  try {
+    window.speechSynthesis?.cancel()
+  } catch {
+    /* ignore */
+  }
+  if (selAudio) {
+    selAudio.onended = null
+    selAudio.pause()
+    selAudio = null
+  }
+  if (selAudioUrl) {
+    URL.revokeObjectURL(selAudioUrl)
+    selAudioUrl = null
+  }
+}
+
+function startSelectionReadInternal(text: string, config: SelectionHostConfig): void {
+  const raw = (text || '').trim()
+  if (!raw) {
+    toast.error('没有可朗读的内容')
+    return
+  }
+  // 与主播放器/一次性朗读互斥：开始前先停掉其它通道。
+  for (const stop of mainChannelStoppers) {
+    try {
+      stop()
+    } catch {
+      /* ignore */
+    }
+  }
+  stopSpeakOnce()
+  cancelSelectionRead() // 取代上一次未完成的选区朗读
+
+  const parts = splitSentences(raw)
+  const pref = seedQuickPref(config.context, config.settings)
+  const voices =
+    config.voices.length > 0
+      ? config.voices
+      : [...(window.speechSynthesis?.getVoices() ?? [])]
+  const engine = describeTtsEngine({
+    provider: pref.provider,
+    voice: pref.voice,
+    customVoice: pref.provider === 'custom' ? pref.voice : '',
+    voiceURI: pref.voiceURI ?? '',
+    voices,
+    speed: pref.speed,
+  })
+  const gen = ++selGen
+  selSession = { parts, pref, voices, rules: [], gen }
+  selPaused = false
+  setSelState({
+    open: true,
+    text: raw,
+    parts,
+    index: 0,
+    playing: true,
+    loading: false,
+    paused: false,
+    engine,
+  })
+  void ensureGlobalPronRules().then((rules) => {
+    if (!selSession || selSession.gen !== gen) return
+    selSession.rules = rules
+    readSelectionPart(0)
+  })
+}
+
+/** 逐小句朗读：每句开始前派发进度事件；结束派发 done，1s 后收起浮层。 */
+function readSelectionPart(idx: number): void {
+  const s = selSession
+  if (!s || s.gen !== selGen) return
+  // 与上一句音频解绑，避免暂停/恢复期间误重播旧句。
+  if (selAudio) {
+    selAudio.onended = null
+    selAudio = null
+  }
+  if (idx >= s.parts.length) {
+    const lastIdx = Math.max(s.parts.length - 1, 0)
+    const last = s.parts[lastIdx] ?? ''
+    selSession = null
+    setSelState({ playing: false, loading: false, paused: false })
+    dispatchSelProgress({ index: lastIdx, total: s.parts.length, text: last, done: true })
+    window.setTimeout(() => {
+      if (selGen === s.gen && selState.open) setSelState({ open: false })
+    }, 1000)
+    return
+  }
+  const rawPart = s.parts[idx]
+  setSelState({ index: idx, loading: true, paused: false })
+  dispatchSelProgress({ index: idx, total: s.parts.length, text: rawPart, done: false })
+  const part = applyPronRules(rawPart, s.rules)
+
+  if (s.pref.provider === 'browser') {
+    const synth = window.speechSynthesis
+    if (!synth) {
+      toast.error('当前浏览器不支持语音合成，请使用 Chrome / Edge')
+      cancelSelectionRead()
+      return
+    }
+    synth.cancel()
+    const selected = s.pref.voiceURI
+      ? s.voices.find((v) => v.voiceURI === s.pref.voiceURI) ?? null
+      : null
+    speakChunksBrowser(synth, part, {
+      voice: selected,
+      speed: s.pref.speed,
+      onEnd: () => {
+        if (!selSession || selSession.gen !== selGen) return
+        readSelectionPart(idx + 1)
+      },
+      onError: () => {
+        if (!selSession || selSession.gen !== selGen) return
+        cancelSelectionRead()
+      },
+    })
+    setSelState({ loading: false, playing: true })
+    return
+  }
+
+  void (async () => {
+    try {
+      const blob = await requestTtsAudio(part, {
+        provider: s.pref.provider,
+        voice: s.pref.voice,
+        speed: s.pref.speed,
+      })
+      if (!selSession || selSession.gen !== selGen) return
+      if (selAudioUrl) URL.revokeObjectURL(selAudioUrl)
+      selAudioUrl = URL.createObjectURL(blob)
+      const audio = new Audio(selAudioUrl)
+      audio.playbackRate = s.pref.speed
+      audio.onended = () => {
+        if (!selSession || selSession.gen !== selGen) return
+        readSelectionPart(idx + 1)
+      }
+      selAudio = audio
+      setSelState({ loading: false, playing: true })
+      if (!selPaused) {
+        try {
+          await audio.play()
+        } catch {
+          /* autoplay blocked */
+        }
+      }
+    } catch (err) {
+      if (!selSession || selSession.gen !== selGen) return
+      toast.error('朗读失败：' + (err instanceof Error ? err.message : '未知错误'))
+      cancelSelectionRead()
+    }
+  })()
+}
+
+/** 暂停/继续：SDK 走 audio.pause()/play()，浏览器走 speechSynthesis.pause()/resume()。 */
+function toggleSelectionReadPause(): void {
+  if (!selState.open || !selState.playing) return
+  if (selState.paused) {
+    if (selAudio) {
+      void selAudio.play().catch(() => {
+        /* ignore */
+      })
+    } else {
+      try {
+        window.speechSynthesis?.resume()
+      } catch {
+        /* ignore */
+      }
+    }
+    setSelState({ paused: false })
+  } else {
+    if (selAudio) selAudio.pause()
+    else {
+      try {
+        window.speechSynthesis?.pause()
+      } catch {
+        /* ignore */
+      }
+    }
+    setSelState({ paused: true })
+  }
+}
+
+/** 取消：立即停合成/音频，浮层消失，派发 done + cancelled。 */
+function cancelSelectionRead(): void {
+  const session = selSession
+  selGen++
+  selSession = null
+  selPaused = false
+  stopSelectionAudio()
+  if (!selState.open) return
+  const idx = selState.index
+  const total = selState.parts.length
+  const text = selState.parts[idx] ?? selState.text
+  setSelState({ open: false, playing: false, loading: false, paused: false })
+  if (session) {
+    dispatchSelProgress({ index: idx, total, text, done: true, cancelled: true })
+  }
+}
+
+/**
+ * 选区朗读 host：注册配置（settings/context/voices）并订阅浮层状态。
+ * 最后注册的 host 负责渲染浮层，卸载后自动让位给其它 host，
+ * 因此浮层不依赖某个具体组件的存活（如主播放器 Sheet 关闭）。
+ */
+function useSelectionTtsHost(
+  settings: SettingsData | null,
+  context: string,
+): { state: SelectionTtsState; isRenderer: boolean } {
+  const configRef = React.useRef<SelectionHostConfig>({
+    settings,
+    context,
+    voices: [],
+  })
+  const voices = useBrowserVoices(true)
+  React.useEffect(() => {
+    configRef.current = { settings, context, voices }
+  }, [settings, context, voices])
+
+  const [hostId, setHostId] = React.useState(0)
+
+  React.useEffect(() => {
+    const id = registerSelectionHost(() => configRef.current)
+    setHostId(id)
+    return () => unregisterSelectionHost(id)
+  }, [])
+
+  const state = React.useSyncExternalStore(
+    subscribeSelectionTts,
+    getSelectionTtsSnapshot,
+    () => SELECTION_TTS_CLOSED,
+  )
+
+  const isRenderer = hostId !== 0 && selectionRendererId() === hostId
+  return { state, isRenderer }
+}
+
+/** 选区朗读临时浮层：portal 到 body，底部居中（主播放器迷你条上方）。 */
+function SelectionReadOverlay({ state }: { state: SelectionTtsState }) {
+  const total = Math.max(state.parts.length, 1)
+  const current = state.parts[state.index] ?? state.text
+  return createPortal(
+    <div
+      role="status"
+      aria-label="选区朗读"
+      className="animate-in slide-in-from-bottom-2 fade-in-0 fixed inset-x-3 bottom-20 z-[75] mx-auto flex max-w-md duration-200"
+    >
+      <div className="flex w-full items-center gap-2.5 rounded-2xl border border-border bg-background/95 py-2 pl-2 pr-2 shadow-xl backdrop-blur">
+        <button
+          type="button"
+          aria-label={state.paused ? '继续朗读选中内容' : '暂停朗读选中内容'}
+          onClick={toggleSelectionReadPause}
+          className={cn(
+            'flex size-10 shrink-0 items-center justify-center rounded-full text-primary-foreground shadow-md transition-all active:scale-95',
+            state.playing && !state.paused ? 'bg-emerald-600' : 'bg-primary',
+          )}
+        >
+          {state.loading ? (
+            <Loader2 className="size-4.5 animate-spin" />
+          ) : state.paused ? (
+            <Play className="size-5 translate-x-px fill-current" />
+          ) : (
+            <Pause className="size-5 fill-current" />
+          )}
+        </button>
+        <div className="min-w-0 flex-1 text-left">
+          <p className="line-clamp-2 text-xs font-medium leading-relaxed">{current}</p>
+          <p className="mt-0.5 truncate text-[10px] text-muted-foreground">
+            {state.engine} · 第 {Math.min(state.index + 1, total)}/{total} 句
+            {state.paused ? ' · 已暂停' : state.loading ? ' · 合成中…' : ''}
+          </p>
+        </div>
+        <button
+          type="button"
+          aria-label="取消朗读选中内容"
+          onClick={cancelSelectionRead}
+          className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <X className="size-4" />
+        </button>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+/**
+ * 选区朗读挂载点：放在页面级（如 reader-view 根部）即可在主播放器未打开时
+ * 也响应 'sb-read-selection' 事件；浮层由最后注册的 host 渲染，不重复。
+ */
+export function SelectionReadPlayer({
+  settings,
+  context = 'reader',
+}: {
+  settings: SettingsData | null
+  context?: string
+}) {
+  const { state, isRenderer } = useSelectionTtsHost(settings, context)
+  const [mounted, setMounted] = React.useState(false)
+  React.useEffect(() => {
+    setMounted(true)
+  }, [])
+  if (!mounted || !isRenderer || !state.open) return null
+  return <SelectionReadOverlay state={state} />
 }

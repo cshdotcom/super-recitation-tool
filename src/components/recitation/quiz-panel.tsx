@@ -148,15 +148,19 @@ interface PointItem {
 }
 
 // ---------- 题型配置（Step 2） ----------
+// 可选题型与 /api/quiz 的 VALID_TYPES 对齐：单选/多选/判断/填空/简答；
+// 连线题（match）API 暂不支持，不列入。
 const QUESTION_TYPES = [
   { key: 'choice', label: '单选题', hint: '四选一', def: 5 },
   { key: 'multi', label: '多选题', hint: '多个正确答案', def: 3 },
-  { key: 'judge', label: '判断题', hint: '正确 / 错误', def: 5 },
+  { key: 'judge', label: '判断题', hint: '正确 / 错误', def: 4 },
   { key: 'fill', label: '填空题', hint: '补全空缺内容', def: 5 },
   { key: 'short', label: '简答题', hint: '简答要点 · 自评对错', def: 3 },
 ] as const
 type QuestionTypeKey = (typeof QUESTION_TYPES)[number]['key']
 const MAX_PER_TYPE = 10
+/** 题目个数选择器上限（1–20）；/api/quiz 两步模式另有 单题型≤10、总数≤30 的服务端限制 */
+const MAX_TOTAL_QUESTIONS = 20
 
 // ---------- 出题期间进度文案 ----------
 const POINT_STAGES = ['正在阅读课文…', '正在提炼核心考点…', '正在整理知识点…', '即将完成…']
@@ -390,11 +394,11 @@ export function QuizPanel({
   const [addText, setAddText] = React.useState('')
   const [addImportance, setAddImportance] = React.useState<'core' | 'secondary'>('core')
 
-  // ---- Step2 题型数量 ----
+  // ---- Step2 题型数量（题目类型多选 + 题目个数 1–20）----
   const [typeCounts, setTypeCounts] = React.useState<Record<QuestionTypeKey, number>>({
     choice: 5,
     multi: 3,
-    judge: 5,
+    judge: 4,
     fill: 5,
     short: 3,
   })
@@ -402,6 +406,80 @@ export function QuizPanel({
     () => Object.values(typeCounts).reduce((a, b) => a + b, 0),
     [typeCounts],
   )
+
+  // ---- 自定义出题类型与个数：生成时随 types + count 一起提交给 /api/quiz ----
+  /** 题型多选开关：勾选 → 恢复默认数量（不超总题数上限）；取消 → 清零 */
+  const toggleTypeSelected = (key: QuestionTypeKey) => {
+    if (typeCounts[key] > 0) {
+      setTypeCounts((prev) => ({ ...prev, [key]: 0 }))
+      return
+    }
+    const room = MAX_TOTAL_QUESTIONS - totalCount
+    if (room <= 0) {
+      toast.warning(`总题数已达上限 ${MAX_TOTAL_QUESTIONS} 道，请先减少其他题型的数量`)
+      return
+    }
+    const def = QUESTION_TYPES.find((t) => t.key === key)?.def ?? 1
+    setTypeCounts((prev) => ({ ...prev, [key]: Math.max(1, Math.min(def, room)) }))
+  }
+
+  /** 总题数 +1：加给当前数量最少且未满的已选题型，保持均衡 */
+  const increaseTotal = () => {
+    if (totalCount >= MAX_TOTAL_QUESTIONS) return
+    const active = QUESTION_TYPES.filter((t) => typeCounts[t.key] > 0)
+    if (active.length === 0) {
+      toast.warning('请先选择至少一种题型')
+      return
+    }
+    const withRoom = active.filter((t) => typeCounts[t.key] < MAX_PER_TYPE)
+    if (withRoom.length === 0) {
+      toast.warning(`单种题型最多 ${MAX_PER_TYPE} 道，可勾选更多题型来增加总题数`)
+      return
+    }
+    const target = [...withRoom].sort((a, b) => typeCounts[a.key] - typeCounts[b.key])[0]
+    setTypeCounts((prev) => ({ ...prev, [target.key]: prev[target.key] + 1 }))
+  }
+
+  /** 总题数 -1：从当前数量最多的已选题型减 1（减到 0 即自动取消该题型） */
+  const decreaseTotal = () => {
+    if (totalCount <= 1) return
+    const active = QUESTION_TYPES.filter((t) => typeCounts[t.key] > 0)
+    if (active.length === 0) return
+    const target = [...active].sort((a, b) => typeCounts[b.key] - typeCounts[a.key])[0]
+    setTypeCounts((prev) => ({ ...prev, [target.key]: Math.max(0, prev[target.key] - 1) }))
+  }
+
+  /** 直接设定总题数（1–20）：在已选题型间均衡分配，超出单题型上限的部分轮补给仍有余量的题型 */
+  const setTotalQuestions = (n: number) => {
+    const target = Math.max(1, Math.min(MAX_TOTAL_QUESTIONS, Math.floor(Number(n)) || 1))
+    const active = QUESTION_TYPES.filter((t) => typeCounts[t.key] > 0)
+    if (active.length === 0) {
+      toast.warning('请先选择至少一种题型')
+      return
+    }
+    const next = { ...typeCounts }
+    const base = Math.floor(target / active.length)
+    const rem = target % active.length
+    active.forEach((t, i) => {
+      next[t.key] = Math.min(MAX_PER_TYPE, base + (i < rem ? 1 : 0))
+    })
+    let left = target - active.reduce((a, t) => a + next[t.key], 0)
+    while (left > 0) {
+      const before = left
+      for (const t of active) {
+        if (left <= 0) break
+        if (next[t.key] < MAX_PER_TYPE) {
+          next[t.key] += 1
+          left -= 1
+        }
+      }
+      if (left === before) break // 所有已选题型均已满
+    }
+    setTypeCounts(next)
+    if (left > 0) {
+      toast(`当前 ${active.length} 种题型最多共出 ${target - left} 道题，可勾选更多题型`)
+    }
+  }
 
   // ---- 加载进度文案 ----
   const [stageIdx, setStageIdx] = React.useState(0)
@@ -688,7 +766,10 @@ export function QuizPanel({
           content,
           keywords,
           points: sel.map((p) => ({ text: p.text, importance: p.importance })),
+          // 题目类型多选结果 + 各题型数量（/api/quiz 两步模式字段：数量为 0 的题型不出题）
           types: typeCounts,
+          // 题目个数（总题数，兼容字段：两步模式按 types 各项之和出题）
+          count: totalCount,
         }),
       })
       if (!res.ok) {
@@ -1064,7 +1145,73 @@ export function QuizPanel({
             onBack={() => setStep('points')}
             right={<span className="text-xs text-muted-foreground">共 {totalCount} 题</span>}
           />
-          <div className="flex flex-col gap-2.5">
+
+          {/* 题目类型多选：勾选要出的题型（连线题 API 暂不支持，未列出） */}
+          <div className="rounded-2xl border border-border bg-card px-4 py-3">
+            <p className="text-sm font-bold">题目类型</p>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              多选要出的题型（连线题暂不支持），可在下方微调每种题的数量
+            </p>
+            <div className="mt-2.5 flex flex-wrap gap-2">
+              {QUESTION_TYPES.map((t) => {
+                const on = typeCounts[t.key] > 0
+                return (
+                  <button
+                    key={t.key}
+                    type="button"
+                    aria-pressed={on}
+                    aria-label={`${on ? '取消' : '选择'}${t.label}`}
+                    onClick={() => toggleTypeSelected(t.key)}
+                    className={cn(
+                      'rounded-full border px-3.5 py-1.5 text-xs font-medium transition-colors',
+                      on
+                        ? 'border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900'
+                        : 'border-border bg-card text-muted-foreground hover:bg-accent',
+                    )}
+                  >
+                    {t.label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* 题目个数：1–20 步进器（+/- 均衡增减，可直接输入总题数） */}
+          <div className="mt-2.5 flex items-center justify-between gap-2 rounded-2xl border border-border bg-card px-4 py-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-bold">题目个数</p>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">
+                1–{MAX_TOTAL_QUESTIONS} 道题，自动均衡分配到已选题型
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <SquareBtn label="减少总题数" disabled={totalCount <= 1} onClick={decreaseTotal}>
+                <Minus className="size-4" />
+              </SquareBtn>
+              <span className="flex h-9 min-w-14 items-center justify-center rounded-full bg-muted px-1.5">
+                <input
+                  type="number"
+                  min={1}
+                  max={MAX_TOTAL_QUESTIONS}
+                  value={totalCount}
+                  onChange={(e) => setTotalQuestions(Number(e.target.value))}
+                  aria-label="题目个数"
+                  className="w-7 bg-transparent text-center text-sm font-bold text-foreground outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                />
+                <span className="text-xs text-muted-foreground">题</span>
+              </span>
+              <SquareBtn
+                label="增加总题数"
+                disabled={totalCount >= MAX_TOTAL_QUESTIONS}
+                onClick={increaseTotal}
+              >
+                <Plus className="size-4" />
+              </SquareBtn>
+            </div>
+          </div>
+
+          <p className="mt-3 px-1 text-xs text-muted-foreground">各题型数量微调</p>
+          <div className="mt-1.5 flex flex-col gap-2.5">
             {QUESTION_TYPES.map((t) => {
               const n = typeCounts[t.key]
               return (
@@ -1093,9 +1240,14 @@ export function QuizPanel({
                         max={MAX_PER_TYPE}
                         value={n}
                         onChange={(e) => {
+                          // 单题型 ≤10，且总题数 ≤20（其他题型已占 totalCount - n）
+                          const cap = Math.max(
+                            0,
+                            Math.min(MAX_PER_TYPE, MAX_TOTAL_QUESTIONS - (totalCount - n)),
+                          )
                           const v = Math.max(
                             0,
-                            Math.min(MAX_PER_TYPE, Math.floor(Number(e.target.value) || 0)),
+                            Math.min(cap, Math.floor(Number(e.target.value) || 0)),
                           )
                           setTypeCounts((prev) => ({ ...prev, [t.key]: v }))
                         }}
@@ -1106,7 +1258,7 @@ export function QuizPanel({
                     </span>
                     <SquareBtn
                       label={`增加${t.label}数量`}
-                      disabled={n >= MAX_PER_TYPE}
+                      disabled={n >= MAX_PER_TYPE || totalCount >= MAX_TOTAL_QUESTIONS}
                       onClick={() =>
                         setTypeCounts((prev) => ({
                           ...prev,

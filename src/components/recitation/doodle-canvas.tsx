@@ -50,7 +50,7 @@ const PENCIL_JITTER: [number, number][] = [
 // 8 preset swatches; the first is the theme-aware default ink.
 const WHEEL_GRADIENT =
   'conic-gradient(#ef4444,#f97316,#eab308,#22c55e,#14b8a6,#3b82f6,#a855f7,#ec4899,#ef4444)'
-// Custom palette (up to 8 user-picked colors) persisted in localStorage.
+// Custom palette (up to 8 user-picked colors) persisted server-side (AppState).
 const CUSTOM_COLORS_KEY = 'beishuba-doodle-colors'
 const MAX_CUSTOM_COLORS = 8
 const TOOL_CYCLE: DoodleTool[] = ['pen', 'pencil', 'marker', 'brush']

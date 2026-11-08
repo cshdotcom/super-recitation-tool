@@ -63,8 +63,12 @@ import {
   Camera,
   Crop,
   Download,
+  FlipHorizontal,
+  FlipVertical,
   Paintbrush,
   Palette,
+  RotateCcw,
+  RotateCw,
   ScanLine,
   SquareSigma,
 } from 'lucide-react'
@@ -75,6 +79,7 @@ import { FreeCropBox, type CropBox, type CropOffset } from '@/components/recitat
 import type { CardData, MaterialBlock } from '@/lib/types'
 import { extractClozeMarks, wrapClozeMark } from '@/lib/editor-cloze'
 import { parseSpanDirective, spanStyleCss } from '@/lib/inline-style'
+import { transformImage } from '@/lib/image-transform'
 import { cn } from '@/lib/utils'
 import { VoiceInput } from '@/components/recitation/voice-input'
 import {
@@ -99,9 +104,11 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Slider } from '@/components/ui/slider'
 import { Textarea } from '@/components/ui/textarea'
 import { RichContent } from '@/components/recitation/rich-content'
@@ -516,6 +523,11 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const [fontSize, setFontSize] = React.useState(16)
   // 复制/导出时是否包含图片（与思维导图/HTML 等富格式）
   const [copyExportImages, setCopyExportImages] = React.useState(true)
+  // 插入图片链接弹窗（可选保存到图片服务器）
+  const [imgUrlOpen, setImgUrlOpen] = React.useState(false)
+  const [imgUrlValue, setImgUrlValue] = React.useState('')
+  const [imgUrlSave, setImgUrlSave] = React.useState(true)
+  const [imgUrlBusy, setImgUrlBusy] = React.useState(false)
   const [lineSpacing, setLineSpacing] = React.useState<number>(1.7)
   /** 处于 Markdown 预览态的块（下标集合） */
   const [previewIdx, setPreviewIdx] = React.useState<ReadonlySet<number>>(new Set())
@@ -897,6 +909,54 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     }
   }
 
+  /** 批量 AI 生成正面：为所有选中且背面非空的块逐个提炼核心论点。 */
+  const batchGenerateFront = async () => {
+    const idxs = [...selected].sort((a, b) => a - b).filter((i) => {
+      const b = blocksRef.current[i]
+      return b && (b.back ?? '').trim()
+    })
+    if (idxs.length === 0) {
+      toast.warning('请先选择有「完整内容」的块')
+      return
+    }
+    const tid = toast.loading(`AI 正在为 ${idxs.length} 块生成核心论点…`)
+    let ok = 0
+    let fail = 0
+    for (const i of idxs) {
+      const back = (blocksRef.current[i]?.back ?? '').trim()
+      try {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            mode: 'ask',
+            content: back.slice(0, 2000),
+            messages: [
+              {
+                role: 'user',
+                content: '请为下面这段内容提炼一句20字以内的核心论点，只返回论点本身：',
+              },
+            ],
+          }),
+        })
+        if (!res.ok) throw new Error('生成失败')
+        const data = (await res.json()) as { reply?: string }
+        const reply = (data.reply ?? '')
+          .replace(/\s+/g, ' ')
+          .replace(/^["'“”「」『』]+|["'“”「」『』]+$/g, '')
+          .trim()
+        if (!reply) throw new Error('AI 未返回结果')
+        commit((prev) => prev.map((b, bi) => (bi === i ? { ...b, front: reply } : b)))
+        ok += 1
+      } catch {
+        fail += 1
+      }
+    }
+    if (fail === 0) toast.success(`已为 ${ok} 块生成核心论点`, { id: tid })
+    else if (ok === 0) toast.error('AI 生成失败，请稍后重试', { id: tid })
+    else toast.warning(`成功 ${ok} 块 · 失败 ${fail} 块`, { id: tid })
+  }
+
   // ---- 分割分块（POST /api/chunk → 确认 → 替换全部块）----
   const runChunk = async () => {
     const content = blocksRef.current
@@ -1187,6 +1247,41 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     toast.success(`已导出 ${fmt.toUpperCase()} 文件`)
   }
 
+  /** 插入图片链接：可选「保存图片到服务器」（POST /api/upload → /api/upload/<id>）。 */
+  const confirmImageUrl = async () => {
+    const url = imgUrlValue.trim()
+    if (!/^https?:\/\/.+/i.test(url)) {
+      toast.error('请输入以 http(s):// 开头的图片链接')
+      return
+    }
+    if (!imgUrlSave) {
+      // 保留外部链接，直接插入
+      insertMarkdown(`![图片](${url})`, '', '')
+      setImgUrlOpen(false)
+      setImgUrlValue('')
+      return
+    }
+    setImgUrlBusy(true)
+    const tid = toast.loading('正在把图片保存到服务器…')
+    try {
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { url?: string; error?: string }
+      if (!res.ok || !data.url) throw new Error(data.error || '保存失败')
+      insertMarkdown(`![图片](${data.url})`, '', '')
+      toast.success('图片已保存到服务器并插入', { id: tid })
+      setImgUrlOpen(false)
+      setImgUrlValue('')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '保存失败', { id: tid })
+    } finally {
+      setImgUrlBusy(false)
+    }
+  }
+
   // ================= 渲染 =================
   return (
     <>
@@ -1211,6 +1306,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                   {(
                     [
                       { label: '全选', onClick: toggleSelectAll, disabled: blocks.length === 0 },
+                      { label: 'AI正面', onClick: () => void batchGenerateFront(), disabled: selected.size === 0 },
                       { label: '合并', onClick: () => mergeSelected(), disabled: selected.size < 2 },
                       { label: '隐藏', onClick: () => hideSelected(), disabled: selected.size === 0 },
                       { label: '删除', onClick: () => deleteSelected(), disabled: selected.size === 0 },
@@ -1542,7 +1638,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                   </button>
                   <button
                     type="button"
-                    onClick={() => insertMarkdown('![](', ')', 'url')}
+                    onClick={() => setImgUrlOpen(true)}
                     onMouseDown={(e) => e.preventDefault()}
                     className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
@@ -1550,7 +1646,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                     插入图片链接
                   </button>
                   <p className="px-2.5 pb-1.5 pt-1 text-[11px] text-muted-foreground">
-                    图片压缩到 800px 宽后内嵌；AI 扫描把图中文字插入正文
+                    图片压缩到 800px 宽后内嵌；链接图片可选保存到图片服务器
                   </p>
                 </PopoverContent>
               </Popover>
@@ -2204,7 +2300,57 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
           if (!v) setImgEdit(null)
         }}
         onConfirm={(box) => void insertCropped(box)}
+        onSrcChange={(next) => setImgEdit(next)}
       />
+      {/* 插入图片链接弹窗（询问是否保存图片到服务器） */}
+      <Dialog open={imgUrlOpen} onOpenChange={(v) => { setImgUrlOpen(v); if (!v) setImgUrlValue('') }}>
+        <DialogContent className="rounded-2xl sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>插入图片链接</DialogTitle>
+            <DialogDescription>粘贴图片地址；保存到服务器后不依赖外部图床</DialogDescription>
+          </DialogHeader>
+          <Input
+            value={imgUrlValue}
+            onChange={(e) => setImgUrlValue(e.target.value)}
+            placeholder="https://example.com/picture.jpg"
+            inputMode="url"
+            aria-label="图片链接"
+            className="h-11 rounded-xl"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !imgUrlBusy) void confirmImageUrl()
+            }}
+          />
+          <label className="flex items-center justify-between gap-2 rounded-xl bg-muted/50 px-3 py-2.5 text-sm">
+            <span>保存图片到服务器（推荐）</span>
+            <input
+              type="checkbox"
+              checked={imgUrlSave}
+              onChange={(e) => setImgUrlSave(e.target.checked)}
+              className="size-4 accent-emerald-600"
+              aria-label="保存图片到服务器"
+            />
+          </label>
+          <DialogFooter className="gap-2">
+            <Button
+              variant="ghost"
+              className="rounded-full"
+              onClick={() => setImgUrlOpen(false)}
+              disabled={imgUrlBusy}
+            >
+              取消
+            </Button>
+            <Button
+              className="rounded-full bg-primary"
+              onClick={() => void confirmImageUrl()}
+              disabled={imgUrlBusy || !imgUrlValue.trim()}
+            >
+              {imgUrlBusy ? <Loader2 className="size-4 animate-spin" /> : null}
+              {imgUrlSave ? '保存并插入' : '插入链接'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* 在线相机（拍照插入）：真实取景器 + 裁剪 + 降级方案 */}
       <CameraCapture
         open={cameraOpen}
@@ -2238,16 +2384,20 @@ function CropDialog({
   open,
   onOpenChange,
   onConfirm,
+  onSrcChange,
 }: {
   src: string
   open: boolean
   onOpenChange: (v: boolean) => void
   onConfirm: (box: CropBox | null) => void
+  /** 旋转/翻转后回传新 dataURL（变换直接烘焙进图片） */
+  onSrcChange?: (next: string) => void
 }) {
   const [zoom, setZoom] = React.useState(1)
   const [offset, setOffset] = React.useState<CropOffset>({ x: 0, y: 0 })
   const [crop, setCrop] = React.useState<CropBox | null>(null)
   const naturalRef = React.useRef<CropBox | null>(null)
+  const [transforming, setTransforming] = React.useState(false)
 
   React.useEffect(() => {
     if (open) {
@@ -2258,12 +2408,31 @@ function CropDialog({
     }
   }, [open])
 
+  /** 旋转/翻转：烘焙变换并重置裁剪框 */
+  const applyTransform = async (opts: { rotate?: number; flipH?: boolean; flipV?: boolean }) => {
+    if (!src || transforming) return
+    setTransforming(true)
+    try {
+      const next = await transformImage(src, opts)
+      onSrcChange?.(next)
+      // 重置几何，FreeCropBox 会按新图重新初始化默认框
+      setZoom(1)
+      setOffset({ x: 0, y: 0 })
+      setCrop(null)
+      naturalRef.current = null
+    } catch (err) {
+      toast.error('变换失败：' + (err instanceof Error ? err.message : '未知错误'))
+    } finally {
+      setTransforming(false)
+    }
+  }
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[88vh] overflow-y-auto rounded-2xl sm:max-w-md">
         <DialogHeader className="pr-10">
           <DialogTitle>裁剪图片</DialogTitle>
-          <DialogDescription>拖动边角手柄自由调整裁剪范围，缩放后可直接插入</DialogDescription>
+          <DialogDescription>拖动边角手柄自由调整裁剪范围，可旋转/翻转，插入后不溢出</DialogDescription>
         </DialogHeader>
         <div className="h-64 overflow-hidden rounded-xl border border-border bg-muted/40 p-2 sm:h-72">
           <FreeCropBox
@@ -2294,6 +2463,36 @@ function CropDialog({
           <span className="w-9 text-right text-xs tabular-nums text-muted-foreground">
             {zoom.toFixed(1)}x
           </span>
+        </div>
+        {/* 旋转 / 翻转工具行 */}
+        <div className="grid grid-cols-4 gap-1.5">
+          {(
+            [
+              { label: '左转', icon: RotateCcw, opts: { rotate: -90 } },
+              { label: '右转', icon: RotateCw, opts: { rotate: 90 } },
+              { label: '翻转', icon: FlipHorizontal, opts: { flipH: true } },
+              { label: '镜像', icon: FlipVertical, opts: { flipV: true } },
+            ] as const
+          ).map((t) => {
+            const Icon = t.icon
+            return (
+              <button
+                key={t.label}
+                type="button"
+                aria-label={t.label}
+                disabled={transforming}
+                onClick={() => void applyTransform(t.opts)}
+                className="flex h-12 flex-col items-center justify-center gap-0.5 rounded-lg border border-border text-[10px] text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+              >
+                {transforming ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Icon className="size-4" strokeWidth={1.75} />
+                )}
+                {t.label}
+              </button>
+            )
+          })}
         </div>
         <div className="flex gap-2">
           <Button variant="outline" className="flex-1 rounded-full" onClick={() => onOpenChange(false)}>

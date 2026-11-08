@@ -1242,14 +1242,16 @@ export function ClozeText({
     }
   }, [])
 
-  // 挖空刷按下：开始收集（不再逐字立即挖空）
+  // 挖空刷按下：开始收集（不再逐字立即挖空）。
+  // 只有按在「字」上才启动刷（空白处按下 = 页面滚动意图，不进刷模式）。
   const handleBrushPointerDown = (e: React.PointerEvent) => {
     if (!brushMode) return
-    draggingRef.current = true
-    brushAccRef.current = new Map()
     const target = e.target as HTMLElement
     const wordEl = target.closest?.('[data-char][data-pos]') as HTMLElement | null
-    if (wordEl) brushAddEl(wordEl)
+    if (!wordEl) return
+    draggingRef.current = true
+    brushAccRef.current = new Map()
+    brushAddEl(wordEl)
   }
   const handleBrushPointerMove = (e: React.PointerEvent) => {
     if (!brushMode || !draggingRef.current) return
@@ -1548,7 +1550,9 @@ export function ClozeText({
               style={styleProp}
               className={cn(
                 runCls,
-                brushMode && 'cursor-crosshair rounded-sm transition-colors hover:bg-accent/70',
+                // 挖空刷：仅在「字」上禁用触摸滚动（划字=刷），行间/页边空白仍可滑动页面
+                brushMode &&
+                  'cursor-crosshair touch-none rounded-sm transition-colors hover:bg-accent/70',
                 manualMode && 'cursor-text rounded-sm transition-colors hover:bg-accent/70',
                 hlCls(false),
               )}
@@ -1710,7 +1714,7 @@ export function ClozeText({
       ref={rootRef}
       className={cn(
         'leading-loose text-zinc-800 dark:text-zinc-200',
-        brushMode && 'touch-none select-none',
+        brushMode ? 'select-none' : undefined,
         suppressNativeSelect && 'select-none [-webkit-touch-callout:none]',
       )}
       style={{ fontSize: `${fontSize}px` }}

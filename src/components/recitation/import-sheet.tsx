@@ -268,7 +268,8 @@ export function ImportSheet({
               value={text}
               onChange={(e) => setText(e.target.value)}
               placeholder="输入或粘贴你要背诵的内容…"
-              className="min-h-[220px] resize-none rounded-2xl border-border bg-muted/30 text-base leading-relaxed focus-visible:ring-1"
+              // 大段粘贴也可在框内滚动（max-h + overflow），不会撑爆面板
+              className="max-h-[46vh] min-h-[180px] resize-none overflow-y-auto rounded-2xl border-border bg-muted/30 text-base leading-relaxed focus-visible:ring-1"
               autoFocus
             />
             <div className="flex items-center justify-between text-xs text-muted-foreground">

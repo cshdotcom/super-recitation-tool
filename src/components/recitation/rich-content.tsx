@@ -317,7 +317,14 @@ const MARKDOWN_COMPONENTS: Components = {
     </td>
   ),
   img: ({ src, alt }) => (
-    <img src={typeof src === 'string' ? src : undefined} alt={alt ?? ''} loading="lazy" className="my-2 max-w-full rounded-lg" />
+    <img
+      src={typeof src === 'string' ? src : undefined}
+      alt={alt ?? ''}
+      loading="lazy"
+      className="my-2 max-w-full rounded-lg"
+      // 任何来源的图片都不允许撑破容器宽度
+      style={{ maxWidth: '100%', height: 'auto' }}
+    />
   ),
   pre: ({ node, children }) => {
     const el = node as unknown as HastNode | undefined
@@ -366,9 +373,11 @@ export const RichContent = React.memo(function RichContent({
   return (
     <div
       className={cn(
-        'text-sm leading-relaxed',
+        'min-w-0 max-w-full break-words text-sm leading-relaxed',
         // KaTeX display blocks: breathing room + horizontal scroll on mobile
         '[&_.katex-display]:my-3 [&_.katex-display]:overflow-x-auto [&_.katex-display]:py-1 [&_.katex-error]:text-red-600 dark:[&_.katex-error]:text-red-400',
+        // HTML 片段 / 内嵌元素永不溢出容器：表格横向滚动，媒体自适应宽度
+        '[&_table]:max-w-full [&_video]:max-w-full [&_iframe]:max-w-full [&_img]:max-w-full',
         className,
       )}
       style={scrollStyle}

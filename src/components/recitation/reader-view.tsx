@@ -6,6 +6,8 @@ import {
   Baseline,
   Brush,
   Check,
+  ChevronDown,
+  ChevronUp,
   Columns2,
   Eye,
   EyeOff,
@@ -31,10 +33,9 @@ import {
 import { toast } from 'sonner'
 
 import type { CardData, ClozeStyle, ReviewAction, SettingsData } from '@/lib/types'
-import { REVIEW_ACTIONS } from '@/lib/types'
+import { REVIEW_ACTIONS, TTS_VOICES } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { ruleCloze, splitParagraphs, toggleOccurrence, removeOccurrence } from '@/lib/cloze'
-import { speakOnce } from '@/components/recitation/tts-player'
 import type { KwEntry } from '@/lib/types'
 import { todayKey, useLocalStorage } from '@/lib/use-local-storage'
 import { useServerState } from '@/lib/use-server-state'
@@ -73,6 +74,11 @@ const DoodleCanvas = NextDynamic(
 const TtsPlayer = NextDynamic(
   () => import('@/components/recitation/tts-player').then((m) => m.TtsPlayer),
   { ssr: false, loading: () => <div className="h-64 animate-pulse rounded-xl bg-muted" /> },
+)
+/** 选区朗读临时播放器：主朗读 Sheet 关闭时也能响应 sb-read-selection 事件 */
+const SelectionReadPlayer = NextDynamic(
+  () => import('@/components/recitation/tts-player').then((m) => m.SelectionReadPlayer),
+  { ssr: false, loading: () => null },
 )
 const ClozeEditorBar = NextDynamic(
   () => import('@/components/recitation/cloze-editor-bar').then((m) => m.ClozeEditorBar),
@@ -155,6 +161,36 @@ const CLOZE_STYLE_LABEL: Record<ClozeStyle, string> = {
   highlight: '高亮',
 }
 
+// 临时播放器（选中文本朗读）事件 detail 契约 — 由 tts-player 侧监听播放。
+interface SbReadSelectionDetail {
+  text: string
+}
+
+// 临时播放器回报的朗读进度（detail 契约）。
+interface SbReadProgressDetail {
+  index: number
+  total: number
+  text: string
+  done: boolean
+  cancelled?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// 朗读引擎说明：点「AI朗读 / 朗读文本」时 toast 提示本次走哪个引擎。
+// 解析顺序与 tts-player 的 seedQuickPref 一致：voicePrefs[context].tts 优先
+// （reader 场景，回退 tts 工具场景），再回退到全局 settings.ttsProvider。
+// ---------------------------------------------------------------------------
+function ttsEngineLabel(settings: SettingsData): string {
+  const pref = settings?.voicePrefs?.['reader']?.tts ?? settings?.voicePrefs?.['tts']?.tts
+  const provider = pref?.provider ?? settings?.ttsProvider ?? 'zai'
+  if (provider === 'custom') return '自定义 TTS 服务'
+  if (provider === 'browser') return '系统语音'
+  const voice = pref?.voice
+  const match = voice ? TTS_VOICES.find((v) => v.value === voice) : undefined
+  const name = match?.label.split('·')[0]?.trim()
+  return name ? `AI 音色 · ${name}` : 'AI 音色（童童等）'
+}
+
 export function ReaderView({
   card,
   settings,
@@ -202,6 +238,22 @@ export function ReaderView({
   const [reviewMode, setReviewMode] = React.useState(false)
   // TTS 全屏播放器 Sheet
   const [ttsOpen, setTtsOpen] = React.useState(false)
+  // 今日计划卡片折叠状态（默认折叠成一条细行；localStorage 持久化，key 随卡片）
+  const [planCollapsed, setPlanCollapsed] = useLocalStorage<boolean>(
+    `bb-plan-collapsed:${card.id}`,
+    true,
+  )
+  // 临时播放器（选中文本朗读）进度回报 — 播放中显示轻提示
+  const [selReadProgress, setSelReadProgress] = React.useState<SbReadProgressDetail | null>(null)
+  React.useEffect(() => {
+    const onProgress = (e: Event) => {
+      const detail = (e as CustomEvent<SbReadProgressDetail>).detail
+      if (!detail) return
+      setSelReadProgress(detail.done || detail.cancelled ? null : detail)
+    }
+    window.addEventListener('sb-read-selection-progress', onProgress)
+    return () => window.removeEventListener('sb-read-selection-progress', onProgress)
+  }, [])
   // 眼睛悬浮球位置（可拖动；服务端持久化 + localStorage 即时水合）
   const [eyePos, setEyePos] = useServerState<{ x: number; y: number } | null>(
     'eyeFabPos',
@@ -386,10 +438,16 @@ export function ReaderView({
     [card, onUpdateCard, pushKwHistory],
   )
 
-  // 选择菜单朗读：走用户默认配置的 TTS 引擎（而非固定浏览器 API）
+  // 选择菜单朗读：分发给临时播放器（tts-player 监听 sb-read-selection 事件播放），
+  // 引擎沿用用户默认配置；点击时先 toast 说明本次使用的引擎，选中态由 ClozeText 自行清除。
   const handleSpeakSelection = React.useCallback(
     (text: string) => {
-      speakOnce(text, { context: 'reader', settings })
+      const t = (text || '').trim()
+      if (!t) return
+      toast.info(`朗读将使用：${ttsEngineLabel(settings)}`)
+      window.dispatchEvent(
+        new CustomEvent<SbReadSelectionDetail>('sb-read-selection', { detail: { text: t } }),
+      )
     },
     [settings],
   )
@@ -765,13 +823,21 @@ export function ReaderView({
                 >
                   <Pencil className="size-5" strokeWidth={1.75} />
                 </Button>
-                {/* AI 朗读（全屏音乐播放器，可收起为迷你悬浮条） */}
+                {/* AI 朗读（全屏音乐播放器，可收起为迷你悬浮条）—
+                    点击先提示播放引擎；播放器打开时按钮呈绿色高亮 + 按压缩放反馈 */}
                 <Button
                   variant="ghost"
                   size="icon"
                   aria-label="AI朗读"
-                  className="text-foreground/80"
-                  onClick={() => setTtsOpen(true)}
+                  aria-pressed={ttsOpen}
+                  className={cn(
+                    'text-foreground/80 transition-all duration-200 active:scale-90',
+                    ttsOpen && 'bg-emerald-500/10 text-emerald-600',
+                  )}
+                  onClick={() => {
+                    toast.info(`朗读将使用：${ttsEngineLabel(settings)}`)
+                    setTtsOpen(true)
+                  }}
                 >
                   <Volume2 className="size-5" strokeWidth={1.75} />
                 </Button>
@@ -1099,8 +1165,14 @@ export function ReaderView({
                   <button
                     key={t.key}
                     type="button"
-                    className="flex w-16 shrink-0 flex-col items-center gap-1 rounded-xl py-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                    onClick={() => openTool(t.key)}
+                    className="flex w-16 shrink-0 flex-col items-center gap-1 rounded-xl py-2 text-muted-foreground transition-all duration-200 hover:bg-accent hover:text-foreground active:scale-95"
+                    onClick={() => {
+                      // 朗读文本：打开工具面板前先说明本次播放使用的引擎
+                      if (t.key === 'tts') {
+                        toast.info(`朗读将使用：${ttsEngineLabel(settings)}`)
+                      }
+                      openTool(t.key)
+                    }}
                   >
                     <Icon className="size-5" strokeWidth={1.75} />
                     <span className="text-[11px]">{t.label}</span>
@@ -1133,30 +1205,57 @@ export function ReaderView({
             </div>
           )}
 
-          {/* 今日计划 card */}
-          <div className="mt-3 rounded-2xl border border-border bg-card p-4">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-bold">今日计划</span>
-              <button
-                type="button"
-                className="text-xs text-muted-foreground transition-colors hover:text-foreground"
-                onClick={() => setPlanOpen(true)}
-              >
-                查看计划 ›
-              </button>
-            </div>
-            <div className="mt-2.5 flex items-center gap-3">
-              <span className="shrink-0 text-xs text-muted-foreground">
-                今日已背 {Math.min(progress, goal)} / {goal} 词
-              </span>
-              <Progress value={progressPct} className="h-1.5 flex-1" aria-label="今日背诵进度" />
-            </div>
-            <Button
-              className="mt-3 h-10 w-full rounded-full bg-primary text-sm font-semibold hover:bg-primary/90"
-              onClick={() => setPlanOpen(true)}
+          {/* 今日计划 card — 默认折叠成一条细行，点击原位展开/收起（localStorage 持久化） */}
+          <div className="mt-3 overflow-hidden rounded-2xl border border-border bg-card">
+            <button
+              type="button"
+              aria-expanded={!planCollapsed}
+              aria-controls="reader-plan-panel"
+              onClick={() => setPlanCollapsed((v) => !v)}
+              className="flex min-h-9 w-full items-center justify-between gap-2 px-4 py-1.5 text-left transition-colors hover:bg-accent/50"
             >
-              制定背书计划
-            </Button>
+              <span className="flex min-w-0 items-center gap-1.5 text-xs">
+                <span className="shrink-0 font-bold">今日计划</span>
+                <span className="shrink-0 text-muted-foreground/60">·</span>
+                <span className="truncate text-muted-foreground">
+                  已背 {Math.min(progress, goal)}/{goal} 词
+                </span>
+              </span>
+              <span className="flex shrink-0 items-center gap-1.5">
+                <span className="text-[11px] font-semibold text-emerald-600">{progressPct}%</span>
+                {planCollapsed ? (
+                  <ChevronDown className="size-4 text-muted-foreground" strokeWidth={1.75} />
+                ) : (
+                  <ChevronUp className="size-4 text-muted-foreground" strokeWidth={1.75} />
+                )}
+              </span>
+            </button>
+            {!planCollapsed && (
+              <div id="reader-plan-panel" className="px-4 pb-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-bold">今日计划</span>
+                  <button
+                    type="button"
+                    className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+                    onClick={() => setPlanOpen(true)}
+                  >
+                    查看计划 ›
+                  </button>
+                </div>
+                <div className="mt-2.5 flex items-center gap-3">
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    今日已背 {Math.min(progress, goal)} / {goal} 词
+                  </span>
+                  <Progress value={progressPct} className="h-1.5 flex-1" aria-label="今日背诵进度" />
+                </div>
+                <Button
+                  className="mt-3 h-10 w-full rounded-full bg-primary text-sm font-semibold hover:bg-primary/90"
+                  onClick={() => setPlanOpen(true)}
+                >
+                  制定背书计划
+                </Button>
+              </div>
+            )}
           </div>
 
           <div className="mt-1.5 text-left text-[11px] text-muted-foreground/70">
@@ -1351,6 +1450,19 @@ export function ReaderView({
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* 临时播放器朗读进度轻提示（选中文本朗读中，不拦截点击） */}
+      {selReadProgress && (
+        <div className="pointer-events-none fixed inset-x-0 bottom-24 z-30 flex justify-center px-4">
+          <div className="max-w-full truncate rounded-full bg-emerald-600/95 px-3 py-1 text-xs text-white shadow-lg">
+            正在朗读：{selReadProgress.text.slice(0, 12)}
+            {selReadProgress.text.length > 12 ? '…' : ''}
+          </div>
+        </div>
+      )}
+
+      {/* 选区朗读临时播放器（主播放器未打开时也生效，取消即消失） */}
+      <SelectionReadPlayer settings={settings} context="reader" />
 
       {/* AI 朗读 — 全屏音乐播放器（可收起为迷你悬浮条继续播放） */}
       <Sheet open={ttsOpen} onOpenChange={setTtsOpen}>

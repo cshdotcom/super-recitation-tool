@@ -16,9 +16,13 @@
 import * as React from 'react'
 import {
   Crop as CropIcon,
+  FlipHorizontal,
+  FlipVertical,
   ImagePlus,
   Loader2,
   Maximize2,
+  RotateCcw,
+  RotateCw,
   ScanText,
   Trash2,
   X,
@@ -27,6 +31,7 @@ import {
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
+import { transformImage } from '@/lib/image-transform'
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
 import {
@@ -91,6 +96,8 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
   const [aspect, setAspect] = React.useState<number | undefined>(undefined)
   const [recognizing, setRecognizing] = React.useState(false)
   const [progress, setProgress] = React.useState<{ done: number; total: number } | null>(null)
+  // 旋转/翻转进行中（工具条按钮禁用 + 转圈）
+  const [transforming, setTransforming] = React.useState(false)
 
   const fileInputRef = React.useRef<HTMLInputElement>(null)
 
@@ -179,6 +186,30 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
 
   const resetCrop = () =>
     updateActive({ crop: null, cropPixels: null, zoom: 1, offset: { x: 0, y: 0 } })
+
+  // 旋转/翻转当前图片：重烘焙 dataURL 后重置裁剪框，让 FreeCropBox 按新图尺寸重新初始化
+  const transformActive = async (opts: {
+    rotate?: number
+    flipH?: boolean
+    flipV?: boolean
+  }) => {
+    if (!active || transforming || recognizing) return
+    setTransforming(true)
+    try {
+      const out = await transformImage(active.dataUrl, opts)
+      updateActive({
+        dataUrl: out,
+        crop: null,
+        cropPixels: null,
+        zoom: 1,
+        offset: { x: 0, y: 0 },
+      })
+    } catch (err) {
+      toast.error('图片变换失败：' + (err instanceof Error ? err.message : '未知错误'))
+    } finally {
+      setTransforming(false)
+    }
+  }
 
   const recognizeAll = async () => {
     if (!images.length) {
@@ -419,6 +450,68 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
                   <span className="w-10 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
                     {active.zoom.toFixed(1)}x
                   </span>
+                </div>
+              )}
+
+              {/* 旋转/翻转工具条：90° 步进旋转 + 水平/垂直翻转（变换后重置裁剪框） */}
+              {active && (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    aria-label="向左旋转 90 度"
+                    disabled={transforming || recognizing}
+                    onClick={() => void transformActive({ rotate: -90 })}
+                    className="flex size-9 flex-col items-center justify-center gap-0.5 rounded-lg bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    {transforming ? (
+                      <Loader2 className="size-4 animate-spin" strokeWidth={1.75} />
+                    ) : (
+                      <RotateCcw className="size-4" strokeWidth={1.75} />
+                    )}
+                    <span className="text-[10px] leading-none">左转</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="向右旋转 90 度"
+                    disabled={transforming || recognizing}
+                    onClick={() => void transformActive({ rotate: 90 })}
+                    className="flex size-9 flex-col items-center justify-center gap-0.5 rounded-lg bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    {transforming ? (
+                      <Loader2 className="size-4 animate-spin" strokeWidth={1.75} />
+                    ) : (
+                      <RotateCw className="size-4" strokeWidth={1.75} />
+                    )}
+                    <span className="text-[10px] leading-none">右转</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="水平翻转（左右镜像）"
+                    disabled={transforming || recognizing}
+                    onClick={() => void transformActive({ flipH: true })}
+                    className="flex size-9 flex-col items-center justify-center gap-0.5 rounded-lg bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    {transforming ? (
+                      <Loader2 className="size-4 animate-spin" strokeWidth={1.75} />
+                    ) : (
+                      <FlipHorizontal className="size-4" strokeWidth={1.75} />
+                    )}
+                    <span className="text-[10px] leading-none">翻转</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="垂直翻转（上下镜像）"
+                    disabled={transforming || recognizing}
+                    onClick={() => void transformActive({ flipV: true })}
+                    className="flex size-9 flex-col items-center justify-center gap-0.5 rounded-lg bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    {transforming ? (
+                      <Loader2 className="size-4 animate-spin" strokeWidth={1.75} />
+                    ) : (
+                      <FlipVertical className="size-4" strokeWidth={1.75} />
+                    )}
+                    <span className="text-[10px] leading-none">镜像</span>
+                  </button>
                 </div>
               )}
               <p className="text-[11px] text-muted-foreground">

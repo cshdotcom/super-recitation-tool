@@ -73,14 +73,20 @@ const BUCKETS: { key: keyof WrongStats['buckets']; label: string }[] = [
   { key: 'one', label: '答错1次' },
 ]
 
-type TimeKey = 'today' | '7d' | '30d' | 'all'
+type TimeKey = 'all' | 'today' | '3d' | '7d' | '30d' | 'custom'
 
 const TIME_OPTIONS: { key: TimeKey; label: string }[] = [
+  { key: 'all', label: '全部' },
   { key: 'today', label: '今天' },
+  { key: '3d', label: '近3天' },
   { key: '7d', label: '近7天' },
   { key: '30d', label: '近30天' },
-  { key: 'all', label: '全部' },
+  { key: 'custom', label: '自定义' },
 ]
+
+/** 告知 AI 可用富文本格式回答（拼进 user prompt，回答由 RichContent 原样渲染） */
+const RICH_FORMAT_HINT =
+  '你可以在回答中使用以下格式，会原样渲染：Markdown（标题/列表/表格/加粗）、LaTeX 公式（$...$ 行内与 $$...$$ 展示）、mermaid 图表（```mermaid 代码块，支持思维导图 mindmap / 树状图 / 流程图）、HTML 片段、代码块。请按需选择最清晰的表达格式。'
 
 const DISPLAY_LABEL: Record<string, string> = {
   fill: '填空',
@@ -165,6 +171,12 @@ export function WrongQuestionsView({
   // ---- 筛选 ----
   const [cardFilter, setCardFilter] = React.useState<string>('all')
   const [timeFilter, setTimeFilter] = React.useState<TimeKey>('all')
+  // 自定义时间段：customStart/customEnd 为输入草稿，customRange 为点「确定」后生效的范围（空串 = 该侧不限）
+  const [customStart, setCustomStart] = React.useState('')
+  const [customEnd, setCustomEnd] = React.useState('')
+  const [customRange, setCustomRange] = React.useState<{ start: string; end: string } | null>(
+    null,
+  )
 
   // ---- 多选 / 批量 ----
   const [selectMode, setSelectMode] = React.useState(false)
@@ -259,13 +271,51 @@ export function WrongQuestionsView({
     return items.filter((i) => {
       if (cardFilter !== 'all' && i.cardId !== cardFilter) return false
       if (timeFilter === 'all') return true
-      const t = new Date(i.updatedAt).getTime()
+      // 按错题产生时间（createdAt）筛选；自定义区间含起止当天
+      const t = new Date(i.createdAt).getTime()
       if (Number.isNaN(t)) return false
-      if (timeFilter === 'today') return new Date(t).toDateString() === new Date(now).toDateString()
+      if (timeFilter === 'today')
+        return new Date(t).toDateString() === new Date(now).toDateString()
+      if (timeFilter === '3d') return now - t <= 3 * 86400000
       if (timeFilter === '7d') return now - t <= 7 * 86400000
-      return now - t <= 30 * 86400000
+      if (timeFilter === '30d') return now - t <= 30 * 86400000
+      // 自定义：未点「确定」前暂不筛选
+      const range = customRange
+      if (!range) return true
+      if (range.start && t < new Date(`${range.start}T00:00:00`).getTime()) return false
+      if (range.end && t > new Date(`${range.end}T23:59:59.999`).getTime()) return false
+      return true
     })
-  }, [items, cardFilter, timeFilter])
+  }, [items, cardFilter, timeFilter, customRange])
+
+  // ---- 时间筛选展示文案 / 自定义区间应用 ----
+  // timeActive：时间条件是否真正生效（自定义未确定范围时不算）
+  const timeActive = timeFilter !== 'all' && (timeFilter !== 'custom' || !!customRange)
+  const customRangeText = customRange
+    ? `${customRange.start || '最早'} ~ ${customRange.end || '今天'}`
+    : ''
+  const timeFilterText =
+    timeFilter === 'all'
+      ? ''
+      : timeFilter === 'custom'
+        ? customRange
+          ? `自定义（${customRangeText}，含当天）`
+          : '自定义'
+        : (TIME_OPTIONS.find((t) => t.key === timeFilter)?.label ?? '')
+
+  const applyCustomRange = () => {
+    const start = customStart.trim()
+    const end = customEnd.trim()
+    if (!start && !end) {
+      toast.warning('请选择开始或结束日期')
+      return
+    }
+    if (start && end && start > end) {
+      toast.warning('开始日期不能晚于结束日期')
+      return
+    }
+    setCustomRange({ start, end })
+  }
 
   // ---- 多选 ----
   const selectedItems = filteredItems.filter((i) => selected.has(i.id))
@@ -506,6 +556,8 @@ export function WrongQuestionsView({
       ...(item.options.length > 0 ? [`选项：${item.options.join('；')}`] : []),
       `正确答案：${item.answer || '（无标准答案）'}`,
       ...(my ? [`我的答案：${my}`] : []),
+      // 告知 AI 可用富文本格式回答（markdown/LaTeX/mermaid/HTML），回答由 RichContent 原样渲染
+      RICH_FORMAT_HINT,
     ]
     fetch('/api/chat', {
       method: 'POST',
@@ -701,7 +753,7 @@ export function WrongQuestionsView({
           </div>
         ) : (
           <>
-            {/* 筛选行：卡片分类 + 时间 chips */}
+            {/* 筛选行：卡片分类 + 时间 pills（含自定义时间段） */}
             <div className="flex items-center gap-2 overflow-x-auto pb-1">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -750,6 +802,43 @@ export function WrongQuestionsView({
               </div>
             </div>
 
+            {/* 自定义时间段：起止日期 + 确定 */}
+            {timeFilter === 'custom' && (
+              <div className="pt-1">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="date"
+                    aria-label="开始日期"
+                    value={customStart}
+                    max={customEnd || undefined}
+                    onChange={(e) => setCustomStart(e.target.value)}
+                    className="h-8 min-w-0 flex-1 rounded-full border border-border bg-card px-3 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring dark:[color-scheme:dark]"
+                  />
+                  <span className="shrink-0 text-xs text-muted-foreground">至</span>
+                  <input
+                    type="date"
+                    aria-label="结束日期"
+                    value={customEnd}
+                    min={customStart || undefined}
+                    onChange={(e) => setCustomEnd(e.target.value)}
+                    className="h-8 min-w-0 flex-1 rounded-full border border-border bg-card px-3 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring dark:[color-scheme:dark]"
+                  />
+                  <button
+                    type="button"
+                    onClick={applyCustomRange}
+                    className="h-8 shrink-0 rounded-full bg-zinc-900 px-3.5 text-xs font-medium text-white transition-transform active:scale-95 dark:bg-zinc-100 dark:text-zinc-900"
+                  >
+                    确定
+                  </button>
+                </div>
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  {customRange
+                    ? `已筛选：${customRangeText}（含起止当天）`
+                    : '请选择开始/结束日期后点「确定」'}
+                </p>
+              </div>
+            )}
+
             {/* 统计 2×2 */}
             <div className="mt-3 grid grid-cols-2 rounded-2xl bg-card py-2">
               {(
@@ -789,7 +878,11 @@ export function WrongQuestionsView({
 
             {filteredItems.length === 0 ? (
               <div className="rounded-2xl bg-card py-14 text-center text-sm text-muted-foreground">
-                {items.length === 0 ? '暂无错题，快去练习吧' : '当前筛选下没有错题'}
+                {items.length === 0
+                  ? '暂无错题，快去练习吧'
+                  : timeActive
+                    ? '该时间段没有错题'
+                    : '当前筛选下没有错题'}
               </div>
             ) : (
               <div className="flex flex-col gap-2.5">
@@ -1134,9 +1227,7 @@ export function WrongQuestionsView({
         <p className="mb-4 text-xs">
           共 {filteredItems.length} 道
           {cardFilter !== 'all' ? ` · ${cardLabel}` : ''}
-          {timeFilter !== 'all'
-            ? ` · ${TIME_OPTIONS.find((t) => t.key === timeFilter)?.label ?? ''}`
-            : ''}
+          {timeFilterText ? ` · ${timeFilterText}` : ''}
         </p>
         {filteredItems.map((item, i) => (
           <div key={item.id} className="mb-3 border-b border-neutral-300 pb-2 text-sm">

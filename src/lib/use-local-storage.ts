@@ -2,44 +2,18 @@
 
 import * as React from 'react'
 
-// Small localStorage-backed state hook (client-side only flags such as
-// 显示快捷编辑栏 / 显示背书工具栏 / 今日计划进度).
+import { useServerState } from '@/lib/use-server-state'
+
+// useLocalStorage — 兼容旧名的持久化状态 hook。
+// 「没有任何数据在本地，全部实时同步服务端」：内部直接委托 useServerState ——
+// 服务端为真源（/api/state AppState 表），localStorage 仅作离线镜像/首屏防闪烁。
+// 所有历史调用点（reader-view 计划进度、tts-player 难句收藏/注音、各折叠态等）
+// 无需改动即自动升级为服务端实时同步。
 export function useLocalStorage<T>(
   key: string,
   initial: T,
 ): [T, (value: T | ((prev: T) => T)) => void] {
-  const [value, setValue] = React.useState<T>(initial)
-  const hydratedRef = React.useRef(false)
-
-  // Hydrate from localStorage after mount (avoids SSR mismatch).
-  React.useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(key)
-      if (raw !== null) setValue(JSON.parse(raw) as T)
-    } catch {
-      /* ignore corrupt entries */
-    }
-    hydratedRef.current = true
-     
-  }, [key])
-
-  const set = React.useCallback(
-    (next: T | ((prev: T) => T)) => {
-      setValue((prev) => {
-        const resolved =
-          typeof next === 'function' ? (next as (p: T) => T)(prev) : next
-        try {
-          window.localStorage.setItem(key, JSON.stringify(resolved))
-        } catch {
-          /* storage full / unavailable — state still updates */
-        }
-        return resolved
-      })
-    },
-    [key],
-  )
-
-  return [value, set]
+  return useServerState<T>(key, initial)
 }
 
 // Today's key for the daily plan progress: plan-{cardId}-{yyyymmdd}
