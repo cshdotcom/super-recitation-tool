@@ -21,7 +21,7 @@ import { THEME_OPTIONS } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { useServerState } from '@/lib/use-server-state'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
-import { FocusMode } from '@/components/recitation/focus-mode'
+import { getFocusState, startFocus } from '@/components/recitation/focus-bus'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 
@@ -197,7 +197,6 @@ export function MoreSheet({
   const [ruleExpanded, setRuleExpanded] = React.useState(false)
   const [templateExpanded, setTemplateExpanded] = React.useState(false)
   const [fontSizeDraft, setFontSizeDraft] = React.useState(settings.fontSize)
-  const [focusOpen, setFocusOpen] = React.useState(false)
   const [showQuickBar, setShowQuickBar] = useServerState<boolean>('showQuickBar', true)
   const [showToolBar, setShowToolBar] = useServerState<boolean>('showToolBar', true)
 
@@ -430,12 +429,22 @@ export function MoreSheet({
         {/* ---------------- 阅读设置 ---------------- */}
         {tab === 'read' && (
           <div className="space-y-4">
-            {/* 专注模式 entry */}
+            {/* 专注模式 entry：直接在后台开一个专注会话（focus-bus），全局浮时钟接管展示/控制 */}
             <button
               type="button"
               onClick={() => {
-                setFocusOpen(true)
+                if (getFocusState().running) {
+                  toast.info('已有专注进行中，右下角时钟可查看')
+                  onOpenChange(false)
+                  return
+                }
+                startFocus({
+                  mode: 'countdown',
+                  targetSec: 25 * 60,
+                  contentName: card.title || '自由专注',
+                })
                 onOpenChange(false)
+                toast.success('专注已开始，右下角时钟可查看')
               }}
               className="flex w-full items-center gap-3 rounded-2xl border border-border bg-card px-4 py-4 text-left transition-colors hover:bg-accent/50"
             >
@@ -445,7 +454,7 @@ export function MoreSheet({
               <span className="min-w-0 flex-1">
                 <span className="block text-sm font-bold">专注模式</span>
                 <span className="block text-xs text-muted-foreground">
-                  全屏倒计时，免打扰沉浸式背书
+                  后台倒计时 25 分钟，右下角浮时钟可暂停 / 结束
                 </span>
               </span>
               <ChevronRight className="size-4 text-muted-foreground/60" strokeWidth={1.75} />
@@ -614,9 +623,6 @@ export function MoreSheet({
         )}
       </div>
     </BottomSheet>
-
-      {/* 专注模式 fullscreen overlay (renders above the sheet) */}
-      {focusOpen && <FocusMode card={card} onExit={() => setFocusOpen(false)} />}
     </>
   )
 }

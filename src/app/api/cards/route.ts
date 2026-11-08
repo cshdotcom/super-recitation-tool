@@ -10,6 +10,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getSessionUser } from '@/lib/auth'
 import { serializeCard } from '@/lib/card'
+import { normKeywordEntries } from '@/lib/cloze'
 
 const TRASH_TTL_MS = 30 * 86400 * 1000 // 回收站保留 30 天，过期自动彻底删除
 
@@ -67,15 +68,17 @@ export async function POST(req: NextRequest) {
     }
     const title: string =
       typeof body?.title === 'string' && body.title.trim() ? body.title.trim() : '未命名卡片'
-    const keywords: string[] = Array.isArray(body?.keywords)
-      ? body.keywords.filter((k: unknown): k is string => typeof k === 'string')
-      : []
+    const keywords = normKeywordEntries(body?.keywords)
 
     const card = await db.card.create({
       data: {
         title,
         content,
         keywords: JSON.stringify(keywords),
+        // 超级编辑器 blocks（分块结构）在创建时一并落库
+        ...(Array.isArray(body?.blocks)
+          ? { blocks: JSON.stringify(body.blocks.slice(0, 200)) }
+          : {}),
         ...(typeof body?.categoryId === 'string' ? { categoryId: body.categoryId } : {}),
       },
     })

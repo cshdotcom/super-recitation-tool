@@ -22,6 +22,13 @@ export interface CardPlan {
   reviewTimes?: number
 }
 
+// ---------- 挖空关键词（位置感知） ----------
+// - plain string          → 旧格式：挖空该词的【所有】出现位置
+// - { t, occ } occ = -1   → 同上（所有出现）
+// - { t, occ } occ >= 0   → 只挖第 occ（0 基）次出现 —— 手动挖空/挖空刷/
+//   选择框生成这种条目，避免「挖一个字，全文同字都被挖」的误伤。
+export type KwEntry = string | { t: string; occ: number }
+
 // ---------- 文字编辑工具 (Q&A material blocks) ----------
 export interface MaterialBlock {
   /** 核心论点（正面） */
@@ -123,7 +130,7 @@ export interface CardData {
   id: string
   title: string
   content: string
-  keywords: string[]
+  keywords: KwEntry[]
   strokes: Stroke[] // 涂鸦笔迹 (persisted)
   plan: CardPlan | null
   mindmaps: MindmapDoc[] // 已保存的思维导图

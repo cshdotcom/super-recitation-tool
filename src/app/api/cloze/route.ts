@@ -4,7 +4,8 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { chatComplete, extractJSON } from '@/lib/ai'
 import { getAIConfig } from '@/lib/settings'
-import { ruleCloze } from '@/lib/cloze'
+import { ruleCloze, kwText } from '@/lib/cloze'
+import type { KwEntry } from '@/lib/types'
 
 export async function POST(req: NextRequest) {
   try {
@@ -35,7 +36,7 @@ export async function POST(req: NextRequest) {
       { role: 'user' as const, content: truncated },
     ]
 
-    let keywords: string[] = []
+    let keywords: KwEntry[] = []
     try {
       const config = await getAIConfig()
       const raw = await chatComplete(messages, config)
@@ -54,10 +55,13 @@ export async function POST(req: NextRequest) {
         ),
       ).slice(0, 50)
       // 去掉互为子串的冗余项（保留更长的片段）。
-      const sorted = [...keywords].sort((a, b) => b.length - a.length)
+      const sorted = [...keywords].sort(
+        (a, b) => kwText(b).length - kwText(a).length,
+      )
       const kept: string[] = []
       for (const k of sorted) {
-        if (!kept.some((x) => x.includes(k))) kept.push(k)
+        const kt = kwText(k)
+        if (!kept.some((x) => x.includes(kt))) kept.push(kt)
       }
       keywords = kept
         .sort((a, b) => content.indexOf(a) - content.indexOf(b))

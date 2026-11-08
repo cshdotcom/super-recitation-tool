@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { ChevronLeft, Loader2 } from 'lucide-react'
+import { ChevronLeft, Loader2, Settings2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type { Mastery, ReviewStats } from '@/lib/types'
@@ -17,6 +17,8 @@ import {
 
 interface ReviewStatsViewProps {
   onBack: () => void
+  /** 打开复习计划管理（页面拥有者接线）；不传则隐藏入口 */
+  onOpenPlanManager?: () => void
 }
 
 const MASTERY_COLORS: Record<Mastery, string> = {
@@ -100,7 +102,7 @@ function MasteryDonut({ mastery }: { mastery: Record<Mastery, number> }) {
 }
 
 // 复习统计页：今日/连续/用时 + 掌握情况饼图 + 复习日历。
-export function ReviewStatsView({ onBack }: ReviewStatsViewProps) {
+export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewProps) {
   const now = new Date()
   const [stats, setStats] = React.useState<ReviewStats | null>(null)
   const [loading, setLoading] = React.useState(true)
@@ -109,10 +111,16 @@ export function ReviewStatsView({ onBack }: ReviewStatsViewProps) {
   const [onlyReviewed, setOnlyReviewed] = React.useState(false)
 
   const todayKey = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
-  const years = React.useMemo(
-    () => Array.from({ length: Math.max(1, new Date().getFullYear() + 2 - 2024) }, (_, i) => 2024 + i),
-    [],
-  )
+  // 年份下拉完全由真实 ReviewLog 数据驱动：日历里出现过的年份 + 当前年。
+  const years = React.useMemo(() => {
+    const currentYear = new Date().getFullYear()
+    const ys = new Set<number>([currentYear])
+    for (const key of Object.keys(stats?.calendar ?? {})) {
+      const y = Number.parseInt(key.slice(0, 4), 10)
+      if (!Number.isNaN(y) && y > 2000 && y <= currentYear) ys.add(y)
+    }
+    return [...ys].sort((a, b) => a - b)
+  }, [stats])
 
   React.useEffect(() => {
     let cancelled = false
@@ -164,6 +172,17 @@ export function ReviewStatsView({ onBack }: ReviewStatsViewProps) {
           >
             <ChevronLeft className="size-6" strokeWidth={2} />
           </button>
+          {onOpenPlanManager && (
+            <button
+              type="button"
+              onClick={onOpenPlanManager}
+              aria-label="复习计划设置"
+              title="复习计划设置"
+              className="z-10 ml-1 flex size-10 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <Settings2 className="size-5" strokeWidth={1.9} />
+            </button>
+          )}
           <h1 className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-lg font-bold">
             复习统计
           </h1>

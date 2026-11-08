@@ -3,11 +3,14 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 
-function parseKeywords(json: string): string[] {
+function parseKeywords(json: string): unknown[] {
   try {
     const parsed = JSON.parse(json || '[]')
     if (!Array.isArray(parsed)) return []
-    return parsed.filter((k: unknown): k is string => typeof k === 'string')
+    // 位置感知挖空条目：string | { t, occ } 原样返回（客户端 normKeywordEntries 解析）
+    return parsed.filter(
+      (k: unknown) => typeof k === 'string' || (k && typeof k === 'object'),
+    )
   } catch {
     return []
   }

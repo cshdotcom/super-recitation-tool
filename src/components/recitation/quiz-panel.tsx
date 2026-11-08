@@ -4,6 +4,7 @@ import * as React from 'react'
 import {
   Loader2,
   FileQuestion,
+  ImagePlus,
   CheckCircle2,
   XCircle,
   Eye,
@@ -18,6 +19,7 @@ import {
   Save,
   Star,
   Sparkles,
+  X,
   AlertCircle,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -62,6 +64,56 @@ const VALID_TYPES: readonly string[] = ['fill', 'short', 'choice', 'multi', 'jud
 
 /** 多选题多个选项在同一字符串中的内部分隔符 */
 const MULTI_SEP = '\u0001'
+
+// ---------- 图片出题（Step1 可选上传课文图片，先 OCR 再提炼知识点） ----------
+const MAX_POINT_IMAGES = 3
+/** 服务端 /api/quiz-points 单图 base64 上限（与路由一致）。 */
+const IMAGE_B64_LIMIT = 400 * 1024
+
+interface QuizImageItem {
+  id: string
+  dataUrl: string
+}
+
+/** 读取图片文件并压缩为 ≤1024px 的 JPEG dataURL（canvas 压缩，同 chat-tool 模式）。 */
+function compressQuizImage(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error('图片读取失败'))
+    reader.onload = () => {
+      const img = new Image()
+      img.onerror = () => reject(new Error('图片解析失败'))
+      img.onload = () => {
+        let w = img.width
+        let h = img.height
+        if (w > 1024 || h > 1024) {
+          const scale = Math.min(1024 / w, 1024 / h)
+          w = Math.round(w * scale)
+          h = Math.round(h * scale)
+        }
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          reject(new Error('无法处理图片'))
+          return
+        }
+        ctx.drawImage(img, 0, 0, w, h)
+        // 逐级降低质量，确保不超过服务端 400KB base64 限制
+        let quality = 0.85
+        let out = canvas.toDataURL('image/jpeg', quality)
+        while (out.length > IMAGE_B64_LIMIT && quality > 0.4) {
+          quality -= 0.15
+          out = canvas.toDataURL('image/jpeg', quality)
+        }
+        resolve(out)
+      }
+      img.src = reader.result as string
+    }
+    reader.readAsDataURL(file)
+  })
+}
 
 // ---------- 知识点 ----------
 interface PointItem {
@@ -271,12 +323,16 @@ export function QuizPanel({
 }: QuizPanelProps) {
   // ---- 向导步骤 ----
   const [step, setStep] = React.useState<Step>(content.trim() ? 'points' : 'idle')
+  /** Step2 生成题目失败的友好错误（留在出题中视图，可重试）。 */
+  const [genError, setGenError] = React.useState<string | null>(null)
 
   // ---- Step1 知识点 ----
   const [points, setPoints] = React.useState<PointItem[]>([])
   const [selectedPoints, setSelectedPoints] = React.useState<Set<string>>(new Set())
   const [pointsLoading, setPointsLoading] = React.useState(false)
   const [pointsError, setPointsError] = React.useState<string | null>(null)
+  /** 图片出题：随知识点提取一起上传的课文图片（≤3 张）。 */
+  const [pointImages, setPointImages] = React.useState<QuizImageItem[]>([])
   const [editingPoint, setEditingPoint] = React.useState<PointItem | null>(null)
   const [editText, setEditText] = React.useState('')
   const [editImportance, setEditImportance] = React.useState<'core' | 'secondary'>('core')
@@ -326,15 +382,17 @@ export function QuizPanel({
   const [checked, setChecked] = React.useState(false)
   const [selfJudge, setSelfJudge] = React.useState<Record<number, boolean>>({})
   const [reported, setReported] = React.useState<Set<number>>(new Set())
+  /** 「我不会」标记的题号 — 立即按答错上报并强制计错。 */
+  const [dontKnow, setDontKnow] = React.useState<Set<number>>(new Set())
   const [quizStart, setQuizStart] = React.useState<number>(Date.now())
 
   // ---- 草稿恢复 ----
   const [pendingDraft, setPendingDraft] = React.useState<QuizDraft | null>(null)
   const draftCheckedRef = React.useRef(false)
 
-  // ---- Step1：AI 提炼知识点 ----
+  // ---- Step1：AI 提炼知识点（可附带课文图片，服务端先 OCR 再提炼） ----
   const fetchPoints = React.useCallback(async () => {
-    if (!content.trim()) return
+    if (!content.trim() && pointImages.length === 0) return
     setPointsLoading(true)
     setPointsError(null)
     startStages(POINT_STAGES.length)
@@ -342,7 +400,12 @@ export function QuizPanel({
       const res = await fetch('/api/quiz-points', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({
+          content,
+          ...(pointImages.length > 0
+            ? { images: pointImages.map((i) => i.dataUrl) }
+            : {}),
+        }),
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
@@ -366,7 +429,48 @@ export function QuizPanel({
       stopStages()
       setPointsLoading(false)
     }
-  }, [content, startStages, stopStages])
+  }, [content, pointImages, startStages, stopStages])
+
+  // ---- 图片出题：选择 / 压缩 / 移除 ----
+  const handlePointImagesChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? [])
+    e.target.value = '' // allow re-picking the same file
+    if (files.length === 0) return
+    const room = MAX_POINT_IMAGES - pointImages.length
+    if (room <= 0) {
+      toast.warning(`图片最多上传 ${MAX_POINT_IMAGES} 张`)
+      return
+    }
+    if (files.length > room) {
+      toast.warning(`图片最多上传 ${MAX_POINT_IMAGES} 张，已保留前 ${room} 张`)
+    }
+    const results = await Promise.allSettled(
+      files.slice(0, room).map((f) => compressQuizImage(f)),
+    )
+    const urls: string[] = []
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') urls.push(r.value)
+      else toast.error(`第 ${i + 1} 张图片处理失败`)
+    })
+    if (urls.length > 0) {
+      setPointImages((prev) => [
+        ...prev,
+        ...urls.map((dataUrl) => ({
+          id: `pimg-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+          dataUrl,
+        })),
+      ])
+    }
+  }
+
+  const removePointImage = (id: string) => {
+    setPointImages((prev) => prev.filter((p) => p.id !== id))
+  }
+
+  // 打开出题面板 / 切换向导步骤时，通知阅读器关闭划词弹层（避免遮挡）
+  React.useEffect(() => {
+    window.dispatchEvent(new CustomEvent('sb-close-selection'))
+  }, [step])
 
   // 首次进入：从服务端检测同卡片的作答草稿 → 弹「恢复上次作答？」
   // （服务端为主，localStorage 只作离线镜像；发现仅本地有旧草稿时自动迁移上传）
@@ -481,6 +585,7 @@ export function QuizPanel({
     setChecked(false)
     setSelfJudge({})
     setReported(new Set())
+    setDontKnow(new Set())
     setQuizStart(Date.now())
     setStep('answering')
     toast.success('已恢复上次作答')
@@ -516,6 +621,7 @@ export function QuizPanel({
       return
     }
     setStep('generating')
+    setGenError(null)
     startStages(GEN_STAGES.length)
     try {
       const res = await fetch('/api/quiz', {
@@ -545,13 +651,14 @@ export function QuizPanel({
       setChecked(false)
       setSelfJudge({})
       setReported(new Set())
+      setDontKnow(new Set())
       setQuizStart(Date.now())
       clearDraftStorage()
       setStep('answering')
       toast.success(`已生成 ${qs.length} 道题`)
     } catch (err) {
-      toast.error('出题失败：' + (err instanceof Error ? err.message : '未知错误'))
-      setStep('types')
+      // 友好错误（含服务端消息）留在「出题中」视图，提供重试 / 返回
+      setGenError(err instanceof Error ? err.message : '未知错误')
     } finally {
       stopStages()
     }
@@ -608,9 +715,21 @@ export function QuizPanel({
     if (q) reportItem(q, right, answers[idx] || '')
   }
 
+  // ---- 「我不会」：立即按答错上报，展示答案并锁定输入 ----
+  const markDontKnow = (idx: number) => {
+    const q = questions[idx]
+    if (!q || revealed.has(idx) || reported.has(idx)) return
+    setDontKnow((prev) => new Set(prev).add(idx))
+    setReported((prev) => new Set(prev).add(idx))
+    setRevealed((prev) => new Set(prev).add(idx))
+    reportItem(q, false, (answers[idx] || '').trim() || '（我不会）')
+  }
+
   // ---- 统一检查：全部作答完一次性判分 ----
   const runUnifiedCheck = () => {
-    const unanswered = questions.filter((_, i) => !(answers[i] || '').trim()).length
+    const unanswered = questions.filter(
+      (_, i) => !reported.has(i) && !(answers[i] || '').trim(),
+    ).length
     if (unanswered > 0) {
       toast.warning(`还有 ${unanswered} 道题未作答，请先完成`)
       return
@@ -620,6 +739,10 @@ export function QuizPanel({
     let wrong = 0
     const newReported = new Set<number>()
     questions.forEach((q, i) => {
+      if (reported.has(i)) {
+        newReported.add(i) // 「我不会」等已上报的题保持原判，不重复上报
+        return
+      }
       if (q.type === 'short') return // 简答题等待自评
       const right = gradeAnswer(q, answers[i] || '') === true
       newReported.add(i)
@@ -639,7 +762,9 @@ export function QuizPanel({
     }
   }
 
-  const answeredCount = questions.filter((_, i) => (answers[i] || '').trim()).length
+  const answeredCount = questions.filter(
+    (_, i) => (answers[i] || '').trim() || dontKnow.has(i),
+  ).length
 
   const score = React.useMemo(() => {
     let total = 0
@@ -649,12 +774,12 @@ export function QuizPanel({
       total++
       if (q.type === 'short') {
         if (selfJudge[i]) right++
-      } else if (gradeAnswer(q, answers[i] || '') === true) {
+      } else if (!dontKnow.has(i) && gradeAnswer(q, answers[i] || '') === true) {
         right++
       }
     })
     return { total, right }
-  }, [questions, reported, selfJudge, answers])
+  }, [questions, reported, selfJudge, answers, dontKnow])
 
   const clearAnswers = () => {
     setAnswers({})
@@ -662,6 +787,7 @@ export function QuizPanel({
     setChecked(false)
     setSelfJudge({})
     setReported(new Set())
+    setDontKnow(new Set())
     setQuizStart(Date.now())
   }
 
@@ -764,7 +890,20 @@ export function QuizPanel({
     <div className="flex min-h-[62vh] flex-col">
       {/* ================= 空闲入口 ================= */}
       {step === 'idle' && (
-        <IdleView canStart={!!content.trim()} onStart={() => setStep('points')} />
+        <IdleView
+          canStart={!!content.trim() || pointImages.length > 0}
+          onStart={() => setStep('points')}
+          extra={
+            !content.trim() ? (
+              <PointImagesRow
+                images={pointImages}
+                onFilesChange={handlePointImagesChange}
+                onRemove={removePointImage}
+                className="w-full max-w-xs"
+              />
+            ) : null
+          }
+        />
       )}
 
       {/* ================= Step 1 选择知识点 ================= */}
@@ -784,6 +923,15 @@ export function QuizPanel({
                 </button>
               ) : null
             }
+          />
+          <PointImagesRow
+            images={pointImages}
+            disabled={pointsLoading}
+            showRegen={pointImages.length > 0 && points.length > 0 && !pointsLoading}
+            onRegen={() => void fetchPoints()}
+            onFilesChange={handlePointImagesChange}
+            onRemove={removePointImage}
+            className="mb-2"
           />
           {pointsLoading || (!pointsError && points.length === 0) ? (
             <ProgressView
@@ -926,24 +1074,38 @@ export function QuizPanel({
       )}
 
       {/* ================= 出题中 ================= */}
-      {step === 'generating' && (
-        <div className="flex flex-1 flex-col items-center justify-center gap-5 py-16 text-center">
-          <div className="flex size-16 items-center justify-center rounded-full bg-emerald-500/10">
-            <Loader2 className="size-8 animate-spin text-emerald-600" />
+      {step === 'generating' &&
+        (genError ? (
+          <ErrorView
+            message={genError}
+            onRetry={() => {
+              setGenError(null)
+              void generate()
+            }}
+            onBack={() => {
+              setGenError(null)
+              setStep('types')
+            }}
+            backLabel="返回修改题型"
+          />
+        ) : (
+          <div className="flex flex-1 flex-col items-center justify-center gap-5 py-16 text-center">
+            <div className="flex size-16 items-center justify-center rounded-full bg-emerald-500/10">
+              <Loader2 className="size-8 animate-spin text-emerald-600" />
+            </div>
+            <div>
+              <p className="text-sm font-bold">
+                {GEN_STAGES[Math.min(stageIdx, GEN_STAGES.length - 1)]}
+              </p>
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                AI 正在根据 {selectedPoints.size} 个知识点编写 {totalCount} 道题，请稍候…
+              </p>
+            </div>
+            <div className="h-1.5 w-40 overflow-hidden rounded-full bg-muted">
+              <div className="h-full w-1/3 animate-pulse rounded-full bg-emerald-500/70" />
+            </div>
           </div>
-          <div>
-            <p className="text-sm font-bold">
-              {GEN_STAGES[Math.min(stageIdx, GEN_STAGES.length - 1)]}
-            </p>
-            <p className="mt-1.5 text-xs text-muted-foreground">
-              AI 正在根据 {selectedPoints.size} 个知识点编写 {totalCount} 道题，请稍候…
-            </p>
-          </div>
-          <div className="h-1.5 w-40 overflow-hidden rounded-full bg-muted">
-            <div className="h-full w-1/3 animate-pulse rounded-full bg-emerald-500/70" />
-          </div>
-        </div>
-      )}
+        ))}
 
       {/* ================= 作答 ================= */}
       {step === 'answering' && questions.length > 0 && (
@@ -1002,7 +1164,11 @@ export function QuizPanel({
               const pickedSet = isMulti
                 ? new Set(userAnswer.split(MULTI_SEP).filter(Boolean))
                 : null
-              const isRight = isShort ? selfJudge[idx] === true : gradeAnswer(q, userAnswer) === true
+              const isRight = dontKnow.has(idx)
+                ? false
+                : isShort
+                  ? selfJudge[idx] === true
+                  : gradeAnswer(q, userAnswer) === true
               const multiCorrect = isMulti
                 ? q.answer
                     .split(/[、,，;；]/)
@@ -1201,9 +1367,19 @@ export function QuizPanel({
                       </div>
                     )}
 
-                    {/* 逐题检查按钮 */}
-                    {checkMode === 'each' && (
-                      <div className="flex items-center justify-end">
+                    {/* 「我不会」+ 逐题检查按钮 */}
+                    <div className="flex items-center justify-between gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isRevealed || isReported}
+                        onClick={() => markDontKnow(idx)}
+                        className="h-8 rounded-full border-destructive/40 px-3 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+                      >
+                        <XCircle className="size-3.5" /> 我不会
+                      </Button>
+                      {checkMode === 'each' && (
                         <Button
                           variant="ghost"
                           size="sm"
@@ -1220,8 +1396,8 @@ export function QuizPanel({
                             </>
                           )}
                         </Button>
-                      </div>
-                    )}
+                      )}
+                    </div>
                   </Card>
                 </li>
               )
@@ -1546,24 +1722,54 @@ function ProgressView({ text, sub }: { text: string; sub?: string }) {
   )
 }
 
-// 错误重试视图
-function ErrorView({ message, onRetry }: { message: string; onRetry: () => void }) {
+// 错误重试视图（重试重新执行失败步骤，可选返回上一步修改）
+function ErrorView({
+  message,
+  onRetry,
+  onBack,
+  backLabel = '返回',
+}: {
+  message: string
+  onRetry: () => void
+  onBack?: () => void
+  backLabel?: string
+}) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-4 py-14 text-center">
       <AlertCircle className="size-9 text-destructive/70" strokeWidth={1.5} />
       <p className="max-w-64 text-sm text-muted-foreground">{message}</p>
-      <Button
-        className="h-10 rounded-full bg-zinc-900 px-8 text-sm font-semibold text-white hover:bg-zinc-800"
-        onClick={onRetry}
-      >
-        重试
-      </Button>
+      <div className="flex items-center gap-2.5">
+        {onBack && (
+          <Button
+            variant="outline"
+            className="h-10 rounded-full px-6 text-sm"
+            onClick={onBack}
+          >
+            {backLabel}
+          </Button>
+        )}
+        <Button
+          className="h-10 rounded-full bg-zinc-900 px-8 text-sm font-semibold text-white hover:bg-zinc-800"
+          onClick={onRetry}
+        >
+          重试
+        </Button>
+      </div>
     </div>
   )
 }
 
 // 空闲入口视图
-function IdleView({ canStart, onStart }: { canStart: boolean; onStart: () => void }) {
+function IdleView({
+  canStart,
+  onStart,
+  extra,
+}: {
+  canStart: boolean
+  onStart: () => void
+  /** 附加内容（如图片出题上传行） */
+  extra?: React.ReactNode
+}) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-5 py-14 text-center">
       <FileQuestion className="size-10 text-muted-foreground/30" strokeWidth={1.5} />
@@ -1583,6 +1789,96 @@ function IdleView({ canStart, onStart }: { canStart: boolean; onStart: () => voi
         <Sparkles className="size-4" /> 开始出题
       </Button>
       {!canStart && <p className="text-xs text-destructive">当前背书卡内容为空，无法出题</p>}
+      {extra}
+    </div>
+  )
+}
+
+// 图片出题上传行：选择课文图片（≤3张），AI 先 OCR 识别再提炼知识点
+function PointImagesRow({
+  images,
+  onFilesChange,
+  onRemove,
+  onRegen,
+  showRegen = false,
+  disabled = false,
+  className,
+}: {
+  images: QuizImageItem[]
+  onFilesChange: (e: React.ChangeEvent<HTMLInputElement>) => void
+  onRemove: (id: string) => void
+  onRegen?: () => void
+  showRegen?: boolean
+  disabled?: boolean
+  className?: string
+}) {
+  const inputRef = React.useRef<HTMLInputElement>(null)
+  return (
+    <div
+      className={cn(
+        'rounded-2xl border border-dashed border-border bg-card/60 p-3',
+        className,
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-xs font-medium">图片出题（可选）</p>
+          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+            上传课文照片（最多 {MAX_POINT_IMAGES} 张），AI 会先识别图中文字再提炼知识点
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {showRegen && (
+            <button
+              type="button"
+              onClick={onRegen}
+              className="rounded-full px-2 py-1 text-xs text-emerald-600 transition-colors hover:bg-emerald-500/10 dark:text-emerald-400"
+            >
+              重新提炼
+            </button>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-8 rounded-full text-xs"
+            disabled={disabled || images.length >= MAX_POINT_IMAGES}
+            onClick={() => inputRef.current?.click()}
+          >
+            <ImagePlus className="size-3.5" /> 上传图片
+          </Button>
+        </div>
+      </div>
+      {images.length > 0 && (
+        <div className="mt-2.5 flex flex-wrap gap-2">
+          {images.map((img) => (
+            <div key={img.id} className="relative">
+              <img
+                src={img.dataUrl}
+                alt="课文图片"
+                className="size-14 rounded-lg border border-border object-cover"
+              />
+              <button
+                type="button"
+                aria-label="移除图片"
+                disabled={disabled}
+                onClick={() => onRemove(img.id)}
+                className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full bg-destructive text-white shadow disabled:opacity-50"
+              >
+                <X className="size-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <input
+        ref={inputRef}
+        type="file"
+        accept="image/*"
+        multiple
+        hidden
+        onChange={onFilesChange}
+      />
     </div>
   )
 }

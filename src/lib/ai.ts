@@ -128,6 +128,72 @@ export async function chatComplete(
   return completion.choices[0]?.message?.content ?? ''
 }
 
+/** Repair common LLM JSON mistakes: trailing commas, raw newlines/tabs
+ *  inside strings, smart quotes, unescaped control chars. */
+function repairJSON(t: string): string {
+  let out = ''
+  let inStr = false
+  let escape = false
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i]
+    if (inStr) {
+      if (escape) {
+        out += ch
+        escape = false
+        continue
+      }
+      if (ch === '\\') {
+        out += ch
+        escape = true
+        continue
+      }
+      if (ch === '"') {
+        inStr = false
+        out += ch
+        continue
+      }
+      if (ch === '\n') {
+        out += '\\n'
+        continue
+      }
+      if (ch === '\r') {
+        continue
+      }
+      if (ch === '\t') {
+        out += '\\t'
+        continue
+      }
+      out += ch
+      continue
+    }
+    if (ch === '"') {
+      inStr = true
+      out += ch
+      continue
+    }
+    // Trailing commas: ",}" ",]" ", ," etc. outside strings.
+    if (ch === ',' || ch === '}' || ch === ']') {
+      if (ch !== ',') {
+        // look back: strip trailing commas before this closer
+        let j = out.length - 1
+        while (j >= 0 && /\s/.test(out[j])) j--
+        while (j >= 0 && out[j] === ',') j--
+        while (j >= 0 && /\s/.test(out[j])) j--
+        out = out.slice(0, j + 1)
+      }
+      out += ch
+      continue
+    }
+    // Smart quotes → straight quotes (outside strings only)
+    if (ch === '\u201c' || ch === '\u201d') {
+      out += '"'
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
 // Robustly extract a JSON object/array from an LLM response that may be
 // wrapped in ```json fences or surrounded by prose.
 export function extractJSON<T = unknown>(text: string): T {
@@ -145,7 +211,7 @@ export function extractJSON<T = unknown>(text: string): T {
   }
 
   const startIdx = t.search(/[[{]/)
-  if (startIdx === -1) throw new Error('未在响应中找到 JSON')
+  if (startIdx === -1) throw new Error('AI 返回格式异常，请重试')
   const open = t[startIdx]
   const close = open === '{' ? '}' : ']'
   let depth = 0
@@ -170,6 +236,28 @@ export function extractJSON<T = unknown>(text: string): T {
       }
     }
   }
-  if (endIdx === -1) throw new Error('JSON 括号未闭合')
-  return JSON.parse(t.slice(startIdx, endIdx + 1)) as T
+  if (endIdx === -1) {
+    // Unterminated JSON — close it up and try to salvage.
+    const slice = t.slice(startIdx)
+    const repaired = repairJSON(slice)
+    for (const suffix of [close, '"' + close, '"}]', '"\n}]']) {
+      try {
+        return JSON.parse(repaired + suffix) as T
+      } catch {
+        /* keep trying */
+      }
+    }
+    throw new Error('AI 返回内容不完整，请重试')
+  }
+  const slice = t.slice(startIdx, endIdx + 1)
+  try {
+    return JSON.parse(slice) as T
+  } catch {
+    // Balanced but malformed — attempt repair before giving up.
+    try {
+      return JSON.parse(repairJSON(slice)) as T
+    } catch {
+      throw new Error('AI 返回格式异常，请重试')
+    }
+  }
 }

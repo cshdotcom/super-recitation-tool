@@ -6,13 +6,16 @@ import {
   ChevronLeft,
   Download,
   EyeOff,
+  GraduationCap,
   Loader2,
   MoreVertical,
   Play,
   Printer,
   Sparkles,
+  Square,
   Star,
   Trash2,
+  Volume2,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -42,6 +45,16 @@ import {
   userAnswerKey,
 } from '@/components/recitation/quiz-panel'
 import { VoiceInput } from '@/components/recitation/voice-input'
+import { useSettingsLite } from '@/lib/voice-prefs'
+import { useQuickTts } from '@/components/recitation/tts-player'
+import { RichContent } from '@/components/recitation/rich-content'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 
 interface WrongQuestionsViewProps {
   onBack: () => void
@@ -145,6 +158,10 @@ export function WrongQuestionsView({
   const [mode, setMode] = React.useState<ViewMode>('list')
   const [done, setDone] = React.useState<{ right: number; total: number } | null>(null)
 
+  // ---- TTS（context 'quiz'，随设置里的音色/语速） ----
+  const settings = useSettingsLite()
+  const tts = useQuickTts('quiz', settings)
+
   // ---- 筛选 ----
   const [cardFilter, setCardFilter] = React.useState<string>('all')
   const [timeFilter, setTimeFilter] = React.useState<TimeKey>('all')
@@ -161,6 +178,13 @@ export function WrongQuestionsView({
   const [similarBusy, setSimilarBusy] = React.useState(false)
   const [similarItems, setSimilarItems] = React.useState<QuizItemData[]>([])
 
+  // ---- AI 解析 ----
+  const [explainItem, setExplainItem] = React.useState<QuizItemData | null>(null)
+  const [explainLoading, setExplainLoading] = React.useState(false)
+  const [explainReply, setExplainReply] = React.useState('')
+  const [explainError, setExplainError] = React.useState('')
+  const explainAbortRef = React.useRef<AbortController | null>(null)
+
   // ---- 本地「我的答案」记录 ----
   const [userAnswers, setUserAnswers] = React.useState<
     Record<string, { userAnswer: string; at: number }>
@@ -169,6 +193,15 @@ export function WrongQuestionsView({
   React.useEffect(() => {
     if (typeof autoRemove === 'number') setRemoveN(autoRemove)
   }, [autoRemove])
+
+  // 卸载时停止朗读并中断进行中的 AI 解析（tts.stop 引用稳定，仅卸载时执行一次）
+  React.useEffect(() => {
+    const stop = tts.stop
+    return () => {
+      explainAbortRef.current?.abort()
+      stop()
+    }
+  }, [tts.stop])
 
   React.useEffect(() => {
     let alive = true
@@ -442,6 +475,70 @@ export function WrongQuestionsView({
     } finally {
       setSimilarBusy(false)
     }
+  }
+
+  // ---- 朗读错题：题目（展开态附带正确答案） ----
+  const speakItem = (item: QuizItemData, includeAnswer: boolean) => {
+    if (tts.speaking) {
+      tts.stop()
+      return
+    }
+    tts.speak(
+      includeAnswer && item.answer
+        ? `题目：${item.question}。正确答案：${item.answer}`
+        : item.question,
+    )
+  }
+
+  // ---- AI 解析：讲解错题涉及的知识点 ----
+  const openExplain = (item: QuizItemData) => {
+    explainAbortRef.current?.abort()
+    const ctrl = new AbortController()
+    explainAbortRef.current = ctrl
+    setExplainItem(item)
+    setExplainReply('')
+    setExplainError('')
+    setExplainLoading(true)
+    const my = userAnswers[userAnswerKey(item.cardId, item.question)]?.userAnswer
+    const lines = [
+      '讲解这道错题涉及的知识点：',
+      `题目：${item.question}`,
+      ...(item.options.length > 0 ? [`选项：${item.options.join('；')}`] : []),
+      `正确答案：${item.answer || '（无标准答案）'}`,
+      ...(my ? [`我的答案：${my}`] : []),
+    ]
+    fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: ctrl.signal,
+      body: JSON.stringify({
+        mode: 'ask',
+        content: item.cardTitle
+          ? `来自卡片「${item.cardTitle}」的错题：${item.question}`
+          : item.question,
+        messages: [{ role: 'user', content: lines.join('\n') }],
+      }),
+    })
+      .then(async (res) => {
+        const data = (await res.json().catch(() => ({}))) as { reply?: string; error?: string }
+        if (!res.ok) throw new Error(data.error || 'AI 解析失败')
+        setExplainReply(data.reply || '')
+      })
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === 'AbortError') return
+        setExplainError(err instanceof Error ? err.message : 'AI 解析失败')
+        toast.error(err instanceof Error ? err.message : 'AI 解析失败')
+      })
+      .finally(() => {
+        if (!ctrl.signal.aborted) setExplainLoading(false)
+      })
+  }
+
+  const closeExplain = () => {
+    explainAbortRef.current?.abort()
+    setExplainItem(null)
+    setExplainLoading(false)
+    tts.stop()
   }
 
   // ---- 导出 CSV ----
@@ -785,7 +882,28 @@ export function WrongQuestionsView({
                             {item.cardTitle && <span>来源：{item.cardTitle}</span>}
                             <span>{formatDate(item.updatedAt)}</span>
                           </div>
-                          <div className="mt-3 flex items-center justify-end gap-2">
+                          <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => speakItem(item, true)}
+                              aria-label={tts.speaking ? '停止朗读' : '朗读题目和答案'}
+                              className="flex h-9 items-center gap-1.5 rounded-full border border-border px-3.5 text-xs text-muted-foreground transition-colors hover:bg-accent"
+                            >
+                              {tts.speaking ? (
+                                <Square className="size-3.5" />
+                              ) : (
+                                <Volume2 className="size-3.5" />
+                              )}
+                              {tts.speaking ? '停止' : '朗读'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => openExplain(item)}
+                              className="flex h-9 items-center gap-1.5 rounded-full border border-purple-500/40 px-3.5 text-xs font-medium text-purple-700 transition-colors hover:bg-purple-500/10 dark:text-purple-400"
+                            >
+                              <GraduationCap className="size-3.5" />
+                              AI 解析
+                            </button>
                             <button
                               type="button"
                               disabled={similarBusy}
@@ -981,6 +1099,35 @@ export function WrongQuestionsView({
         </AlertDialogContent>
       </AlertDialog>
 
+      {/* AI 解析弹窗 */}
+      <Dialog
+        open={!!explainItem}
+        onOpenChange={(o) => {
+          if (!o) closeExplain()
+        }}
+      >
+        <DialogContent className="rounded-2xl sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>AI 解析</DialogTitle>
+            <DialogDescription className="line-clamp-2 text-xs leading-relaxed">
+              {explainItem?.question}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[60vh] overflow-y-auto overscroll-contain">
+            {explainLoading ? (
+              <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
+                <Loader2 className="size-4 animate-spin" />
+                AI 正在解析…
+              </div>
+            ) : explainError ? (
+              <p className="py-8 text-center text-sm text-destructive">{explainError}</p>
+            ) : (
+              <RichContent content={explainReply} />
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {/* 打印题单（仅打印时显示） */}
       <div id="wrong-print" className="hidden print:block">
         <h2 className="mb-1 text-lg font-bold">错题本 · {new Date().toLocaleDateString('zh-CN')}</h2>
@@ -1058,6 +1205,20 @@ function PracticeBoard({
   const [right, setRight] = React.useState(0)
   const [submitting, setSubmitting] = React.useState(false)
   const startAtRef = React.useRef<number>(Date.now())
+
+  // 练习模式 TTS（context 'quiz'）：朗读题目，显示答案后一并朗读
+  const settings = useSettingsLite()
+  const tts = useQuickTts('quiz', settings)
+
+  // 切题 / 卸载时停止上一题的朗读
+  React.useEffect(() => {
+    tts.stop()
+     
+  }, [idx])
+  React.useEffect(() => {
+    const stop = tts.stop
+    return () => stop()
+  }, [tts.stop])
 
   const finish = React.useRef<(right: number) => void>(onDone)
   finish.current = onDone
@@ -1149,6 +1310,26 @@ function PracticeBoard({
                 : '简答'}
           </span>
           <span className="truncate text-xs text-muted-foreground">{item.cardTitle}</span>
+          <button
+            type="button"
+            aria-label={tts.speaking ? '停止朗读' : '朗读题目'}
+            onClick={() =>
+              tts.speaking
+                ? tts.stop()
+                : tts.speak(
+                    revealed && item.answer
+                      ? `题目：${item.question}。正确答案：${item.answer}`
+                      : item.question,
+                  )
+            }
+            className="ml-auto flex size-9 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-emerald-600"
+          >
+            {tts.speaking ? (
+              <Square className="size-4" strokeWidth={1.9} />
+            ) : (
+              <Volume2 className="size-4" strokeWidth={1.9} />
+            )}
+          </button>
         </div>
         <p className="mt-3 whitespace-pre-wrap text-[15px] font-medium leading-relaxed">
           {item.question}

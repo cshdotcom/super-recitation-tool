@@ -18,10 +18,12 @@
 //   铃声       getFocusSoundPrefs / saveFocusSoundPrefs / playFocusBell / playBuiltin
 //             FOCUS_BUILTIN_SOUNDS（内置铃声清单）
 //   历史       getTodayHistory（本设备今日会话记录）
-//   组件       FocusFloatingClock（全局挂载一次）
+//   UI 跳转    requestOpenFocusView / consumeOpenFocusRequest（浮时钟「全屏计时」→
+//             window 派发 CustomEvent('sb-open-focus')，页面据此切到专注视图）
+//   组件       FocusFloatingClock（全局挂载一次；圆钮可拖动，位置持久化 ui:focusClockPos）
 
 import * as React from 'react'
-import { Clock3, Pause, Play, Upload, Volume2 } from 'lucide-react'
+import { Clock3, Maximize2, Pause, Play, Upload, Volume2 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -438,6 +440,27 @@ export function isImmersiveOpen(): boolean {
   return immersiveOpen
 }
 
+// ---------- 「全屏计时」跨视图请求（浮时钟详情 → 页面切到专注视图） ----------
+
+let lastOpenFocusAt = 0
+
+/** 派发 'sb-open-focus' 事件（页面监听后导航到专注视图），并记录时间戳供晚挂载的 FocusApp 补收 */
+export function requestOpenFocusView(): void {
+  lastOpenFocusAt = Date.now()
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sb-open-focus'))
+  }
+}
+
+/** 取走最近 5 秒内的全屏计时请求（FocusApp 挂载晚于事件派发时补收，避免丢事件） */
+export function consumeOpenFocusRequest(): boolean {
+  if (lastOpenFocusAt && Date.now() - lastOpenFocusAt < 5 * 1000) {
+    lastOpenFocusAt = 0
+    return true
+  }
+  return false
+}
+
 // ---------- 本机会话历史（今日记录列表用；服务器 API 无逐条日志查询） ----------
 
 export interface FocusHistoryEntry {
@@ -629,10 +652,87 @@ export function fmtDurHuman(totalSec: number): string {
   return m > 0 ? `${h} 小时 ${m} 分` : `${h} 小时`
 }
 
+// ---------- 浮时钟位置（可拖动；百分比定位抗窗口尺寸变化，持久化到 /api/state） ----------
+
+/** 服务端 AppState KV key（GET /api/state?key=… → { values: { [key]: string|null } }） */
+const FOCUS_CLOCK_POS_KEY = 'ui:focusClockPos'
+/** 拖拽释放后距视口边缘的最小像素 */
+const POS_EDGE_MARGIN = 8
+/** 圆钮直径（size-16 = 64px） */
+const PILL_SIZE = 64
+/** 指针移动超过该像素视为拖拽（否则仍当作点击打开详情） */
+const DRAG_THRESHOLD = 6
+
+/** 圆钮中心位置（视口宽高的百分比 0-100） */
+export interface FocusClockPos {
+  x: number
+  y: number
+}
+
+function clampPosPx(left: number, top: number): { left: number; top: number } {
+  const vw = window.innerWidth || 1
+  const vh = window.innerHeight || 1
+  const half = PILL_SIZE / 2
+  return {
+    left: Math.min(vw - half - POS_EDGE_MARGIN, Math.max(half + POS_EDGE_MARGIN, left)),
+    top: Math.min(vh - half - POS_EDGE_MARGIN, Math.max(half + POS_EDGE_MARGIN, top)),
+  }
+}
+
+function posToPercent(left: number, top: number): FocusClockPos {
+  const vw = window.innerWidth || 1
+  const vh = window.innerHeight || 1
+  return { x: (left / vw) * 100, y: (top / vh) * 100 }
+}
+
+function clampPosPercent(p: FocusClockPos): FocusClockPos {
+  const vw = window.innerWidth || 1
+  const vh = window.innerHeight || 1
+  const c = clampPosPx((p.x / 100) * vw, (p.y / 100) * vh)
+  return posToPercent(c.left, c.top)
+}
+
+/** 默认位置：右下角 bottom-4 right-4（16px 边距 + 半径 32px → 中心距角 48px） */
+function defaultPosPx(): { left: number; top: number } {
+  const vw = window.innerWidth || 1
+  const vh = window.innerHeight || 1
+  return { left: vw - 48, top: vh - 48 }
+}
+
+async function loadClockPos(): Promise<FocusClockPos | null> {
+  try {
+    const res = await fetch(`/api/state?key=${encodeURIComponent(FOCUS_CLOCK_POS_KEY)}`)
+    if (!res.ok) return null
+    const data = (await res.json()) as { values?: Record<string, string | null> }
+    const raw = data.values?.[FOCUS_CLOCK_POS_KEY]
+    if (!raw) return null
+    const p = JSON.parse(raw) as Partial<FocusClockPos>
+    const x = Number(p?.x)
+    const y = Number(p?.y)
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 100 || y < 0 || y > 100) {
+      return null
+    }
+    return clampPosPercent({ x, y })
+  } catch {
+    return null
+  }
+}
+
+function saveClockPos(p: FocusClockPos): void {
+  const value = JSON.stringify({ x: Math.round(p.x * 100) / 100, y: Math.round(p.y * 100) / 100 })
+  void fetch('/api/state', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key: FOCUS_CLOCK_POS_KEY, value }),
+  }).catch(() => {
+    // 位置保存失败不影响计时
+  })
+}
+
 // ============================================================
 // FocusFloatingClock — 全局浮时钟（主线程挂载一次即可）
-//   运行中：右下角小圆钮（mm:ss），点击弹详情 Dialog
-//   详情：当前会话（内容名 / 已专注 / 暂停继续 / 结束）+ 今日&累计统计 + 结束铃声设置
+//   运行中：可拖动小圆钮（mm:ss，长按拖拽换位置并持久化），点击弹详情 Dialog
+//   详情：当前会话（内容名 / 已专注 / 全屏计时 / 暂停继续 / 结束）+ 今日&累计统计 + 结束铃声设置
 //   到点：自动弹「时间到了」Dialog（可手动播放铃声）
 // ============================================================
 
@@ -646,6 +746,96 @@ export function FocusFloatingClock() {
   const [sound, setSound] = React.useState<FocusSoundPrefs>(SOUND_DEFAULT)
   const [stats, setStats] = React.useState<{ todayMin: number; totalCount: number } | null>(null)
   const [statsErr, setStatsErr] = React.useState(false)
+
+  // ---------- 圆钮位置（可拖动，持久化 ui:focusClockPos，百分比定位抗窗口尺寸变化） ----------
+  const [pos, setPos] = React.useState<FocusClockPos | null>(null)
+  const [dragging, setDragging] = React.useState(false)
+  const posRef = React.useRef<FocusClockPos | null>(null)
+  const dragRef = React.useRef<{
+    pointerId: number
+    startX: number
+    startY: number
+    baseLeft: number
+    baseTop: number
+    moved: boolean
+  } | null>(null)
+  const suppressClickRef = React.useRef(false)
+
+  // 挂载时读取上次拖放的位置（无记录 / 失败 → 默认右下角）
+  React.useEffect(() => {
+    let alive = true
+    void loadClockPos().then((p) => {
+      if (alive && p) setPos(p)
+    })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // 窗口尺寸变化时按百分比重新夹取，保证圆钮不出视口
+  React.useEffect(() => {
+    const onResize = () => setPos((p) => (p ? clampPosPercent(p) : p))
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  React.useEffect(() => {
+    posRef.current = pos
+  }, [pos])
+
+  const onPillPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    suppressClickRef.current = false // 兑现/清掉上次残留的拖拽吞噬标记
+    const p = posRef.current
+    const base = p
+      ? {
+          left: (p.x / 100) * (window.innerWidth || 1),
+          top: (p.y / 100) * (window.innerHeight || 1),
+        }
+      : defaultPosPx()
+    dragRef.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      baseLeft: base.left,
+      baseTop: base.top,
+      moved: false,
+    }
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {
+      // 个别浏览器对非主指针不支持 capture，忽略（仍可拖拽，只是移出按钮后丢跟踪）
+    }
+  }
+
+  const onPillPointerMove = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const d = dragRef.current
+    if (!d || d.pointerId !== e.pointerId) return
+    const dx = e.clientX - d.startX
+    const dy = e.clientY - d.startY
+    if (!d.moved) {
+      if (Math.hypot(dx, dy) <= DRAG_THRESHOLD) return
+      d.moved = true
+      setDragging(true)
+    }
+    const c = clampPosPx(d.baseLeft + dx, d.baseTop + dy)
+    setPos(posToPercent(c.left, c.top))
+  }
+
+  const endPillDrag = (e: React.PointerEvent<HTMLButtonElement>) => {
+    const d = dragRef.current
+    dragRef.current = null
+    setDragging(false)
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      // ignore
+    }
+    if (!d || d.pointerId !== e.pointerId || !d.moved) return // 未拖动 → 交给 onClick 打开详情
+    suppressClickRef.current = true // 本次是拖拽，吞掉 pointerup 后紧随的 click
+    const p = posRef.current
+    if (p) saveClockPos(p)
+  }
 
   React.useEffect(() => {
     setSound(getFocusSoundPrefs())
@@ -817,10 +1007,30 @@ export function FocusFloatingClock() {
           {
             key: 'pill',
             type: 'button',
-            'aria-label': '专注浮时钟',
-            onClick: () => setDetailOpen(true),
-            className:
-              'fixed bottom-4 right-4 z-40 flex size-16 flex-col items-center justify-center rounded-full bg-zinc-900 text-white shadow-xl transition-transform active:scale-95',
+            'aria-label': '专注浮时钟（可拖动）',
+            onClick: () => {
+              if (suppressClickRef.current) {
+                suppressClickRef.current = false
+                return // 刚完成一次拖拽，不要误开详情
+              }
+              setDetailOpen(true)
+            },
+            onPointerDown: onPillPointerDown,
+            onPointerMove: onPillPointerMove,
+            onPointerUp: endPillDrag,
+            onPointerCancel: endPillDrag,
+            className: cn(
+              'fixed z-40 flex size-16 touch-none select-none flex-col items-center justify-center rounded-full bg-zinc-900 text-white shadow-xl outline-none transition-transform',
+              pos ? '' : 'bottom-4 right-4',
+              dragging ? 'scale-105 cursor-grabbing shadow-2xl' : 'cursor-grab active:scale-95',
+            ),
+            style: pos
+              ? {
+                  left: `${pos.x}%`,
+                  top: `${pos.y}%`,
+                  transform: 'translate(-50%, -50%)',
+                }
+              : undefined,
           },
           h('span', { key: 't', className: 'text-sm font-bold leading-none tabular-nums' }, fmtClock(display)),
           h('span', { key: 's', className: 'mt-1 text-[10px] leading-none text-white/60' }, st.paused ? '已暂停' : '专注中'),
@@ -874,6 +1084,22 @@ export function FocusFloatingClock() {
               ),
               st.paused &&
                 h('span', { className: 'mt-2 inline-block rounded-full bg-white/10 px-2 py-0.5 text-[11px] text-white/80' }, '已暂停'),
+            ),
+            h(
+              'button',
+              {
+                key: 'fullscreen',
+                type: 'button',
+                onClick: () => {
+                  setDetailOpen(false)
+                  // 页面监听 'sb-open-focus' 后切到专注视图；FocusApp 自己也会补收（挂载晚时）
+                  requestOpenFocusView()
+                },
+                className:
+                  'flex h-11 w-full items-center justify-center gap-1.5 rounded-full border text-sm font-semibold transition-colors hover:bg-zinc-50',
+              },
+              h(Maximize2, { key: 'ic', className: 'size-4' }),
+              '全屏计时',
             ),
             h(
               'div',

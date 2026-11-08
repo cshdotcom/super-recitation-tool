@@ -58,9 +58,15 @@ import {
   Undo2,
   UnfoldVertical,
   Zap,
+  Camera,
+  Crop,
+  Paintbrush,
+  ScanLine,
+  SquareSigma,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { toast } from 'sonner'
+import { FreeCropBox, type CropBox, type CropOffset } from '@/components/recitation/free-crop-box'
 
 import type { CardData, MaterialBlock } from '@/lib/types'
 import { extractClozeMarks, wrapClozeMark } from '@/lib/editor-cloze'
@@ -84,6 +90,13 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Slider } from '@/components/ui/slider'
 import { Textarea } from '@/components/ui/textarea'
 import { RichContent } from '@/components/recitation/rich-content'
@@ -125,6 +138,18 @@ const FORMAT_MAP: Record<FormatKind, { before: string; after: string; ph: string
   highlight: { before: '==', after: '==', ph: '文字' },
   quote: { before: '> ', after: '', ph: '文字' },
 }
+
+// 字色调色板（%%color|文字%% 语法，阅读视图与预览均渲染）
+const TEXT_COLORS: { value: string; label: string }[] = [
+  { value: 'default', label: '默认' },
+  { value: '#dc2626', label: '红色' },
+  { value: '#ea580c', label: '橙色' },
+  { value: '#16a34a', label: '绿色' },
+  { value: '#0d9488', label: '青色' },
+  { value: '#7c3aed', label: '紫色' },
+  { value: '#db2777', label: '粉色' },
+  { value: '#64748b', label: '灰色' },
+]
 
 const FORMAT_ITEMS: { kind: FormatKind; label: string; icon: LucideIcon }[] = [
   { kind: 'bold', label: '加粗', icon: Bold },
@@ -208,12 +233,56 @@ function compressImage(file: File): Promise<string> {
   })
 }
 
+/** 裁剪：按自然像素框裁出 dataURL（宽 ≤800px） */
+function cropDataUrl(
+  src: string,
+  box: { x: number; y: number; width: number; height: number },
+  maxW = 800,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const bw = Math.max(1, box.width)
+      const bh = Math.max(1, box.height)
+      const w = Math.max(1, Math.min(maxW, Math.round(bw)))
+      const h = Math.max(1, Math.round((bh / bw) * w))
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('画布不可用'))
+        return
+      }
+      ctx.drawImage(img, box.x, box.y, bw, bh, 0, 0, w, h)
+      resolve(canvas.toDataURL('image/jpeg', 0.85))
+    }
+    img.onerror = () => reject(new Error('图片解码失败'))
+    img.src = src
+  })
+}
+
+/** 可视化表格模板：rows×cols */
+function buildTableTemplate(rows: number, cols: number): string {
+  const head = `| ${Array.from({ length: cols }, (_, i) => `表头 ${i + 1}`).join(' | ')} |`
+  const sep = `| ${Array.from({ length: cols }, () => '---').join(' | ')} |`
+  const body = Array.from({ length: Math.max(rows - 1, 1) }, () =>
+    `| ${Array.from({ length: cols }, () => '单元格').join(' | ')} |`,
+  )
+  return [head, sep, ...body].join('\n')
+}
+
 /** 预览用：把 {{挖空}} 显示为加粗（关键词提取用 extractClozeMarks） */
 function toPreviewMarkdown(text: string): string {
-  return String(text ?? '').replace(/\{\{([^{}]*)\}\}/g, (_m, inner: string) => {
-    const kw = inner.trim()
-    return kw ? `**${kw}**` : inner
-  })
+  return String(text ?? '')
+    .replace(/\{\{([^{}]*)\}\}/g, (_m, inner: string) => {
+      const kw = inner.trim()
+      return kw ? `**${kw}**` : inner
+    })
+    // 荧光笔 ==x== → <mark>
+    .replace(/==([^=\n]+)==/g, '<mark>$1</mark>')
+    // 字色 %%color|文字%% → <span style>
+    .replace(/%%([^|\n]+)\|([^%\n]*)%%/g, '<span style="color:$1">$2</span>')
 }
 
 // ---------- 自适应高度输入框 ----------
@@ -309,6 +378,17 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const taRefs = React.useRef(new Map<string, HTMLTextAreaElement>())
   const lastFocusRef = React.useRef<FocusTarget | null>(null)
   const fileInputRef = React.useRef<HTMLInputElement | null>(null)
+  // ---- 图片裁剪 / AI 扫描 ----
+  const cameraInputRef = React.useRef<HTMLInputElement | null>(null)
+  const scanInputRef = React.useRef<HTMLInputElement | null>(null)
+  const [imgEdit, setImgEdit] = React.useState<string | null>(null) // 待裁剪图片 dataURL
+  const [imgZoom, setImgZoom] = React.useState(1)
+  const [imgOffset, setImgOffset] = React.useState<CropOffset>({ x: 0, y: 0 })
+  const [imgCrop, setImgCrop] = React.useState<CropBox | null>(null)
+  const imgCropNaturalRef = React.useRef<CropBox | null>(null)
+  const [tableOpen, setTableOpen] = React.useState(false)
+  const [tableRows, setTableRows] = React.useState(3)
+  const [tableCols, setTableCols] = React.useState(3)
 
   // ---- state + ref 同步写入 ----
   const applyBlocks = (next: MaterialBlock[]) => {
@@ -742,10 +822,8 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     })
   }
 
-  // ---- 插入图片 ----
-  const handleImageFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    e.target.value = '' // 允许重复选择同一文件
+  // ---- 插入图片（先压缩，再进入裁剪编辑器）----
+  const prepareImage = async (file: File | undefined, direct = false) => {
     if (!file) return
     if (!file.type.startsWith('image/')) {
       toast.error('请选择图片文件')
@@ -753,10 +831,78 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     }
     try {
       const dataUrl = await compressImage(file)
-      insertMarkdown(`![图片](${dataUrl})`, '', '')
-      toast.success('图片已插入')
+      if (direct) {
+        insertMarkdown(`![图片](${dataUrl})`, '', '')
+        toast.success('图片已插入')
+      } else {
+        setImgZoom(1)
+        setImgOffset({ x: 0, y: 0 })
+        setImgCrop(null)
+        imgCropNaturalRef.current = null
+        setImgEdit(dataUrl)
+      }
     } catch (err) {
       toast.error('图片处理失败：' + (err instanceof Error ? err.message : '未知错误'))
+    }
+  }
+
+  const handleImageFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    await prepareImage(file)
+  }
+
+  const handleCameraFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    await prepareImage(file)
+  }
+
+  // AI 扫描：图片 → OCR 文字 → 插入正文
+  const handleScanFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    if (!file.type.startsWith('image/')) {
+      toast.error('请选择图片文件')
+      return
+    }
+    const tid = toast.loading('AI 正在识别图片文字…')
+    try {
+      const dataUrl = await compressImage(file)
+      const res = await fetch('/api/ocr', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: dataUrl }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.error || '识别失败')
+      }
+      const data = (await res.json()) as { text?: string }
+      const text = (data.text || '').trim()
+      if (!text) {
+        toast.warning('未识别到文字', { id: tid })
+        return
+      }
+      insertMarkdown(text, '', '')
+      toast.success(`已插入识别文字（${text.length} 字）`, { id: tid })
+    } catch (err) {
+      toast.error('AI 扫描失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+    }
+  }
+
+  // 裁剪后插入
+  const insertCropped = async (boxOverride?: CropBox | null) => {
+    if (!imgEdit) return
+    try {
+      const box = boxOverride ?? imgCropNaturalRef.current ?? imgCrop
+      const out = box ? await cropDataUrl(imgEdit, box) : imgEdit
+      insertMarkdown(`![图片](${out})`, '', '')
+      toast.success('图片已插入')
+      setImgEdit(null)
+    } catch (err) {
+      toast.error('裁剪失败：' + (err instanceof Error ? err.message : '未知错误'))
     }
   }
 
@@ -996,6 +1142,48 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 </PopoverContent>
               </Popover>
 
+              {/* 字色 */}
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="文字颜色"
+                    onMouseDown={(e) => e.preventDefault()}
+                    className={TOOLBAR_BTN}
+                  >
+                    <Paintbrush className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">字色</span>
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side="bottom"
+                  align="start"
+                  onOpenAutoFocus={(e) => e.preventDefault()}
+                  className="w-48 rounded-2xl p-3"
+                >
+                  <p className="text-sm font-semibold">文字颜色</p>
+                  <div className="mt-2 grid grid-cols-6 gap-1.5">
+                    {TEXT_COLORS.map((c) => (
+                      <button
+                        key={c.value}
+                        type="button"
+                        aria-label={c.label}
+                        title={c.label}
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => insertMarkdown(`%%${c.value}|`, '%%', '文字')}
+                        className="flex size-8 items-center justify-center rounded-full ring-1 ring-border transition-transform hover:scale-110"
+                      >
+                        <span
+                          className="size-5 rounded-full"
+                          style={{ background: c.value === 'default' ? 'linear-gradient(45deg,#ddd,#fff)' : c.value }}
+                        />
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-2 text-[11px] text-muted-foreground">选中文字后点色球可给选区上色</p>
+                </PopoverContent>
+              </Popover>
+
               {/* 挖空：选中文字包上 {{ }} */}
               <button
                 type="button"
@@ -1044,8 +1232,24 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                     onClick={() => fileInputRef.current?.click()}
                     className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
-                    <ImagePlus className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
-                    上传图片
+                    <Crop className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    上传图片（可裁剪）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => cameraInputRef.current?.click()}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <Camera className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    拍照插入
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => scanInputRef.current?.click()}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <ScanLine className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    AI 扫描（识别文字）
                   </button>
                   <button
                     type="button"
@@ -1057,7 +1261,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                     插入图片链接
                   </button>
                   <p className="px-2.5 pb-1.5 pt-1 text-[11px] text-muted-foreground">
-                    上传图片压缩到 800px 宽后内嵌
+                    图片压缩到 800px 宽后内嵌；AI 扫描把图中文字插入正文
                   </p>
                 </PopoverContent>
               </Popover>
@@ -1070,30 +1274,125 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 tabIndex={-1}
                 onChange={(e) => void handleImageFile(e)}
               />
+              <input
+                ref={cameraInputRef}
+                type="file"
+                accept="image/*"
+                capture="environment"
+                className="hidden"
+                aria-hidden
+                tabIndex={-1}
+                onChange={(e) => void handleCameraFile(e)}
+              />
+              <input
+                ref={scanInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                aria-hidden
+                tabIndex={-1}
+                onChange={(e) => void handleScanFile(e)}
+              />
 
-              {/* 公式：$$E=mc^2$$ 模板 */}
-              <button
-                type="button"
-                aria-label="插入公式"
-                onClick={() => insertMarkdown('$$', '$$', 'E=mc^2')}
-                onMouseDown={(e) => e.preventDefault()}
-                className={TOOLBAR_BTN}
-              >
-                <Sigma className="size-5" strokeWidth={1.75} aria-hidden />
-                <span className="text-[11px] leading-none">公式</span>
-              </button>
+              {/* 公式：行内 $..$ / 独立 $$..$$ */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button type="button" aria-label="插入公式" className={TOOLBAR_BTN}>
+                    <SquareSigma className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">公式</span>
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="bottom" align="start" className="w-44 rounded-xl">
+                  <DropdownMenuItem
+                    onClick={() => {
+                      insertMarkdown('$', '$', 'E=mc^2')
+                    }}
+                  >
+                    行内公式 $x^2$
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => {
+                      insertMarkdown('$$', '$$', 'E=mc^2')
+                    }}
+                  >
+                    独立公式 $$…$$
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
 
-              {/* 表格 */}
-              <button
-                type="button"
-                aria-label="插入表格"
-                onClick={() => insertMarkdown(TABLE_TEMPLATE, '', '', true)}
-                onMouseDown={(e) => e.preventDefault()}
-                className={TOOLBAR_BTN}
-              >
-                <TableIcon className="size-5" strokeWidth={1.75} aria-hidden />
-                <span className="text-[11px] leading-none">表格</span>
-              </button>
+              {/* 表格：可视化行列选择 */}
+              <Popover open={tableOpen} onOpenChange={setTableOpen}>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="插入表格"
+                    onMouseDown={(e) => e.preventDefault()}
+                    className={TOOLBAR_BTN}
+                  >
+                    <TableIcon className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">表格</span>
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent side="bottom" align="start" className="w-56 rounded-2xl p-3">
+                  <p className="text-sm font-semibold">插入表格</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">选择行数 × 列数</p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">行</span>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="size-7 rounded-full"
+                      aria-label="减少行"
+                      onClick={() => setTableRows((r) => Math.max(1, r - 1))}
+                    >
+                      −
+                    </Button>
+                    <span className="w-6 text-center text-sm font-medium tabular-nums">{tableRows}</span>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="size-7 rounded-full"
+                      aria-label="增加行"
+                      onClick={() => setTableRows((r) => Math.min(20, r + 1))}
+                    >
+                      +
+                    </Button>
+                  </div>
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">列</span>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="size-7 rounded-full"
+                      aria-label="减少列"
+                      onClick={() => setTableCols((c) => Math.max(1, c - 1))}
+                    >
+                      −
+                    </Button>
+                    <span className="w-6 text-center text-sm font-medium tabular-nums">{tableCols}</span>
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      className="size-7 rounded-full"
+                      aria-label="增加列"
+                      onClick={() => setTableCols((c) => Math.min(10, c + 1))}
+                    >
+                      +
+                    </Button>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="mt-2.5 h-8 w-full rounded-full text-xs"
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => {
+                      insertMarkdown(buildTableTemplate(tableRows, tableCols), '', '', true)
+                      setTableOpen(false)
+                    }}
+                  >
+                    插入 {tableRows}×{tableCols} 表格
+                  </Button>
+                </PopoverContent>
+              </Popover>
 
               {/* 新建分块 */}
               <button
@@ -1415,10 +1714,10 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                             <span className="text-[11px] text-muted-foreground">挖空词：</span>
                             {previewData.keywords.map((k) => (
                               <span
-                                key={k}
+                                key={typeof k === 'string' ? k : `${k.t}@${k.occ}`}
                                 className="rounded-md bg-background px-1.5 py-0.5 text-[11px] text-foreground ring-1 ring-border"
                               >
-                                {k}
+                                {typeof k === 'string' ? k : k.t}
                               </span>
                             ))}
                           </div>
@@ -1468,6 +1767,92 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      {/* 图片裁剪弹窗（上传/拍照后可选裁剪再插入） */}
+      <CropDialog
+        src={imgEdit ?? ''}
+        open={!!imgEdit}
+        onOpenChange={(v) => {
+          if (!v) setImgEdit(null)
+        }}
+        onConfirm={(box) => void insertCropped(box)}
+      />
     </>
+  )
+}
+
+// ============================================================
+// CropDialog — 图片裁剪编辑弹窗（自由拉升裁剪框）
+// ============================================================
+function CropDialog({
+  src,
+  open,
+  onOpenChange,
+  onConfirm,
+}: {
+  src: string
+  open: boolean
+  onOpenChange: (v: boolean) => void
+  onConfirm: (box: CropBox | null) => void
+}) {
+  const [zoom, setZoom] = React.useState(1)
+  const [offset, setOffset] = React.useState<CropOffset>({ x: 0, y: 0 })
+  const [crop, setCrop] = React.useState<CropBox | null>(null)
+  const naturalRef = React.useRef<CropBox | null>(null)
+
+  React.useEffect(() => {
+    if (open) {
+      setZoom(1)
+      setOffset({ x: 0, y: 0 })
+      setCrop(null)
+      naturalRef.current = null
+    }
+  }, [open])
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-h-[88vh] overflow-y-auto rounded-2xl sm:max-w-md">
+        <DialogHeader className="pr-10">
+          <DialogTitle>裁剪图片</DialogTitle>
+          <DialogDescription>拖动边角手柄自由调整裁剪范围，缩放后可直接插入</DialogDescription>
+        </DialogHeader>
+        <div className="rounded-xl border border-border bg-muted/40 p-2">
+          <FreeCropBox
+            src={src}
+            zoom={zoom}
+            onZoomChange={setZoom}
+            offset={offset}
+            onOffsetChange={setOffset}
+            crop={crop}
+            onCropChange={setCrop}
+            onCropNatural={(c) => {
+              naturalRef.current = c
+            }}
+            grid
+          />
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="shrink-0 text-xs text-muted-foreground">缩放</span>
+          <Slider
+            value={[zoom]}
+            min={1}
+            max={4}
+            step={0.1}
+            onValueChange={(v) => setZoom(v[0] ?? 1)}
+            className="flex-1"
+          />
+          <span className="w-9 text-right text-xs tabular-nums text-muted-foreground">
+            {zoom.toFixed(1)}x
+          </span>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" className="flex-1 rounded-full" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button className="flex-1 rounded-full" onClick={() => onConfirm(naturalRef.current ?? crop)}>
+            插入图片
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }

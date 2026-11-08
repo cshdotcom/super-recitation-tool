@@ -18,6 +18,7 @@ import {
   Check,
   ChevronDown,
   ChevronLeft,
+  ChevronRight,
   ChevronUp,
   Clock3,
   Loader2,
@@ -54,10 +55,12 @@ import { cn } from '@/lib/utils'
 import type { FocusContentData } from '@/lib/types'
 import {
   FOCUS_BUS_EVENTS,
+  consumeOpenFocusRequest,
   fmtClock,
   fmtDurHuman,
   getDisplaySec,
   getElapsedSec,
+  getFocusState,
   getTodayHistory,
   pauseFocus,
   resumeFocus,
@@ -106,6 +109,29 @@ function fmtDurationMin(min: number): string {
 
 function timeStr(at: number): string {
   return new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+}
+
+function dateStr(at: number): string {
+  return new Date(at).toLocaleDateString('zh-CN', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'short',
+  })
+}
+
+/** 记录详情用：日期文案（跨天会话显示起止两天） */
+function recordDateLabel(e: FocusHistoryEntry): string {
+  const startAt = e.at - e.seconds * 1000
+  return dateStr(startAt) === dateStr(e.at) ? dateStr(e.at) : `${dateStr(startAt)} → ${dateStr(e.at)}`
+}
+
+/** 记录详情用：开始 → 结束 时间段（跨天时结束侧补日期） */
+function recordTimeRange(e: FocusHistoryEntry): string {
+  const startAt = e.at - e.seconds * 1000
+  const endLabel =
+    dateStr(startAt) === dateStr(e.at) ? timeStr(e.at) : `${dateStr(e.at)} ${timeStr(e.at)}`
+  return `${timeStr(startAt)} → ${endLabel}`
 }
 
 function hideImgOnError(e: React.SyntheticEvent<HTMLImageElement>): void {
@@ -193,6 +219,8 @@ export function FocusApp({ onBack }: FocusAppProps) {
   const [items, setItems] = React.useState<FocusContentData[]>([])
   const [loading, setLoading] = React.useState(true)
   const [history, setHistory] = React.useState<FocusHistoryEntry[]>([])
+  // 今日记录详情 Dialog（本地 FocusHistoryEntry，无服务端 id，不可单条删除，仅展示）
+  const [entryDetail, setEntryDetail] = React.useState<FocusHistoryEntry | null>(null)
 
   // ---------- 入口两步 ----------
   const [step, setStep] = React.useState<Step>('mode')
@@ -265,6 +293,17 @@ export function FocusApp({ onBack }: FocusAppProps) {
     window.addEventListener(FOCUS_BUS_EVENTS.LOGGED, onLogged)
     return () => window.removeEventListener(FOCUS_BUS_EVENTS.LOGGED, onLogged)
   }, [fetchList])
+
+  // 浮时钟详情「全屏计时」→ 页面切到本视图后打开全屏遮罩；
+  // 若事件先于本组件挂载派发（用户在其他视图点击），用 consumeOpenFocusRequest 补收
+  React.useEffect(() => {
+    const onOpenFocus = () => {
+      if (getFocusState().running) setOverlay(true)
+    }
+    window.addEventListener('sb-open-focus', onOpenFocus)
+    if (consumeOpenFocusRequest()) onOpenFocus()
+    return () => window.removeEventListener('sb-open-focus', onOpenFocus)
+  }, [])
 
   // 全屏计时锁定背景滚动（仅本页遮罩期间）
   React.useEffect(() => {
@@ -739,26 +778,30 @@ export function FocusApp({ onBack }: FocusAppProps) {
                         .slice()
                         .reverse()
                         .map((e, i) => (
-                          <div
+                          <button
                             key={`${e.at}-${i}`}
+                            type="button"
+                            aria-label={`查看「${e.name}」的专注详情`}
+                            onClick={() => setEntryDetail(e)}
                             className={cn(
-                              'flex items-center justify-between gap-3 px-4 py-3',
+                              'flex w-full items-center justify-between gap-3 px-4 py-3.5 text-left transition-colors hover:bg-accent/50',
                               i > 0 && 'border-t',
                             )}
                           >
-                            <div className="min-w-0">
-                              <p className="truncate text-sm font-medium">{e.name}</p>
-                              <p className="text-xs text-zinc-400">{timeStr(e.at)} 结束</p>
-                            </div>
-                            <p className="shrink-0 text-sm font-semibold tabular-nums">
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-sm font-medium">{e.name}</span>
+                              <span className="block text-xs text-zinc-400">{timeStr(e.at)} 结束</span>
+                            </span>
+                            <span className="shrink-0 text-sm font-semibold tabular-nums">
                               {fmtDurHuman(e.seconds)}
-                            </p>
-                          </div>
+                            </span>
+                            <ChevronRight className="size-4 shrink-0 text-zinc-300" strokeWidth={1.75} />
+                          </button>
                         ))
                     )}
                   </div>
                   <p className="mt-2 text-center text-[11px] text-zinc-400">
-                    记录列表保存在本设备 · 分钟/次数统计来自服务器
+                    点击记录可查看详情 · 记录保存在本设备，分钟/次数统计来自服务器
                   </p>
                 </section>
               )}
@@ -836,8 +879,8 @@ export function FocusApp({ onBack }: FocusAppProps) {
 
       {/* ---------- 自定义时长 Dialog ---------- */}
       <Dialog open={customOpen} onOpenChange={setCustomOpen}>
-        <DialogContent className="max-w-xs rounded-2xl">
-          <DialogHeader>
+        <DialogContent className="max-h-[85vh] overflow-y-auto rounded-2xl sm:max-w-xs">
+          <DialogHeader className="pr-10">
             <DialogTitle>自定义时长</DialogTitle>
             <DialogDescription>
               {mode === 'countdown' ? '本次倒计时的倒数时长' : '正计时的目标时长，到点自动结束'}
@@ -850,7 +893,7 @@ export function FocusApp({ onBack }: FocusAppProps) {
           </div>
           <p className="text-center text-sm text-zinc-500">共 {customH * 60 + customM} 分钟</p>
 
-          <div className="no-scrollbar flex justify-center gap-2 overflow-x-auto">
+          <div className="flex flex-wrap justify-center gap-2">
             {[15, 25, 45, 60, 90].map((d) => (
               <button
                 key={d}
@@ -895,14 +938,15 @@ export function FocusApp({ onBack }: FocusAppProps) {
           if (!o) setManageView('list')
         }}
       >
-        <DialogContent className="max-w-md rounded-2xl">
+        {/* grid-rows 三段式：标题 / 可滚动内容 / 底部操作 —— 内容超高时底部按钮始终可见 */}
+        <DialogContent className="grid max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden rounded-2xl sm:max-w-md">
           {manageView === 'list' ? (
             <>
-              <DialogHeader>
+              <DialogHeader className="pr-10">
                 <DialogTitle>管理专注内容</DialogTitle>
                 <DialogDescription>新建、编辑、排序或删除专注内容预设</DialogDescription>
               </DialogHeader>
-              <div className="flex max-h-[50vh] flex-col gap-2 overflow-y-auto">
+              <div className="flex min-h-0 flex-col gap-2 overflow-y-auto">
                 {items.map((c, i) => (
                   <div key={c.id} className="flex items-center gap-1.5 rounded-xl border p-2.5">
                     <div className="min-w-0 flex-1">
@@ -979,109 +1023,111 @@ export function FocusApp({ onBack }: FocusAppProps) {
             </>
           ) : (
             <>
-              <DialogHeader>
+              <DialogHeader className="pr-10">
                 <DialogTitle>{editing ? '编辑专注内容' : '新建专注内容'}</DialogTitle>
               </DialogHeader>
 
-              <input
-                value={name}
-                maxLength={30}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="专注内容名称，如：背第一章"
-                aria-label="专注内容名称"
-                className="h-11 w-full rounded-xl border bg-background px-3 text-base outline-none placeholder:text-zinc-400 focus-visible:ring-2 focus-visible:ring-ring"
-              />
+              <div className="flex min-h-0 flex-col gap-4 overflow-y-auto">
+                <input
+                  value={name}
+                  maxLength={30}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="专注内容名称，如：背第一章"
+                  aria-label="专注内容名称"
+                  className="h-11 w-full shrink-0 rounded-xl border bg-background px-3 text-base outline-none placeholder:text-zinc-400 focus-visible:ring-2 focus-visible:ring-ring"
+                />
 
-              <div>
-                <p className="mb-2 text-sm text-muted-foreground">默认专注时长</p>
-                <div className="no-scrollbar flex gap-2 overflow-x-auto pb-1">
-                  {DURATIONS.map((d) => (
-                    <button
-                      key={d}
-                      type="button"
-                      aria-pressed={mMinutes === d}
-                      onClick={() => setMMinutes(d)}
+                <div>
+                  <p className="mb-2 text-sm text-muted-foreground">默认专注时长</p>
+                  <div className="flex flex-wrap gap-2">
+                    {DURATIONS.map((d) => (
+                      <button
+                        key={d}
+                        type="button"
+                        aria-pressed={mMinutes === d}
+                        onClick={() => setMMinutes(d)}
+                        className={cn(
+                          'flex h-10 shrink-0 items-center rounded-xl border bg-white px-4 text-sm transition-colors',
+                          mMinutes === d
+                            ? 'border-zinc-900 font-semibold ring-2 ring-zinc-900/10'
+                            : 'border-zinc-200 text-foreground',
+                        )}
+                      >
+                        {d}min
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div>
+                  <p className="mb-2 text-sm text-muted-foreground">选择背景（全屏计时展示）</p>
+                  <div className="grid grid-cols-3 gap-3">
+                    <label
                       className={cn(
-                        'flex h-10 shrink-0 items-center rounded-xl border bg-white px-4 text-sm transition-colors',
-                        mMinutes === d
-                          ? 'border-zinc-900 font-semibold ring-2 ring-zinc-900/10'
-                          : 'border-zinc-200 text-foreground',
+                        'relative flex aspect-square cursor-pointer flex-col items-center justify-center gap-1 overflow-hidden rounded-xl border-2 text-zinc-500 transition',
+                        localBg && bg === localBg
+                          ? 'border-zinc-900'
+                          : 'border-dashed border-zinc-300 hover:border-zinc-400',
                       )}
                     >
-                      {d}min
+                      {localBg ? (
+                        <img
+                          src={localBg}
+                          alt="自定义背景"
+                          onError={hideImgOnError}
+                          className="absolute inset-0 h-full w-full object-cover"
+                        />
+                      ) : (
+                        <>
+                          <Plus className="size-5" strokeWidth={1.75} />
+                          <span className="text-xs">本地图</span>
+                        </>
+                      )}
+                      <input
+                        type="file"
+                        accept="image/*"
+                        className="hidden"
+                        aria-label="添加本地图片"
+                        onChange={(e) => void onPickImage(e)}
+                      />
+                    </label>
+                    {BG_PRESETS.map((p) => (
+                      <button
+                        key={p.key}
+                        type="button"
+                        aria-label={`背景 ${p.key}`}
+                        aria-pressed={bg === p.key}
+                        onClick={() => setBg(p.key)}
+                        className={cn(
+                          'relative aspect-square overflow-hidden rounded-xl border-2 transition',
+                          bg === p.key ? 'border-zinc-900' : 'border-transparent',
+                        )}
+                      >
+                        <img
+                          src={p.src}
+                          alt=""
+                          onError={hideImgOnError}
+                          className="absolute inset-0 h-full w-full object-cover"
+                        />
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      aria-label="无背景"
+                      aria-pressed={bg === ''}
+                      onClick={() => setBg('')}
+                      className={cn(
+                        'flex aspect-square items-center justify-center overflow-hidden rounded-xl border-2 bg-gradient-to-br from-zinc-100 to-zinc-200 text-xs text-zinc-500 transition',
+                        bg === '' ? 'border-zinc-900' : 'border-transparent',
+                      )}
+                    >
+                      无背景
                     </button>
-                  ))}
+                  </div>
                 </div>
               </div>
 
-              <div>
-                <p className="mb-2 text-sm text-muted-foreground">选择背景（全屏计时展示）</p>
-                <div className="grid grid-cols-4 gap-2">
-                  <label
-                    className={cn(
-                      'relative flex aspect-square cursor-pointer flex-col items-center justify-center gap-1 overflow-hidden rounded-xl border-2 text-zinc-500 transition',
-                      localBg && bg === localBg
-                        ? 'border-zinc-900'
-                        : 'border-dashed border-zinc-300 hover:border-zinc-400',
-                    )}
-                  >
-                    {localBg ? (
-                      <img
-                        src={localBg}
-                        alt="自定义背景"
-                        onError={hideImgOnError}
-                        className="absolute inset-0 h-full w-full object-cover"
-                      />
-                    ) : (
-                      <>
-                        <Plus className="size-5" strokeWidth={1.75} />
-                        <span className="text-xs">本地图</span>
-                      </>
-                    )}
-                    <input
-                      type="file"
-                      accept="image/*"
-                      className="hidden"
-                      aria-label="添加本地图片"
-                      onChange={(e) => void onPickImage(e)}
-                    />
-                  </label>
-                  {BG_PRESETS.map((p) => (
-                    <button
-                      key={p.key}
-                      type="button"
-                      aria-label={`背景 ${p.key}`}
-                      aria-pressed={bg === p.key}
-                      onClick={() => setBg(p.key)}
-                      className={cn(
-                        'relative aspect-square overflow-hidden rounded-xl border-2 transition',
-                        bg === p.key ? 'border-zinc-900' : 'border-transparent',
-                      )}
-                    >
-                      <img
-                        src={p.src}
-                        alt=""
-                        onError={hideImgOnError}
-                        className="absolute inset-0 h-full w-full object-cover"
-                      />
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    aria-label="无背景"
-                    aria-pressed={bg === ''}
-                    onClick={() => setBg('')}
-                    className={cn(
-                      'flex aspect-square items-center justify-center overflow-hidden rounded-xl border-2 bg-gradient-to-br from-zinc-100 to-zinc-200 text-xs text-zinc-500 transition',
-                      bg === '' ? 'border-zinc-900' : 'border-transparent',
-                    )}
-                  >
-                    无背景
-                  </button>
-                </div>
-              </div>
-
-              <div className="flex gap-2">
+              <div className="flex shrink-0 gap-2">
                 <button
                   type="button"
                   onClick={() => setManageView('list')}
@@ -1098,6 +1144,45 @@ export function FocusApp({ onBack }: FocusAppProps) {
                   {saving ? <Loader2 className="mx-auto size-4 animate-spin" /> : '保存'}
                 </button>
               </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* ---------- 今日记录详情 Dialog ---------- */}
+      {/* 说明：本机记录（localStorage）没有服务端 id，/api/focus/log 也无单条删除接口，故仅展示详情 */}
+      <Dialog
+        open={entryDetail !== null}
+        onOpenChange={(o) => {
+          if (!o) setEntryDetail(null)
+        }}
+      >
+        <DialogContent className="rounded-2xl sm:max-w-sm">
+          {entryDetail && (
+            <>
+              <DialogHeader className="pr-10">
+                <DialogTitle>专注记录详情</DialogTitle>
+                <DialogDescription>本次专注会话的详细信息</DialogDescription>
+              </DialogHeader>
+              <div className="rounded-2xl bg-zinc-900 p-4 text-white">
+                <p className="truncate text-base font-bold">{entryDetail.name || '自由专注'}</p>
+                <p className="mt-1 text-3xl font-bold tabular-nums">{fmtDurHuman(entryDetail.seconds)}</p>
+              </div>
+              <dl className="flex flex-col gap-2.5 rounded-2xl border p-4 text-sm">
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="shrink-0 text-muted-foreground">日期</dt>
+                  <dd className="text-right font-medium">{recordDateLabel(entryDetail)}</dd>
+                </div>
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="shrink-0 text-muted-foreground">时间</dt>
+                  <dd className="text-right font-medium tabular-nums">{recordTimeRange(entryDetail)}</dd>
+                </div>
+                <div className="flex items-start justify-between gap-3">
+                  <dt className="shrink-0 text-muted-foreground">时长</dt>
+                  <dd className="text-right font-semibold tabular-nums">{fmtDurHuman(entryDetail.seconds)}</dd>
+                </div>
+              </dl>
+              <p className="text-center text-[11px] text-zinc-400">专注记录保存在本设备</p>
             </>
           )}
         </DialogContent>

@@ -2,21 +2,25 @@
 
 // 主页（1:1 复刻参考 App 布局）：
 // - 顶栏：汉堡菜单(侧边栏) / 标题 / 搜索 / 更多(⋯)
-// - 标题行：当前项目名 + 待复习胶囊(蓝点) + 日历按钮
+// - 标题行：当前项目名 + 待复习胶囊 + 日历按钮（复习日历）
 // - 卡片列表：文件行（图标 + 标题 + 日期 + ⋯ 菜单），搜索结果高亮标注
-// - 底部 Dock：首页 | 黑色大 + | 资料（学习工具面板）
+// - 底部 Dock：首页 | 黑色大 +（导入内容）| 复习
+// - 排序模式（自定义排序）：长按拖动卡片调整顺序
 // - 侧边栏（截图5）：账号头 + 常用功能 + 项目(全部/未分类/最近/自定义项目, 可折叠/搜索/编辑)
 // - 批量选择模式：全选 + 批量删除/移动
 
 import * as React from 'react'
 import { formatDistanceToNow } from 'date-fns'
 import { zhCN } from 'date-fns/locale'
+import { motion, Reorder, useDragControls } from 'framer-motion'
 import {
   AlignLeft,
   ArrowUpDown,
   BarChart3,
   BookX,
+  CalendarCheck,
   CalendarClock,
+  CalendarDays,
   ChevronDown,
   ChevronRight,
   ClipboardList,
@@ -24,8 +28,8 @@ import {
   FileText,
   Folder,
   FolderOpen,
+  GripVertical,
   LayoutGrid,
-  Layers,
   Menu,
   Pencil,
   Pin,
@@ -41,7 +45,6 @@ import {
   User,
   X,
 } from 'lucide-react'
-import { toast } from 'sonner'
 
 import type { AccountData, CardData, ProjectData } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -83,6 +86,12 @@ interface HomeViewProps {
   onActiveCategoryChange: (id: string) => void
   onOpenCard: (card: CardData) => void
   onNew: () => void
+  /** 底部 Dock 黑色 + 按钮：打开「导入内容」面板（文件/粘贴/拍照/图片识别） */
+  onOpenImport: () => void
+  /** 待复习胶囊：打开「待复习」列表 */
+  onOpenReviewDue: () => void
+  /** 独立日历按钮：打开复习统计/日历 */
+  onOpenCalendar: () => void
   onOpenSettings: () => void
   onOpenAccount: () => void
   onLogout: () => void
@@ -90,7 +99,8 @@ interface HomeViewProps {
   onRenameCard: (card: CardData, title: string) => void
   onTogglePin: (card: CardData) => void
   onMoveCard: (card: CardData, categoryId: string) => void
-  onDuplicateCard: (card: CardData) => void
+  /** 创建副本到指定项目（categoryId 为空串 = 未分类；不传则沿用卡片原项目） */
+  onDuplicateCard: (card: CardData, categoryId?: string) => void
   onDeleteCard: (id: string) => void
   onBatchDelete: (ids: string[]) => void
   onBatchMove: (ids: string[], categoryId: string) => void
@@ -130,9 +140,11 @@ export function HomeView({
   onActiveCategoryChange,
   onOpenCard,
   onNew,
+  onOpenImport,
+  onOpenReviewDue,
+  onOpenCalendar,
   onOpenSettings,
   onOpenAccount,
-  onLogout,
   onShareCard,
   onRenameCard,
   onTogglePin,
@@ -171,8 +183,14 @@ export function HomeView({
   const [moveToProj, setMoveToProj] = React.useState<{ ids: string[] } | null>(null)
   const [renameCard, setRenameCard] = React.useState<{ id: string; title: string } | null>(null)
   const [deleteCard, setDeleteCard] = React.useState<CardData | null>(null)
-  const [toolsOpen, setToolsOpen] = React.useState(false)
   const [sortOpen, setSortOpen] = React.useState(false)
+  /** 自定义排序 → 拖动排序模式（顶栏出现提示条，列表可长按拖动） */
+  const [sortDragMode, setSortDragMode] = React.useState(false)
+  /** 拖拽过程中的临时顺序（未提交），null = 未在拖拽 */
+  const [dragIds, setDragIds] = React.useState<string[] | null>(null)
+  /** 创建副本弹窗：目标卡片 + 目标项目 */
+  const [duplicateCard, setDuplicateCard] = React.useState<CardData | null>(null)
+  const [dupTarget, setDupTarget] = React.useState('__uncat__')
   const [batchMoveOpen, setBatchMoveOpen] = React.useState(false)
   const [moveTarget, setMoveTarget] = React.useState('__uncat__')
 
@@ -254,6 +272,64 @@ export function HomeView({
     })
   }
   const allSelected = visibleCards.length > 0 && visibleCards.every((c) => selected.has(c.id))
+
+  // ---------- 排序模式（自定义排序：长按拖动） ----------
+  const cardsById = React.useMemo(() => new Map(cards.map((c) => [c.id, c])), [cards])
+  // 拖拽过程中使用未提交的临时顺序，松手后交回父组件按 ord 排序
+  const orderedCards = React.useMemo(
+    () => (dragIds ? dragIds.map((id) => cardsById.get(id)!).filter(Boolean) : visibleCards),
+    [dragIds, cardsById, visibleCards],
+  )
+  // 过滤条件/排序方式变化时丢弃未提交的拖拽顺序
+  React.useEffect(() => {
+    setDragIds(null)
+  }, [query, activeCategoryId, sortMode, sortDragMode])
+
+  const commitDragOrder = () => {
+    if (dragIds) {
+      onReorderCards(dragIds)
+      setDragIds(null)
+    }
+  }
+
+  const exitSortMode = () => {
+    commitDragOrder()
+    setSortDragMode(false)
+  }
+
+  // ⋯ 菜单里的「上移/下移」：在当前展示顺序上交换（拖拽中则基于临时顺序）
+  const nudgeCard = (cardId: string, dir: -1 | 1) => {
+    const ids = [...(dragIds ?? visibleCards.map((c) => c.id))]
+    const i = ids.indexOf(cardId)
+    const j = i + dir
+    if (i < 0 || j < 0 || j >= ids.length) return
+    ;[ids[i], ids[j]] = [ids[j], ids[i]]
+    onReorderCards(ids)
+    setDragIds(null)
+  }
+
+  // 卡片行公共 props（普通列表 / 拖拽排序列表共用）
+  const cardRowProps = (card: CardData) => ({
+    card,
+    projectName: projects.find((p) => p.id === card.categoryId)?.name,
+    query,
+    excerpt: excerptOf(card),
+    batchMode,
+    checked: selected.has(card.id),
+    sortMode: sortDragMode,
+    onToggle: () => toggleSelect(card.id),
+    onOpen: () => onOpenCard(card),
+    onShare: () => onShareCard(card),
+    onRename: () => setRenameCard({ id: card.id, title: card.title }),
+    onTogglePin: () => onTogglePin(card),
+    onMove: () => setMoveToProj({ ids: [card.id] }),
+    onDuplicate: () => {
+      setDupTarget('__uncat__')
+      setDuplicateCard(card)
+    },
+    onDelete: () => setDeleteCard(card),
+    onReorder: (dir: -1 | 1) => nudgeCard(card.id, dir),
+  })
 
   // ---------- sidebar ----------
   const handleToolClick = (key: string) => {
@@ -365,7 +441,12 @@ export function HomeView({
                 )}
                 <Popover open={sortOpen} onOpenChange={setSortOpen}>
                   <PopoverTrigger asChild>
-                    <Button variant="ghost" size="icon" aria-label="排序">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label="排序"
+                      className={cn(sortDragMode && 'text-emerald-600')}
+                    >
                       <ArrowUpDown className="size-5" strokeWidth={1.75} />
                     </Button>
                   </PopoverTrigger>
@@ -387,7 +468,8 @@ export function HomeView({
                         onClick={() => {
                           setSortMode(s.key)
                           setSortOpen(false)
-                          if (s.key === 'custom') toast.info('自定义排序：用每张卡片 ⋯ 菜单里的「上移/下移」调整顺序')
+                          // 自定义排序 → 进入拖动排序模式；其他排序自动退出
+                          setSortDragMode(s.key === 'custom')
                         }}
                       >
                         {s.label}
@@ -445,27 +527,56 @@ export function HomeView({
             </>
           )}
         </div>
+
+        {/* 排序模式提示条 */}
+        {sortDragMode && (
+          <div className="border-t border-border bg-foreground text-background">
+            <div className="mx-auto flex h-11 w-full max-w-2xl items-center gap-2 px-4">
+              <GripVertical className="size-4 shrink-0" strokeWidth={2} aria-hidden />
+              <p className="min-w-0 flex-1 truncate text-xs font-medium">
+                排序模式 · 长按拖动卡片调整顺序
+              </p>
+              <Button
+                size="sm"
+                className="h-7 rounded-full bg-background px-4 text-xs font-semibold text-foreground hover:bg-background/90"
+                onClick={exitSortMode}
+              >
+                完成
+              </Button>
+            </div>
+          </div>
+        )}
       </header>
 
       {/* ================= 主内容 ================= */}
       <main className="mx-auto w-full max-w-2xl flex-1 px-4 pb-32 pt-5">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <h1 className="text-3xl font-extrabold tracking-tight">{titleText}</h1>
-          <button
-            type="button"
-            aria-label={`待复习 ${dueCount} 张`}
-            onClick={onOpenReviewStats}
-            className="flex items-center gap-2 rounded-full border border-border bg-card px-3.5 py-2 text-sm transition-colors hover:bg-accent"
-          >
-            待复习
-            {dueCount > 0 && (
-              <span className="relative flex size-5 items-center justify-center rounded-full bg-foreground text-[10px] font-bold text-background">
-                {dueCount > 99 ? '99+' : dueCount}
-                <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-emerald-500 ring-2 ring-background" />
-              </span>
-            )}
-            <CalendarClock className="size-4 text-muted-foreground" strokeWidth={1.75} />
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              aria-label={`待复习 ${dueCount} 张`}
+              onClick={onOpenReviewDue}
+              className="flex items-center gap-2 rounded-full border border-border bg-card px-3.5 py-2 text-sm transition-colors hover:bg-accent"
+            >
+              待复习
+              {dueCount > 0 && (
+                <span className="relative flex size-5 items-center justify-center rounded-full bg-foreground text-[10px] font-bold text-background">
+                  {dueCount > 99 ? '99+' : dueCount}
+                  <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-emerald-500 ring-2 ring-background" />
+                </span>
+              )}
+              <CalendarClock className="size-4 text-muted-foreground" strokeWidth={1.75} />
+            </button>
+            <button
+              type="button"
+              aria-label="复习日历"
+              onClick={onOpenCalendar}
+              className="flex items-center justify-center rounded-full border border-border bg-card p-2.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+            >
+              <CalendarDays className="size-4" strokeWidth={1.75} />
+            </button>
+          </div>
         </div>
 
         {loading ? (
@@ -484,68 +595,79 @@ export function HomeView({
               {query ? '换个关键词试试，或点击 ⋯ 新建卡片' : '点击下方黑色 + 按钮创建'}
             </p>
           </div>
-        ) : (
-          <ul className="mt-5 space-y-3" role="list" aria-label="背书卡列表">
-            {visibleCards.map((card) => (
-              <CardRow
+        ) : sortDragMode ? (
+          <Reorder.Group
+            axis="y"
+            values={dragIds ?? visibleCards.map((c) => c.id)}
+            onReorder={setDragIds}
+            as="div"
+            className="mt-5 space-y-3"
+            aria-label="背书卡列表"
+          >
+            {orderedCards.map((card) => (
+              <SortableCardRow
                 key={card.id}
-                card={card}
-                projectName={projects.find((p) => p.id === card.categoryId)?.name}
-                query={query}
-                excerpt={excerptOf(card)}
-                batchMode={batchMode}
-                checked={selected.has(card.id)}
-                onToggle={() => toggleSelect(card.id)}
-                onOpen={() => onOpenCard(card)}
-                onShare={() => onShareCard(card)}
-                onRename={() => setRenameCard({ id: card.id, title: card.title })}
-                onTogglePin={() => onTogglePin(card)}
-                onMove={() => setMoveToProj({ ids: [card.id] })}
-                onDuplicate={() => onDuplicateCard(card)}
-                onDelete={() => setDeleteCard(card)}
-                onReorder={(dir) => {
-                  const ids = visibleCards.map((c) => c.id)
-                  const i = ids.indexOf(card.id)
-                  const j = i + dir
-                  if (j < 0 || j >= ids.length) return
-                  ;[ids[i], ids[j]] = [ids[j], ids[i]]
-                  onReorderCards(ids)
-                }}
+                {...cardRowProps(card)}
+                onCommitDrag={commitDragOrder}
               />
             ))}
-          </ul>
+          </Reorder.Group>
+        ) : (
+          <div className="mt-5 space-y-3" role="list" aria-label="背书卡列表">
+            {visibleCards.map((card) => (
+              <CardRow key={card.id} {...cardRowProps(card)} />
+            ))}
+          </div>
         )}
       </main>
 
       {/* ================= 底部 Dock ================= */}
       <div className="pointer-events-none fixed inset-x-0 bottom-4 z-40 flex justify-center px-4">
-        <div className="pointer-events-auto flex w-full max-w-md items-center justify-between rounded-full border border-border bg-background/95 px-6 py-2.5 shadow-xl backdrop-blur">
+        <nav
+          aria-label="主导航"
+          className="pointer-events-auto flex w-full max-w-md items-center justify-between rounded-full border border-border bg-background/95 px-3 py-2 shadow-xl backdrop-blur"
+        >
+          {/* 首页（当前页）：回到顶部 */}
           <button
             type="button"
             aria-label="首页"
-            className="flex flex-col items-center gap-0.5 text-foreground"
+            aria-current="page"
+            onClick={() => window.scrollTo({ top: 0, behavior: 'smooth' })}
+            className="relative flex min-w-[72px] flex-col items-center justify-center gap-0.5 rounded-full px-4 py-1.5 transition-transform active:scale-95"
           >
-            <LayoutGrid className="size-5" strokeWidth={2} aria-hidden />
-            <span className="text-[10px] font-medium">首页</span>
+            <motion.span
+              layoutId="dock-active"
+              transition={{ type: 'spring', stiffness: 500, damping: 40 }}
+              aria-hidden
+              className="absolute inset-0 rounded-full bg-primary"
+            />
+            <span className="relative z-10 flex flex-col items-center gap-0.5 text-primary-foreground">
+              <LayoutGrid className="size-5" strokeWidth={2} aria-hidden />
+              <span className="text-[10px] font-semibold leading-none">首页</span>
+            </span>
           </button>
+
+          {/* 导入内容 */}
           <button
             type="button"
-            aria-label="新建背书卡"
-            onClick={onNew}
-            className="flex size-14 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg shadow-black/25 transition-transform hover:scale-105 active:scale-95"
+            aria-label="导入内容"
+            onClick={onOpenImport}
+            className="flex size-14 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg shadow-black/25 transition-transform hover:scale-105 active:scale-95"
           >
             <Plus className="size-6" strokeWidth={2.25} aria-hidden />
           </button>
+
+          {/* 复习 */}
           <button
             type="button"
-            aria-label="资料与学习工具"
-            onClick={() => setToolsOpen(true)}
-            className="flex flex-col items-center gap-0.5 text-foreground"
+            aria-label="复习"
+            onClick={onOpenReviewStats}
+            className="flex min-w-[72px] flex-col items-center justify-center gap-0.5 rounded-full px-4 py-1.5 text-foreground transition-transform active:scale-95"
           >
-            <Layers className="size-5" strokeWidth={2} aria-hidden />
-            <span className="text-[10px] font-medium">资料</span>
+            <CalendarCheck className="size-5" strokeWidth={2} aria-hidden />
+            <span className="text-[10px] font-medium leading-none">复习</span>
           </button>
-        </div>
+        </nav>
       </div>
 
       {/* ================= 侧边栏（截图5） ================= */}
@@ -746,47 +868,6 @@ export function HomeView({
         </div>
       )}
 
-      {/* ================= 资料面板（学习工具） ================= */}
-      {toolsOpen && (
-        <div className="fixed inset-0 z-50 flex items-end bg-black/45" onClick={() => setToolsOpen(false)} role="presentation">
-          <div
-            role="dialog"
-            aria-label="学习工具"
-            className="mx-auto w-full max-w-2xl rounded-t-3xl bg-background p-5 pb-10 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="mx-auto mb-4 h-1.5 w-12 rounded-full bg-muted" />
-            <p className="mb-3 text-base font-bold">学习工具</p>
-            <div className="grid grid-cols-4 gap-3">
-              {COMMON_TOOLS.map((tool) => (
-                <button
-                  key={tool.key}
-                  type="button"
-                  onClick={() => {
-                    setToolsOpen(false)
-                    handleToolClick(tool.key)
-                  }}
-                  className="flex flex-col items-center gap-2 rounded-2xl border border-border bg-card py-4 transition-colors hover:bg-accent"
-                >
-                  <tool.icon className="size-6 text-foreground/80" strokeWidth={1.75} aria-hidden />
-                  <span className="text-xs">{tool.label}</span>
-                </button>
-              ))}
-            </div>
-            <Button
-              variant="outline"
-              className="mt-5 w-full rounded-full"
-              onClick={() => {
-                setToolsOpen(false)
-                onLogout()
-              }}
-            >
-              退出登录
-            </Button>
-          </div>
-        </div>
-      )}
-
       {/* ================= 弹窗集合 ================= */}
       {/* 新建项目 */}
       <Dialog open={newProjOpen} onOpenChange={setNewProjOpen}>
@@ -928,6 +1009,44 @@ export function HomeView({
         </DialogContent>
       </Dialog>
 
+      {/* 创建副本到项目 */}
+      <Dialog open={!!duplicateCard} onOpenChange={(v) => !v && setDuplicateCard(null)}>
+        <DialogContent className="rounded-2xl sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>创建副本</DialogTitle>
+          </DialogHeader>
+          <p className="-mt-1 text-sm text-muted-foreground">
+            「{duplicateCard?.title}」将复制到所选项目。
+          </p>
+          <div className="text-sm">
+            <p className="mb-1.5 font-medium">复制到项目</p>
+            <Select value={dupTarget} onValueChange={setDupTarget}>
+              <SelectTrigger className="h-10 w-full rounded-xl"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__uncat__">未分类</SelectItem>
+                {projects.map((p) => (
+                  <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setDuplicateCard(null)}>取消</Button>
+            <Button
+              className="rounded-full bg-primary"
+              onClick={() => {
+                if (duplicateCard) {
+                  onDuplicateCard(duplicateCard, dupTarget === '__uncat__' ? '' : dupTarget)
+                }
+                setDuplicateCard(null)
+              }}
+            >
+              创建
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* 重命名卡片 */}
       <Dialog open={!!renameCard} onOpenChange={(v) => !v && setRenameCard(null)}>
         <DialogContent className="rounded-2xl sm:max-w-sm">
@@ -1057,29 +1176,15 @@ function ProjRow({
 }
 
 // 卡片行（截图6）：文件图标 + 标题 + 日期 + ⋯ 菜单
-function CardRow({
-  card,
-  projectName,
-  query,
-  excerpt,
-  batchMode,
-  checked,
-  onToggle,
-  onOpen,
-  onShare,
-  onRename,
-  onTogglePin,
-  onMove,
-  onDuplicate,
-  onDelete,
-  onReorder,
-}: {
+interface CardRowProps {
   card: CardData
   projectName?: string
   query: string
   excerpt: { before: string; hit: string; after: string } | null
   batchMode: boolean
   checked: boolean
+  /** 排序模式：点击不打开卡片，行左侧显示拖动手柄提示 */
+  sortMode: boolean
   onToggle: () => void
   onOpen: () => void
   onShare: () => void
@@ -1089,7 +1194,26 @@ function CardRow({
   onDuplicate: () => void
   onDelete: () => void
   onReorder: (dir: -1 | 1) => void
-}) {
+}
+
+function CardRow({
+  card,
+  projectName,
+  query,
+  excerpt,
+  batchMode,
+  checked,
+  sortMode,
+  onToggle,
+  onOpen,
+  onShare,
+  onRename,
+  onTogglePin,
+  onMove,
+  onDuplicate,
+  onDelete,
+  onReorder,
+}: CardRowProps) {
   const [menuOpen, setMenuOpen] = React.useState(false)
 
   const titleWithHighlight = (text: string) => {
@@ -1109,23 +1233,33 @@ function CardRow({
   }
 
   return (
-    <li
+    <div
+      role="listitem"
       className={cn(
-        'group relative flex cursor-pointer items-center gap-3 rounded-2xl border border-border bg-card p-4 shadow-sm transition-all hover:shadow-md',
+        'group relative flex items-center gap-3 rounded-2xl border border-border bg-card p-4 shadow-sm transition-all hover:shadow-md',
+        sortMode ? 'cursor-grab select-none [-webkit-touch-callout:none]' : 'cursor-pointer',
         checked && 'border-emerald-600/60 ring-1 ring-emerald-600/40',
       )}
-      onClick={() => (batchMode ? onToggle() : onOpen())}
-      role="button"
+      onClick={() => {
+        if (batchMode) {
+          onToggle()
+          return
+        }
+        if (!sortMode) onOpen()
+      }}
       tabIndex={0}
       aria-label={`打开背书卡：${card.title}`}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
           if (batchMode) onToggle()
-          else onOpen()
+          else if (!sortMode) onOpen()
         }
       }}
     >
+      {sortMode && (
+        <GripVertical className="size-4 shrink-0 text-muted-foreground/40" strokeWidth={1.75} aria-hidden />
+      )}
       {batchMode && (
         <span
           aria-hidden
@@ -1251,7 +1385,72 @@ function CardRow({
           </button>
         </PopoverContent>
       </Popover>
-    </li>
+    </div>
+  )
+}
+
+// 排序模式行：Reorder.Item 包裹卡片行，长按 350ms 触发拖动（移动超过阈值取消）。
+// 行内 touch-action: none 保证移动端长按拖动不被页面滚动打断；
+// onContextMenu 屏蔽长按弹出的系统菜单。
+function SortableCardRow({
+  onCommitDrag,
+  ...row
+}: CardRowProps & { onCommitDrag: () => void }) {
+  const controls = useDragControls()
+  const holdTimer = React.useRef<number | null>(null)
+  const holdOrigin = React.useRef<{ x: number; y: number } | null>(null)
+
+  const clearHold = () => {
+    if (holdTimer.current !== null) {
+      window.clearTimeout(holdTimer.current)
+      holdTimer.current = null
+    }
+    holdOrigin.current = null
+  }
+
+  // 卸载时兜底清理定时器
+  React.useEffect(() => clearHold, [])
+
+  const handlePointerDown = (e: React.PointerEvent) => {
+    // ⋯ 菜单等交互元素上不触发拖动
+    const target = e.target as HTMLElement
+    if (target.closest('button, a, input, textarea, select, [role="menu"]')) return
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    clearHold()
+    holdOrigin.current = { x: e.clientX, y: e.clientY }
+    const pe = e
+    holdTimer.current = window.setTimeout(() => {
+      holdTimer.current = null
+      holdOrigin.current = null
+      controls.start(pe)
+    }, 350)
+  }
+
+  const handlePointerMove = (e: React.PointerEvent) => {
+    // 长按等待期内移动超过阈值 → 取消（视为滚动/点击意图）
+    const origin = holdOrigin.current
+    if (!origin) return
+    if (Math.abs(e.clientX - origin.x) > 8 || Math.abs(e.clientY - origin.y) > 8) clearHold()
+  }
+
+  return (
+    <Reorder.Item
+      value={row.card.id}
+      as="div"
+      dragListener={false}
+      dragControls={controls}
+      className="rounded-2xl outline-none"
+      style={{ touchAction: 'none' }}
+      whileDrag={{ scale: 1.02, boxShadow: '0 18px 36px rgba(0,0,0,0.18)', zIndex: 30 }}
+      onDragEnd={onCommitDrag}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={clearHold}
+      onPointerCancel={clearHold}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <CardRow {...row} />
+    </Reorder.Item>
   )
 }
 

@@ -7,6 +7,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getSessionUser } from '@/lib/auth'
 import { normalizeStrokeInput, serializeCard } from '@/lib/card'
+import { normKeywordEntries } from '@/lib/cloze'
 import type { Stroke } from '@/lib/types'
 
 export async function GET(
@@ -50,9 +51,8 @@ export async function PATCH(
       data.content = body.content
     }
     if (Array.isArray(body?.keywords)) {
-      data.keywords = JSON.stringify(
-        body.keywords.filter((k: unknown): k is string => typeof k === 'string')
-      )
+      // 位置感知挖空：string（全量）+ {t, occ}（单次出现）都合法
+      data.keywords = JSON.stringify(normKeywordEntries(body.keywords))
     }
     // 涂鸦 strokes: accepts both formats — legacy [[x,y],...] point arrays and
     // styled { pts:[[x,y],...], color, width, tool } doodle strokes. Points are

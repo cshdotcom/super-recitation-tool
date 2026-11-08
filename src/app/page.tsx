@@ -6,7 +6,8 @@ import { useTheme } from 'next-themes'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { AccountData, CardData, Mastery, MaterialBlock, ProjectData, SettingsData } from '@/lib/types'
+import type { AccountData, CardData, KwEntry, Mastery, MaterialBlock, ProjectData, SettingsData } from '@/lib/types'
+import { kwText, normKeywordEntries } from '@/lib/cloze'
 import { extractClozeMarks } from '@/lib/editor-cloze'
 import { HomeView } from '@/components/recitation/home-view'
 import { ReaderView } from '@/components/recitation/reader-view'
@@ -59,6 +60,10 @@ const RecycleBinView = NextDynamic(
   () => import('@/components/recitation/recycle-bin-view').then((m) => m.RecycleBinView),
   { ssr: false, loading: () => <PageSkeleton /> },
 )
+const ReviewDueView = NextDynamic(
+  () => import('@/components/recitation/review-due-view').then((m) => m.ReviewDueView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
 
 function PageSkeleton() {
   return (
@@ -76,6 +81,7 @@ type View =
   | 'report'
   | 'favorites'
   | 'review-stats'
+  | 'review-due'
   | 'plan-editor'
   | 'review-overview'
   | 'plan-manager'
@@ -153,19 +159,13 @@ export default function Page() {
     }
   }, [setTheme])
 
-  // 待复习数量：复习周期内（最近一次评估非 none）的卡片数
+  // 待复习数量：/api/review/due（有复习记录且未被忽略/延后提醒的卡片数）
   React.useEffect(() => {
     if (!authed) return
-    fetch(`/api/review?perCard=1&tzOffset=${new Date().getTimezoneOffset()}`)
-      .then((r) => r.json())
-      .then((res: { statuses?: Record<string, string> }) => {
-        const st = res?.statuses ?? {}
-        setDueCount(
-          cards.filter((c) => {
-            const a = st[c.id]
-            return a === 'familiar' || a === 'fuzzy' || a === 'forget'
-          }).length,
-        )
+    fetch('/api/review/due')
+      .then((r) => (r.ok ? r.json() : { cards: [] }))
+      .then((res: { cards?: { id: string }[] }) => {
+        setDueCount(res?.cards?.length ?? 0)
       })
       .catch(() => {})
   }, [authed, cards])
@@ -256,9 +256,17 @@ export default function Page() {
       const title = (editorTitle || editorDraft?.title || '').trim() || '未命名卡片'
 
       if (editorMode === 'edit' && currentCard) {
-        // 编辑已有卡：保留仍存在于正文中的旧挖空 + 新的 {{}} 标记
-        const kept = currentCard.keywords.filter((k) => content.includes(k))
-        const keywords = Array.from(new Set([...kept, ...marks]))
+        // 编辑已有卡：保留仍存在于正文中的旧挖空 + 新的 {{}} 标记（按 位置+词 去重）
+        const seen = new Set<string>()
+        const merged: KwEntry[] = []
+        for (const e of [...normKeywordEntries(currentCard.keywords), ...normKeywordEntries(marks)]) {
+          if (!content.includes(kwText(e))) continue
+          const key = typeof e === 'string' ? e : `${e.t}\u0000${e.occ}`
+          if (seen.has(key)) continue
+          seen.add(key)
+          merged.push(e)
+        }
+        const keywords = merged
         const tid = toast.loading('正在保存修改…')
         try {
           const res = await fetch(`/api/cards/${encodeURIComponent(currentCard.id)}`, {
@@ -291,6 +299,7 @@ export default function Page() {
             title,
             content,
             keywords: marks,
+            blocks,
             categoryId:
               activeCategoryId && activeCategoryId !== 'recent' && activeCategoryId !== 'uncategorized'
                 ? activeCategoryId
@@ -442,7 +451,7 @@ export default function Page() {
   )
 
   const handleDuplicateCard = React.useCallback(
-    async (card: CardData) => {
+    async (card: CardData, categoryId?: string) => {
       const tid = toast.loading('正在创建副本…')
       try {
         const res = await fetch('/api/cards', {
@@ -452,6 +461,8 @@ export default function Page() {
             title: `${card.title} 副本`,
             content: card.content,
             keywords: card.keywords,
+            blocks: card.blocks,
+            ...(typeof categoryId === 'string' ? { categoryId } : {}),
           }),
         })
         if (!res.ok) throw new Error('创建失败')
@@ -659,6 +670,34 @@ export default function Page() {
     setImportOpen(false)
   }, [])
 
+  // 浮时钟「全屏计时」事件 → 进入专注视图
+  React.useEffect(() => {
+    const onOpenFocus = () => setView('focus')
+    window.addEventListener('sb-open-focus', onOpenFocus)
+    return () => window.removeEventListener('sb-open-focus', onOpenFocus)
+  }, [])
+
+  // 语音偏好变更事件（聊天工具等派发）→ 同步本地 settings 状态
+  React.useEffect(() => {
+    const onVoicePrefs = (e: Event) => {
+      const detail = (e as CustomEvent).detail as
+        | { context: string; tts?: unknown; asr?: unknown }
+        | undefined
+      if (!detail?.context) return
+      setSettings((prev) => {
+        if (!prev) return prev
+        const prefs = { ...(prev.voicePrefs || {}) }
+        const cur = { ...(prefs[detail.context] || {}) }
+        if (detail.tts) cur.tts = detail.tts as never
+        if (detail.asr) cur.asr = detail.asr as never
+        prefs[detail.context] = cur
+        return { ...prev, voicePrefs: prefs }
+      })
+    }
+    window.addEventListener('sb-voice-prefs-changed', onVoicePrefs)
+    return () => window.removeEventListener('sb-voice-prefs-changed', onVoicePrefs)
+  }, [])
+
   // ---------- gated rendering ----------
   if (authLoading || !authed) {
     return (
@@ -699,6 +738,9 @@ export default function Page() {
           onActiveCategoryChange={setActiveCategoryId}
           onOpenCard={handleOpenCard}
           onNew={handleNewCard}
+          onOpenImport={() => setImportOpen(true)}
+          onOpenReviewDue={() => setView('review-due')}
+          onOpenCalendar={() => setView('review-stats')}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenAccount={() => setAccountOpen(true)}
           onLogout={handleLogout}
@@ -712,7 +754,7 @@ export default function Page() {
             toast.success(c.pinned ? '已取消置顶' : '已置顶')
           }}
           onMoveCard={(c, categoryId) => handleUpdateCard({ ...c, categoryId })}
-          onDuplicateCard={(c) => void handleDuplicateCard(c)}
+          onDuplicateCard={(c, categoryId) => void handleDuplicateCard(c, categoryId)}
           onDeleteCard={(id) => void handleDelete(id)}
           onBatchDelete={(ids) => void handleBatchDelete(ids)}
           onBatchMove={handleBatchMove}
@@ -750,7 +792,18 @@ export default function Page() {
       ) : view === 'favorites' ? (
         <FavoritesView onBack={() => setView('home')} />
       ) : view === 'review-stats' ? (
-        <ReviewStatsView onBack={() => setView('home')} />
+        <ReviewStatsView
+          onBack={() => setView('home')}
+          onOpenPlanManager={() => setView('plan-manager')}
+        />
+      ) : view === 'review-due' ? (
+        <ReviewDueView
+          onBack={() => setView('home')}
+          onOpenCard={(id) => {
+            const c = cards.find((x) => x.id === id)
+            if (c) handleOpenCard(c)
+          }}
+        />
       ) : view === 'plan-editor' && currentCard ? (
         <PlanEditorView
           card={currentCard}
@@ -832,6 +885,7 @@ export default function Page() {
         cards={cards}
         onChangeSettings={handleChangeSettings}
         onClearAll={handleClearAll}
+        onOpenPlans={() => setView('plan-manager')}
       />
 
       <AccountSheet

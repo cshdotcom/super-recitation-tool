@@ -33,7 +33,9 @@ import { toast } from 'sonner'
 import type { CardData, ClozeStyle, ReviewAction, SettingsData } from '@/lib/types'
 import { REVIEW_ACTIONS } from '@/lib/types'
 import { cn } from '@/lib/utils'
-import { ruleCloze, splitParagraphs } from '@/lib/cloze'
+import { ruleCloze, splitParagraphs, toggleOccurrence, removeOccurrence } from '@/lib/cloze'
+import { speakOnce } from '@/components/recitation/tts-player'
+import type { KwEntry } from '@/lib/types'
 import { todayKey, useLocalStorage } from '@/lib/use-local-storage'
 import { useServerState } from '@/lib/use-server-state'
 import { Button } from '@/components/ui/button'
@@ -56,7 +58,6 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { MoreSheet, type ClozeTemplate } from '@/components/recitation/more-sheet'
-import { NotebookPen } from 'lucide-react'
 import { PlanDialog } from '@/components/recitation/plan-dialog'
 import { ProgressSheet } from '@/components/recitation/progress-sheet'
 import { ReviewScoreBar } from '@/components/recitation/review-score-bar'
@@ -193,8 +194,8 @@ export function ReaderView({
   const [ruleDialogOpen, setRuleDialogOpen] = React.useState(false)
   const [templateDialogOpen, setTemplateDialogOpen] = React.useState(false)
   const [progressOpen, setProgressOpen] = React.useState(false)
-  const kwPastRef = React.useRef<string[][]>([])
-  const kwFutureRef = React.useRef<string[][]>([])
+  const kwPastRef = React.useRef<KwEntry[][]>([])
+  const kwFutureRef = React.useRef<KwEntry[][]>([])
   // 编辑模式内的挖空刷开关（不改变 mode，避免退出编辑器）
   const [editorBrush, setEditorBrush] = React.useState(false)
   // 复习模式：熟悉/模糊/忘记 评分条只在复习时出现
@@ -245,7 +246,7 @@ export function ReaderView({
 
   // ---------- keyword history (undo/redo) ----------
   const pushKwHistory = React.useCallback(
-    (prevKw: string[]) => {
+    (prevKw: KwEntry[]) => {
       kwPastRef.current.push(prevKw)
       kwFutureRef.current = []
       // cap the history at 50 entries
@@ -289,29 +290,31 @@ export function ReaderView({
   )
 
   const handleToggleKeyword = React.useCallback(
-    (word: string) => {
-      const has = card.keywords.includes(word)
-      const nextKeywords = has
-        ? card.keywords.filter((k) => k !== word)
-        : [...card.keywords, word]
+    (word: string, occ: number) => {
+      const nextKeywords = toggleOccurrence(card.keywords, word, occ, card.content)
       pushKwHistory(card.keywords)
       onUpdateCard({ ...card, keywords: nextKeywords })
-      if (!has) bumpProgress()
+      if (!toggleOccurrence([], word, occ, card.content).some((e) =>
+        typeof e === 'string' ? e === word : e.t === word && (e.occ === occ || e.occ === -1),
+      )) {
+        // removed → no progress bump
+      } else {
+        bumpProgress()
+      }
     },
     [card, onUpdateCard, bumpProgress, pushKwHistory],
   )
 
   // 长按选择文字 → 挖空选中（编辑模式）
   const handleSelectCloze = React.useCallback(
-    (text: string) => {
+    (text: string, occ: number) => {
       const t = text.trim()
       if (!t) return
-      if (card.keywords.includes(t)) {
-        toast.info('该词已在挖空列表中')
-        return
-      }
       pushKwHistory(card.keywords)
-      onUpdateCard({ ...card, keywords: [...card.keywords, t] })
+      onUpdateCard({
+        ...card,
+        keywords: toggleOccurrence(card.keywords, t, occ, card.content),
+      })
       bumpProgress()
       toast.success(`已挖空「${t.slice(0, 12)}${t.length > 12 ? '…' : ''}」`)
     },
@@ -320,7 +323,7 @@ export function ReaderView({
 
   // 自定义选择菜单（长按/右键）→ 挖空选中（阅读模式，字级）
   const handleSelectionCloze = React.useCallback(
-    (text: string) => {
+    (text: string, occ: number) => {
       const t = text.trim()
       if (!t) return
       // 必须是原文连续子串（含标点），否则无法渲染成挖空
@@ -328,22 +331,48 @@ export function ReaderView({
         toast.error('选择包含不连续内容，请重新选择连续的文字')
         return
       }
-      if (card.keywords.includes(t)) return
+      // 只挖选中的这一次出现（occ 定位），其他句子的同字词不受影响
       pushKwHistory(card.keywords)
-      onUpdateCard({ ...card, keywords: [...card.keywords, t] })
+      onUpdateCard({
+        ...card,
+        keywords: toggleOccurrence(card.keywords, t, occ, card.content),
+      })
       bumpProgress()
     },
     [card, onUpdateCard, pushKwHistory, bumpProgress],
   )
 
   const handleSelectionUncloze = React.useCallback(
-    (text: string) => {
+    (text: string, occ: number) => {
       const t = text.trim()
-      if (!t || !card.keywords.includes(t)) return
+      if (!t) return
       pushKwHistory(card.keywords)
-      onUpdateCard({ ...card, keywords: card.keywords.filter((k) => k !== t) })
+      onUpdateCard({
+        ...card,
+        keywords: removeOccurrence(card.keywords, t, occ, card.content),
+      })
     },
     [card, onUpdateCard, pushKwHistory],
+  )
+
+  // 空白长按菜单：取消挖空（只取消这一次出现）
+  const handleRemoveKeyword = React.useCallback(
+    (word: string, occ: number) => {
+      pushKwHistory(card.keywords)
+      onUpdateCard({
+        ...card,
+        keywords: removeOccurrence(card.keywords, word, occ, card.content),
+      })
+    },
+    [card, onUpdateCard, pushKwHistory],
+  )
+
+  // 选择菜单朗读：走用户默认配置的 TTS 引擎（而非固定浏览器 API）
+  const handleSpeakSelection = React.useCallback(
+    (text: string) => {
+      speakOnce(text, { context: 'reader', settings })
+    },
+    [settings],
   )
 
   // ---------- review scoring (熟悉/模糊/忘记) ----------
@@ -475,20 +504,34 @@ export function ReaderView({
 
   const applyTemplateCloze = React.useCallback(
     (template: ClozeTemplate) => {
-      let kws: string[] = []
+      let kws: KwEntry[] = []
       if (template === 'sentence-start') {
-        // 首字挖空：第一「字」of every sentence (字级挖空).
+        // 首字挖空：每句第一个「字」——按出现位置挖空，同名首字不误伤其他句子。
         const tokenRe = /[\u4e00-\u9fff\u3400-\u4dbf]|[a-zA-Z0-9]+/g
         const sentences = card.content.split(/(?<=[。！？；!?;\n])/)
-        const set = new Set<string>()
+        const counters = new Map<string, number>()
+        const seen = new Set<string>()
+        const out: KwEntry[] = []
+        let scanned = 0
         for (const s of sentences) {
-          const m = s.trim().match(tokenRe)
+          const trimmed = s.trim()
+          const lead = s.length - (s.startsWith(trimmed) ? 0 : s.slice(0, s.indexOf(trimmed)).length)
+          void lead
+          const m = trimmed.match(tokenRe)
           if (m && m[0]) {
-            // A CJK match is exactly one 字; a latin token stays whole.
-            set.add(m[0])
+            // 该首字在全文中的出现序号：数它之前的出现次数（粗略：按扫描偏移）
+            const before = card.content.slice(0, scanned + s.indexOf(m[0]))
+            const occ = before.split(m[0]).length - 1
+            const key = `${m[0]}\u0000${occ}`
+            if (!seen.has(key)) {
+              seen.add(key)
+              counters.set(m[0], occ)
+              out.push({ t: m[0], occ })
+            }
           }
+          scanned += s.length
         }
-        kws = Array.from(set)
+        kws = out
       } else if (template === 'numbers') {
         const nums = card.content.match(/\d+(?:\.\d+)?%?/g) || []
         kws = Array.from(new Set(nums))
@@ -703,15 +746,6 @@ export function ReaderView({
                 >
                   <Pencil className="size-5" strokeWidth={1.75} />
                 </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label="文字编辑工具"
-                  className="text-foreground/80"
-                  onClick={() => onOpenMaterialEditor?.()}
-                >
-                  <NotebookPen className="size-5" strokeWidth={1.75} />
-                </Button>
                 {/* AI 朗读（全屏音乐播放器，可收起为迷你悬浮条） */}
                 <Button
                   variant="ghost"
@@ -838,6 +872,8 @@ export function ReaderView({
               revealed={revealed}
               onReveal={handleReveal}
               onToggleKeyword={handleToggleKeyword}
+              onRemoveKeyword={handleRemoveKeyword}
+              speakText={handleSpeakSelection}
             />
           )}
 
@@ -1314,6 +1350,7 @@ export function ReaderView({
             settings={settings}
             context="reader"
             cardTitle={card.title}
+            cardId={card.id}
             favoritesKey={card.id}
             onClose={() => setTtsOpen(false)}
           />

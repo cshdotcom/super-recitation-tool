@@ -3,6 +3,7 @@
 import * as React from 'react'
 import {
   Braces,
+  CalendarClock,
   ChevronRight,
   Cpu,
   Database,
@@ -59,6 +60,7 @@ interface SettingsSheetProps {
   settings: SettingsData | null
   cards: CardData[]
   onChangeSettings: (patch: Partial<SettingsData>) => void
+  onOpenPlans?: () => void
   onClearAll: () => Promise<void> | void
 }
 
@@ -370,6 +372,7 @@ export function SettingsSheet({
   cards,
   onChangeSettings,
   onClearAll,
+  onOpenPlans,
 }: SettingsSheetProps) {
   // AI model draft (saved via 保存 button)
   const [aiDraft, setAiDraft] = React.useState({
@@ -510,6 +513,31 @@ export function SettingsSheet({
               ))}
             </div>
             <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">已自动保存</p>
+          </section>
+
+          {/* ---------- 复习设置 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">复习设置</p>
+            <div className="rounded-2xl border border-border bg-card px-4 py-3">
+              <button
+                type="button"
+                onClick={() => {
+                  onOpenChange(false)
+                  onOpenPlans?.()
+                }}
+                className="flex w-full items-center justify-between gap-3 text-left"
+              >
+                <span className="flex items-center gap-2.5 text-sm font-medium">
+                  <CalendarClock className="size-4 text-muted-foreground" strokeWidth={1.75} />
+                  复习计划管理
+                </span>
+                <ChevronRight className="size-4 text-muted-foreground" strokeWidth={1.75} />
+              </button>
+              <p className="mt-1 pl-[26px] text-[11px] leading-relaxed text-muted-foreground/70">
+                选择记忆方案（艾宾浩斯）、编辑自定义复习周期、调整智能预测
+              </p>
+            </div>
+            <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">点按进入复习计划管理</p>
           </section>
 
           {/* ---------- 导入偏好 ---------- */}

@@ -14,6 +14,7 @@ import {
 } from 'lucide-react'
 
 import type { CardData, SettingsData, ToolToggles } from '@/lib/types'
+import { keywordTexts } from '@/lib/cloze'
 import { cn } from '@/lib/utils'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import { ToolTogglesSheet } from '@/components/recitation/tool-toggles-sheet'
@@ -118,12 +119,12 @@ export function ToolsSheet({
     }
     switch (tool) {
       case 'tts':
-        return <TtsPlayer text={content} settings={settings} />
+        return <TtsPlayer text={content} settings={settings} cardId={card.id} cardTitle={card.title} />
       case 'asr':
         return (
           <AsrRecorder
             originalText={content}
-            keywords={card.keywords}
+            keywords={keywordTexts(card.keywords)}
             settings={settings}
             cardId={card.id}
             cardTitle={card.title}
@@ -133,16 +134,16 @@ export function ToolsSheet({
         return (
           <QuizPanel
             content={content}
-            keywords={card.keywords}
+            keywords={keywordTexts(card.keywords)}
             cardId={card.id}
             cardTitle={card.title}
             autoRemove={settings.quizAutoRemove}
           />
         )
       case 'supervise':
-        return <ChatTool mode="supervise" content={content} cardId={card.id} />
+        return <ChatTool mode="supervise" content={content} cardId={card.id} settings={settings} />
       case 'ask':
-        return <ChatTool mode="ask" content={content} allowImages cardId={card.id} />
+        return <ChatTool mode="ask" content={content} allowImages cardId={card.id} settings={settings} />
       case 'mindmap':
         return (
           <MindmapView
@@ -158,7 +159,7 @@ export function ToolsSheet({
       case 'copywrite':
         return <CopywritePanel content={content} />
       case 'wheel':
-        return <WheelPanel content={content} />
+        return <WheelPanel content={content} settings={settings} cardId={card.id} card={card} />
       default:
         return null
     }

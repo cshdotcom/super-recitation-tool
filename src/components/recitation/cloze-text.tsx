@@ -6,9 +6,15 @@ import { Copy, Eraser, Eye, Flag, RotateCcw, Volume2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
-import { splitCharTokens, splitParagraphs, tokenize } from '@/lib/cloze'
-import type { ClozeStyle } from '@/lib/types'
+import {
+  computeBlankRanges,
+  occAt,
+  splitCharTokens,
+  normKeywordEntries,
+} from '@/lib/cloze'
+import type { ClozeStyle, KwEntry } from '@/lib/types'
 import { LongPressMenu, type MenuAction } from '@/components/recitation/long-press-menu'
+import katex from 'katex'
 
 const LONG_PRESS_MS = 420
 const MOVE_TOLERANCE = 12
@@ -22,9 +28,206 @@ interface CharToken {
   isChar: boolean // 字 token (toggleable) vs separator
 }
 
+// ---------------------------------------------------------------------------
+// 轻量富文本内联解析：加粗/斜体/删除线/行内代码/荧光笔/字色/行内公式。
+// plain = 去掉标记后的纯文本（挖空关键词与位置都基于 plain 计算）。
+// ---------------------------------------------------------------------------
+
+interface InlineRun {
+  text: string
+  /** offset of run.text inside the paragraph's plain text */
+  start: number
+  cls?: string
+  code?: boolean
+  color?: string
+  math?: string
+}
+
+const INLINE_RE =
+  /\$([^$\n]+)\$|%%([^|\n]+)\|([^%\n]*)%%|==([^=\n]+)==|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|`([^`\n]+)`|\*([^*\n]+)\*/g
+
+function parseInline(line: string): { runs: InlineRun[]; plain: string } {
+  const runs: InlineRun[] = []
+  let plain = ''
+  let last = 0
+  let m: RegExpExecArray | null
+  INLINE_RE.lastIndex = 0
+  while ((m = INLINE_RE.exec(line)) !== null) {
+    if (m.index > last) {
+      runs.push({ text: line.slice(last, m.index), start: plain.length })
+      plain += line.slice(last, m.index)
+    }
+    if (m[1] !== undefined) {
+      runs.push({ text: m[1], start: plain.length, cls: 'italic text-primary/90', math: m[1] })
+      plain += m[1]
+    } else if (m[2] !== undefined) {
+      runs.push({ text: m[3] ?? '', start: plain.length, color: m[2] })
+      plain += m[3] ?? ''
+    } else if (m[4] !== undefined) {
+      runs.push({ text: m[4], start: plain.length, cls: 'rounded-sm bg-amber-300/70 px-0.5 dark:bg-amber-500/40' })
+      plain += m[4]
+    } else if (m[5] !== undefined) {
+      runs.push({ text: m[5], start: plain.length, cls: 'font-bold' })
+      plain += m[5]
+    } else if (m[6] !== undefined) {
+      runs.push({ text: m[6], start: plain.length, cls: 'line-through opacity-70' })
+      plain += m[6]
+    } else if (m[7] !== undefined) {
+      runs.push({ text: m[7], start: plain.length, code: true })
+      plain += m[7]
+    } else if (m[8] !== undefined) {
+      runs.push({ text: m[8], start: plain.length, cls: 'italic' })
+      plain += m[8]
+    }
+    last = m.index + m[0].length
+  }
+  if (last < line.length) {
+    runs.push({ text: line.slice(last), start: plain.length })
+    plain += line.slice(last)
+  }
+  if (runs.length === 0 && line) runs.push({ text: line, start: 0 })
+  return { runs, plain }
+}
+
+// 表格行解析：| a | b | → [a, b]
+function splitTableRow(line: string): string[] {
+  return line
+    .replace(/^\s*\|/, '')
+    .replace(/\|\s*$/, '')
+    .split('|')
+    .map((c) => c.trim())
+}
+
+function isTableLine(line: string): boolean {
+  const t = line.trim()
+  return t.startsWith('|') && t.endsWith('|') && t.length > 2
+}
+
+function isTableSeparator(line: string): boolean {
+  const t = line.trim()
+  return /^\|[\s:|-]+\|$/.test(t)
+}
+
+function isImageLine(line: string): boolean {
+  return /^\s*!\[[^\]]*\]\([^)]+\)\s*$/.test(line)
+}
+
+function parseImageLine(line: string): { alt: string; src: string } | null {
+  const m = line.match(/!\[([^\]]*)\]\(([^)]+)\)/)
+  if (!m) return null
+  return { alt: m[1], src: m[2] }
+}
+
+// 段落块：text（可挖空）| image | formula | table
+type Block =
+  | { kind: 'text'; runs: InlineRun[]; plain: string; plainStart: number; tocPara?: number }
+  | { kind: 'image'; alt: string; src: string }
+  | { kind: 'formula'; tex: string; display: boolean }
+  | { kind: 'table'; rows: string[][] }
+
+/**
+ * 把一段文本拆成可渲染块，并给出每段纯文本在「全局 plain」中的偏移，
+ * 使挖空范围（绝对下标）能映射回段落内部。图片/表格/公式块不参与挖空。
+ */
+function buildBlocks(content: string): { blocks: Block[]; plain: string } {
+  const lines = content.split(/(\r?\n)/)
+  // tokens: 交替 [文本行, 换行符]；逐行扫描并组合块
+  const rawLines: { text: string; start: number }[] = []
+  let offset = 0
+  for (let i = 0; i < lines.length; i += 2) {
+    const text = lines[i] ?? ''
+    rawLines.push({ text, start: offset })
+    offset += text.length + (lines[i + 1]?.length ?? 0)
+  }
+
+  const blocks: Block[] = []
+  const plainParts: string[] = []
+  let plainLen = 0
+  let textParaCount = 0
+
+  const pushPlain = (plain: string, tocPara: number) => {
+    const block: Block = { kind: 'text', runs: [], plain: '', plainStart: 0, tocPara }
+    const parsed = parseInline(plain)
+    block.runs = parsed.runs
+    block.plain = parsed.plain
+    block.plainStart = plainLen
+    blocks.push(block)
+    plainParts.push(parsed.plain, '\n')
+    plainLen += parsed.plain.length + 1
+  }
+
+  let i = 0
+  while (i < rawLines.length) {
+    const { text, start } = rawLines[i]
+    const trimmed = text.trim()
+
+    // 空行：跳过（占一个换行，不影响 plain 对齐——空行不产生 plain）
+    if (!trimmed) {
+      i += 1
+      continue
+    }
+
+    // 图片行
+    if (isImageLine(text)) {
+      const img = parseImageLine(text)
+      if (img) {
+        blocks.push({ kind: 'image', alt: img.alt, src: img.src })
+        i += 1
+        continue
+      }
+    }
+
+    // 独立公式块 $$ ... $$（单行或多行）
+    if (trimmed.startsWith('$$')) {
+      const single = trimmed.match(/^\$\$(.+)\$\$$/)
+      if (single) {
+        blocks.push({ kind: 'formula', tex: single[1], display: true })
+        i += 1
+        continue
+      }
+      if (trimmed === '$$') {
+        // 多行公式：收集到闭合 $$
+        let j = i + 1
+        const buf: string[] = []
+        while (j < rawLines.length && rawLines[j].text.trim() !== '$$') {
+          buf.push(rawLines[j].text)
+          j += 1
+        }
+        if (j < rawLines.length) {
+          blocks.push({ kind: 'formula', tex: buf.join('\n'), display: true })
+          i = j + 1
+          continue
+        }
+      }
+    }
+
+    // 表格块（连续 | 行，跳过分隔行）
+    if (isTableLine(text)) {
+      const rows: string[][] = []
+      let j = i
+      while (j < rawLines.length && isTableLine(rawLines[j].text)) {
+        if (!isTableSeparator(rawLines[j].text)) rows.push(splitTableRow(rawLines[j].text))
+        j += 1
+      }
+      if (rows.length > 0) {
+        blocks.push({ kind: 'table', rows })
+        i = j
+        continue
+      }
+    }
+
+    // 普通文本段
+    pushPlain(text, textParaCount)
+    textParaCount += 1
+    i += 1
+  }
+
+  return { blocks, plain: plainParts.join('') }
+}
+
 interface ClozeTextProps {
   content: string
-  keywords: string[]
+  keywords: KwEntry[]
   style: ClozeStyle
   showAnswers: boolean
   fontSize: number
@@ -39,28 +242,41 @@ interface ClozeTextProps {
   onPageChange?: (page: number, total: number) => void
   revealed: Set<number>
   onReveal: (idx: number) => void
-  onToggleKeyword: (word: string) => void
+  /** Toggle one occurrence: (text, occ) — occ = 出现序号，-1 = 旧格式全部。 */
+  onToggleKeyword: (word: string, occ: number) => void
   /** 挖空编辑模式: tapping a blank removes it; the selection menu's 挖空 action
    * routes to onSelectCloze instead of the reader keyword updater. */
   selectionMode?: boolean
-  /** Called with the trimmed selected text when 挖空选中 is tapped (编辑模式). */
-  onSelectCloze?: (text: string) => void
+  /** Called with (text, occ) when 挖空选中 is tapped (编辑模式). */
+  onSelectCloze?: (text: string, occ: number) => void
   /** ALWAYS-ON custom selection menu (reader mode): captures long-press
    * (mobile) + right-click (desktop) character selection and shows a floating
    * menu with a 挖空 button. */
   selectMenuEnabled?: boolean
   /** 挖空 the selected substring (multi-字 selection blanks that whole part). */
-  onSelectionCloze?: (text: string) => void
+  onSelectionCloze?: (text: string, occ: number) => void
   /** 取消挖空 — called when the selection is an existing keyword. */
-  onSelectionUncloze?: (text: string) => void
+  onSelectionUncloze?: (text: string, occ: number) => void
   /** Full override of the per-blank long-press menu actions. */
   menuActions?: MenuAction[]
   /** 取消挖空 — only adds the menu action when provided. */
-  onRemoveKeyword?: (word: string) => void
+  onRemoveKeyword?: (word: string, occ: number) => void
   /** 标记难点 — only adds the menu action when provided. */
   onMarkHard?: (word: string) => void
   /** Fallback for custom keys when menuActions is overridden. */
-  onMenuAction?: (key: string, word: string, idx: number) => void
+  onMenuAction?: (key: string, word: string, idx: number, occ: number) => void
+  /** 只读（访客共享视图）：隐藏挖空/取消挖空入口，仅保留朗读/复制与点按显示。 */
+  readOnly?: boolean
+  /** 覆盖内部朗读实现（默认浏览器 speechSynthesis；登录用户传默认配置引擎）。 */
+  speakText?: (text: string) => void
+}
+
+interface BlankPos {
+  start: number
+  end: number
+  text: string
+  occ: number
+  idx: number // 渲染序（reveal 集合的 key）
 }
 
 export function ClozeText({
@@ -86,6 +302,8 @@ export function ClozeText({
   onRemoveKeyword,
   onMarkHard,
   onMenuAction,
+  readOnly = false,
+  speakText: speakTextProp,
 }: ClozeTextProps) {
   const containerRef = React.useRef<HTMLDivElement>(null)
   const rootRef = React.useRef<HTMLDivElement>(null)
@@ -124,22 +342,29 @@ export function ClozeText({
     tempTimersRef.current.set(idx, t)
   }
 
-  // 朗读该字 — browser speechSynthesis only, no server call.
-  const speakText = (text: string) => {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      toast.error('当前浏览器不支持朗读')
-      return
-    }
-    try {
-      window.speechSynthesis.cancel()
-      const u = new SpeechSynthesisUtterance(text)
-      u.lang = 'zh-CN'
-      u.rate = 0.9
-      window.speechSynthesis.speak(u)
-    } catch {
-      toast.error('朗读失败，请重试')
-    }
-  }
+  // 朗读 — 优先外部注入的引擎（默认配置），否则浏览器 speechSynthesis。
+  const speakText = React.useCallback(
+    (text: string) => {
+      if (speakTextProp) {
+        speakTextProp(text)
+        return
+      }
+      if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
+        toast.error('当前浏览器不支持朗读')
+        return
+      }
+      try {
+        window.speechSynthesis.cancel()
+        const u = new SpeechSynthesisUtterance(text)
+        u.lang = 'zh-CN'
+        u.rate = 0.9
+        window.speechSynthesis.speak(u)
+      } catch {
+        toast.error('朗读失败，请重试')
+      }
+    },
+    [speakTextProp],
+  )
 
   // 复制文本
   const copyText = (text: string) => {
@@ -149,7 +374,7 @@ export function ClozeText({
       .catch(() => toast.error('复制失败，请长按手动复制'))
   }
 
-  const handleBlankMenuAction = (key: string, word: string, idx: number) => {
+  const handleBlankMenuAction = (key: string, word: string, idx: number, occ: number) => {
     switch (key) {
       case 'reveal':
         tempReveal(idx)
@@ -161,8 +386,8 @@ export function ClozeText({
         copyText(word)
         break
       case 'remove':
-        if (onRemoveKeyword) {
-          onRemoveKeyword(word)
+        if (onRemoveKeyword && !readOnly) {
+          onRemoveKeyword(word, occ)
           toast.success(`已取消挖空「${word}」`)
         }
         break
@@ -173,11 +398,52 @@ export function ClozeText({
         }
         break
       default:
-        onMenuAction?.(key, word, idx)
+        onMenuAction?.(key, word, idx, occ)
     }
   }
 
-  const keywordSet = React.useMemo(() => new Set(keywords), [keywords])
+  const entries = React.useMemo(() => normKeywordEntries(keywords), [keywords])
+
+  const sources = React.useMemo((): SourceCtx[] => {
+    const list: { key: string; src: string; chunkIndex: number | null }[] = []
+    if (chunks) {
+      chunks.forEach((c, i) => list.push({ key: `chunk-${i}`, src: c, chunkIndex: i }))
+    } else if (pages) {
+      pages.forEach((p, i) => list.push({ key: `page-${i}`, src: p, chunkIndex: null }))
+    } else {
+      list.push({ key: 'root', src: content, chunkIndex: null })
+    }
+    let idxOffset = 0
+    return list.map(({ key, src, chunkIndex }) => {
+      const { blocks, plain } = buildBlocks(src)
+      const ranges = computeBlankRanges(plain, entries).map((r) => ({
+        ...r,
+        occ: occAt(plain, r.text, r.start),
+      }))
+      // reveal key 全局连续（跨分块不冲突）
+      const blanks: BlankPos[] = ranges.map((r, i) => ({ ...r, idx: idxOffset + i }))
+      idxOffset += blanks.length
+      const blankByStart = new Map<number, BlankPos>(blanks.map((b) => [b.start, b]))
+      return { key, raw: src, chunkIndex, blocks, plain, blanks, blankByStart, blankSet: new Set<number>() }
+    })
+  }, [chunks, pages, content, entries])
+
+  // 选择菜单/挖空刷：解析选中文本属于哪个渲染源 + 其出现序号。
+  const resolveSelection = React.useCallback(
+    (text: string): { occ: number; plain: string } => {
+      for (const s of sources) {
+        const idx = s.plain.indexOf(text)
+        if (idx >= 0) return { occ: occAt(s.plain, text, idx), plain: s.plain }
+      }
+      return { occ: -1, plain: '' }
+    },
+    [sources],
+  )
+  const isTextBlanked = React.useCallback(
+    (text: string) => sources.some((s) => s.blanks.some((b) => b.text === text)),
+    [sources],
+  )
+
 
   // ===========================================================================
   // 自定义选择菜单 (character-level, 自由选择框): long-press (touch) or
@@ -317,6 +583,35 @@ export function ClozeText({
     clearSelHighlight()
   }, [clearSelHighlight])
 
+  // 打开任何弹窗/抽屉（Radix dialog / popper）或收到 sb-close-selection 事件时，
+  // 自动关闭选择菜单——避免选字框浮在 AI出题等面板上挡住操作。
+  React.useEffect(() => {
+    if (typeof window === 'undefined') return
+    const close = () => closeSelMenu()
+    window.addEventListener('sb-close-selection', close)
+    let scheduled = false
+    const obs = new MutationObserver(() => {
+      if (scheduled) return
+      scheduled = true
+      window.requestAnimationFrame(() => {
+        scheduled = false
+        const root = rootRef.current
+        if (!root) return
+        // 选择菜单自身 portaled 到 body，这里只关心外部弹层出现的情况。
+        if (!selMenu && !selTips) return
+        const dialog = document.querySelector(
+          '[role="dialog"][data-state="open"], [data-radix-popper-content-wrapper]',
+        )
+        if (dialog && !root.contains(dialog)) close()
+      })
+    })
+    obs.observe(document.body, { childList: true, subtree: true })
+    return () => {
+      window.removeEventListener('sb-close-selection', close)
+      obs.disconnect()
+    }
+  }, [closeSelMenu, selMenu, selTips])
+
   const charIdxFromPoint = (x: number, y: number): number => {
     const el = document.elementFromPoint(x, y)
     const charEl = el?.closest('[data-char]') as HTMLElement | null
@@ -363,19 +658,26 @@ export function ClozeText({
         window.innerWidth - SEL_MENU_W / 2 - VIEWPORT_INSET,
       )
       const y = above ? bbox.top - 10 : bbox.bottom + 10
+      const mk = (px: number, py: boolean) => ({
+        x: px,
+        y: py ? bbox.top - 10 : bbox.bottom + 10,
+        above: py,
+        text,
+        isKeyword: isTextBlanked(text),
+      })
       if (at) {
         setSelMenu({
           x: at.x,
           y: at.y,
           above: at.y > window.innerHeight / 2,
           text,
-          isKeyword: keywordSet.has(text),
+          isKeyword: isTextBlanked(text),
         })
       } else {
-        setSelMenu({ x, y, above, text, isKeyword: keywordSet.has(text) })
+        setSelMenu(mk(x, above))
       }
     },
-    [extractSelText, getCharEls, keywordSet, computeSelLayout],
+    [extractSelText, getCharEls, computeSelLayout, isTextBlanked],
   )
 
   // ---- pointer flow (touch long-press → drag selection with handles) ----
@@ -516,7 +818,6 @@ export function ClozeText({
       root.contains(sel.focusNode)
 
     if (nativeInside && selText && selText.length <= 200) {
-      const rect = sel.getRangeAt(0).getBoundingClientRect()
       const x = Math.min(
         Math.max(e.clientX, SEL_MENU_WIDTH / 2 + VIEWPORT_INSET),
         window.innerWidth - SEL_MENU_WIDTH / 2 - VIEWPORT_INSET,
@@ -527,7 +828,7 @@ export function ClozeText({
         y,
         above: y > window.innerHeight / 2,
         text: selText,
-        isKeyword: keywordSet.has(selText),
+        isKeyword: isTextBlanked(selText),
       })
       return
     }
@@ -544,19 +845,21 @@ export function ClozeText({
     if (!cur) return
     switch (key) {
       case 'cloze': {
+        if (readOnly) break
         const text = cur.text
+        const occ = resolveSelection(text).occ
         if (cur.isKeyword) {
           // already blanked → uncloze
           if (selectionMode) {
-            onToggleKeyword(text)
+            onToggleKeyword(text, occ)
           } else {
-            onSelectionUncloze?.(text)
+            onSelectionUncloze?.(text, occ)
             toast.success(`已取消挖空「${text.slice(0, 10)}${text.length > 10 ? '…' : ''}」`)
           }
         } else if (selectionMode) {
-          onSelectCloze?.(text)
+          onSelectCloze?.(text, occ)
         } else {
-          onSelectionCloze?.(text)
+          onSelectionCloze?.(text, occ)
           toast.success(
             `已挖空 ${Array.from(text).length} 字「${text.slice(0, 10)}${text.length > 10 ? '…' : ''}」`,
           )
@@ -690,31 +993,33 @@ export function ClozeText({
         onClick={(e) => e.stopPropagation()}
         onContextMenu={(e) => e.preventDefault()}
       >
-        <button
-          type="button"
-          role="menuitem"
-          onClick={(e) => {
-            e.stopPropagation()
-            handleSelMenuAction('cloze')
-          }}
-          className={cn(
-            'flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13px] transition-colors',
-            selMenu.isKeyword
-              ? 'text-amber-300 hover:bg-amber-400/15'
-              : 'text-emerald-300 hover:bg-emerald-400/15',
-          )}
-        >
-          {selMenu.isKeyword ? (
-            <RotateCcw className="size-4 shrink-0" strokeWidth={1.75} />
-          ) : (
-            <Eraser className="size-4 shrink-0" strokeWidth={1.75} />
-          )}
-          <span className="truncate">
-            {selMenu.isKeyword
-              ? `取消挖空「${selMenu.text.slice(0, 6)}${selMenu.text.length > 6 ? '…' : ''}」`
-              : `挖空选中${Array.from(selMenu.text).length > 1 ? `（${Array.from(selMenu.text).length}字）` : ''}`}
-          </span>
-        </button>
+        {!readOnly && (
+          <button
+            type="button"
+            role="menuitem"
+            onClick={(e) => {
+              e.stopPropagation()
+              handleSelMenuAction('cloze')
+            }}
+            className={cn(
+              'flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13px] transition-colors',
+              selMenu.isKeyword
+                ? 'text-amber-300 hover:bg-amber-400/15'
+                : 'text-emerald-300 hover:bg-emerald-400/15',
+            )}
+          >
+            {selMenu.isKeyword ? (
+              <RotateCcw className="size-4 shrink-0" strokeWidth={1.75} />
+            ) : (
+              <Eraser className="size-4 shrink-0" strokeWidth={1.75} />
+            )}
+            <span className="truncate">
+              {selMenu.isKeyword
+                ? `取消挖空「${selMenu.text.slice(0, 6)}${selMenu.text.length > 6 ? '…' : ''}」`
+                : `挖空选中${Array.from(selMenu.text).length > 1 ? `（${Array.from(selMenu.text).length}字）` : ''}`}
+            </span>
+          </button>
+        )}
         <button
           type="button"
           role="menuitem"
@@ -756,29 +1061,37 @@ export function ClozeText({
     }
   }, [])
 
+  // 由元素上的 data-src 找到所属渲染源的 plain
+  const brushPlainOf = (el: HTMLElement): string => {
+    const key = el.dataset.src || 'root'
+    return sources.find((s) => s.key === key)?.plain ?? content
+  }
+
+  // 挖空刷 = 只刷入不擦除：扫过的字若未挖空则挖空该次出现。
+  // data-pos 记录该字在渲染源 plain 中的绝对下标，data-src 标记所属渲染源。
   const handleBrushPointerDown = (e: React.PointerEvent) => {
     if (!brushMode) return
     draggingRef.current = true
     touchedRef.current.clear()
-    // 挖空刷 = 只刷入不擦除：起点字未挖空则立即挖空（擦除用挖空菜单的取消挖空）。
     const target = e.target as HTMLElement
-    const wordEl = target.closest?.('[data-word]') as HTMLElement | null
+    const wordEl = target.closest?.('[data-word][data-pos]') as HTMLElement | null
     if (wordEl?.dataset.word) {
       const w = wordEl.dataset.word
       touchedRef.current.add(w)
-      if (!keywordSet.has(w)) onToggleKeyword(w)
+      if (!isTextBlanked(w)) {
+        onToggleKeyword(w, occAt(brushPlainOf(wordEl), w, Number(wordEl.dataset.pos)))
+      }
     }
   }
-
   const handleBrushPointerMove = (e: React.PointerEvent) => {
     if (!brushMode || !draggingRef.current) return
     const el = document.elementFromPoint(e.clientX, e.clientY)
-    const wordEl = el?.closest('[data-word]') as HTMLElement | null
+    const wordEl = el?.closest('[data-word][data-pos]') as HTMLElement | null
     if (!wordEl?.dataset.word) return
     const w = wordEl.dataset.word
-    if (touchedRef.current.has(w) || keywordSet.has(w)) return
+    if (touchedRef.current.has(w) || isTextBlanked(w)) return
     touchedRef.current.add(w)
-    onToggleKeyword(w)
+    onToggleKeyword(w, occAt(brushPlainOf(wordEl), w, Number(wordEl.dataset.pos)))
   }
 
   const scrollToPage = (idx: number) => {
@@ -794,10 +1107,27 @@ export function ClozeText({
     onPageChange?.(page, pages?.length ?? 1)
   }, [page, pages?.length])
 
-  // ---- build all content JSX; blanks AND 字 tokens get running indices so
-  // the selection layer can highlight arbitrary ranges. ----
-  const buildContent = (): React.ReactNode => {
-    let blankIdx = -1
+  // ===========================================================================
+  // 渲染管线：buildBlocks → computeBlankRanges(plain) → 逐字渲染（挖空 + 富样式）
+  // 每个渲染源（全文 / 分块 / 分页）独立建块与挖空范围，全部在 useMemo 中完成，
+  // 渲染期间不再改写任何 ref（react-hooks 规则）。
+  // ===========================================================================
+  interface SourceCtx {
+    key: string
+    raw: string
+    chunkIndex: number | null
+    blocks: Block[]
+    plain: string
+    blanks: BlankPos[]
+    blankByStart: Map<number, BlankPos>
+    blankSet: Set<number>
+  }
+
+
+
+  const renderSource = (ctx: SourceCtx): React.ReactNode => {
+    const { raw: src, key: srcKey } = ctx
+
     let charIdx = -1
 
     // Highlight classes applied while the custom selection covers this token.
@@ -808,9 +1138,9 @@ export function ClozeText({
           : 'rounded-sm bg-amber-300/70 outline-2 outline-amber-500/80 dark:bg-amber-500/40'
         : undefined
 
-    const renderBlank = (text: string) => {
-      blankIdx += 1
-      const idx = blankIdx
+    const renderBlank = (b: BlankPos, extraCls?: string) => {
+      const idx = b.idx
+      const text = b.text
       charIdx += 1
       const ci = charIdx
       const isRevealed = revealed.has(idx)
@@ -843,8 +1173,6 @@ export function ClozeText({
           )
           break
         case 'blur':
-          // Text stays in place but blurred; the blur lifts (with a filter
-          // transition) when the answer shows.
           styleCls = cn(
             'rounded-sm',
             !visible && 'opacity-80',
@@ -858,7 +1186,6 @@ export function ClozeText({
             visible && effRevealed && cn('rounded-sm', revealedCls),
             visible && !effRevealed && cn('rounded-sm', peekedCls),
           )
-          // One * per character (JSX-level swap; data-word keeps the real text).
           if (!visible) inner = '*'.repeat(Array.from(text).length)
           break
         case 'blank':
@@ -897,7 +1224,7 @@ export function ClozeText({
           onClick={(e) => {
             e.stopPropagation()
             if (!brushMode) {
-              if (selectionMode) onToggleKeyword(text)
+              if (selectionMode) onToggleKeyword(text, b.occ)
               else onReveal(idx)
             }
           }}
@@ -906,14 +1233,14 @@ export function ClozeText({
               ? undefined
               : (e) => {
                   e.stopPropagation()
-                  onToggleKeyword(text)
+                  if (!readOnly) onToggleKeyword(text, b.occ)
                 }
           }
           onKeyDown={(e) => {
             if (e.key === 'Enter' || e.key === ' ') {
               e.preventDefault()
               if (!brushMode) {
-                if (selectionMode) onToggleKeyword(text)
+                if (selectionMode) onToggleKeyword(text, b.occ)
                 else onReveal(idx)
               }
             }
@@ -922,6 +1249,7 @@ export function ClozeText({
             'cursor-pointer align-middle',
             style !== 'blur' && 'transition-colors',
             styleCls,
+            extraCls,
             hlCls(true),
           )}
           style={{
@@ -947,9 +1275,9 @@ export function ClozeText({
         menuActions ??
         [
           { key: 'reveal', label: '查看答案', icon: <Eye className="size-3.5" strokeWidth={1.75} /> },
-          { key: 'speak', label: '朗读该字', icon: <Volume2 className="size-3.5" strokeWidth={1.75} /> },
+          { key: 'speak', label: '朗读', icon: <Volume2 className="size-3.5" strokeWidth={1.75} /> },
           { key: 'copy', label: '复制', icon: <Copy className="size-3.5" strokeWidth={1.75} /> },
-          ...(onRemoveKeyword
+          ...(onRemoveKeyword && !readOnly
             ? [{ key: 'remove', label: '取消挖空', icon: <Eraser className="size-3.5" strokeWidth={1.75} /> }]
             : []),
           ...(onMarkHard
@@ -961,180 +1289,229 @@ export function ClozeText({
         <LongPressMenu
           key={`b-${idx}`}
           actions={blankActions}
-          onAction={(key) => handleBlankMenuAction(key, text, idx)}
+          onAction={(key) => handleBlankMenuAction(key, text, idx, b.occ)}
         >
           {blank}
         </LongPressMenu>
       )
     }
 
-    const renderParagraph = (para: string, paraKey: string, tocPara?: number): React.ReactNode => {
-      const tokens = brushMode || manualMode ? null : tokenize(para, keywords)
+    // 渲染一个文本块：runs + 空白位置 → spans。
+    const renderTextBlock = (block: Extract<Block, { kind: 'text' }>, blockKey: string) => {
+      const { runs, plainStart, plain: pPlain } = block
+      const pStart = plainStart
+      const pEnd = plainStart + pPlain.length
 
-      if (tokens) {
-        // Normal (non-toggle) rendering: keyword segments become blanks,
-        // everything else splits into 字 tokens (selection targets).
-        return (
-          <p key={paraKey} data-toc-para={tocPara} className="whitespace-pre-wrap">
-            {tokens.flatMap((seg, i) => {
-              if (seg.isBlank) return [renderBlank(seg.text)]
-              const parts = splitCharTokens(seg.text)
-              return parts.map((w, j) => {
-                if (!w.isChar) {
-                  return <span key={`s${i}-${j}`}>{w.text}</span>
-                }
-                charIdx += 1
-                const ci = charIdx
-                return (
-                  <span
-                    key={`s${i}-${j}`}
-                    data-char="1"
-                    data-ci={ci}
-                    className={cn(
-                      hlCls(false),
-                    )}
-                  >
-                    {w.text}
-                  </span>
-                )
-              })
-            })}
-          </p>
-        )
+      const out: React.ReactNode[] = []
+      let pos = pStart // 当前渲染到的 plain 绝对位置
+      let ri = 0
+
+      while (pos < pEnd && ri < runs.length) {
+        const run = runs[ri]
+        const runStart = pStart + run.start
+        const runEndAbs = runStart + run.text.length
+        if (pos < runStart) {
+          // 防御：run 之间的间隙
+          const gap = pPlain.slice(pos - pStart, run.start)
+          if (gap) out.push(<span key={`${blockKey}-g${pos}`}>{gap}</span>)
+          pos = runStart
+        }
+        const blankAtPos = ctx.blankByStart.get(pos)
+        if (blankAtPos) {
+          out.push(
+            <React.Fragment key={`${blockKey}-b${blankAtPos.start}`}>
+              {renderBlank(blankAtPos)}
+            </React.Fragment>,
+          )
+          pos = blankAtPos.end
+          // 空白可能跨越多个 run：跳过被覆盖的 runs
+          while (ri < runs.length && pStart + runs[ri].start + runs[ri].text.length <= pos) ri += 1
+          continue
+        }
+        // 在 run 内：下一段到 run 末尾或下一个空白起点
+        const nextBlank = ctx.blanks.find((bb) => bb.start > pos && bb.start < runEndAbs)
+        const segEnd = nextBlank ? Math.min(nextBlank.start, runEndAbs) : runEndAbs
+        const segPlain = pPlain.slice(pos - pStart, segEnd - pStart)
+        const runCls = run.code
+          ? 'rounded bg-muted px-1 py-0.5 font-mono text-[0.92em]'
+          : run.cls
+        const styleProp = run.color ? { color: run.color } : undefined
+        const chars = splitCharTokens(segPlain)
+        for (let ci2 = 0; ci2 < chars.length; ci2++) {
+          const w = chars[ci2]
+          if (!w.isChar) {
+            out.push(
+              <span key={`${blockKey}-s${pos}-${ci2}`} style={styleProp} className={runCls}>
+                {w.text}
+              </span>,
+            )
+            pos += w.text.length
+            continue
+          }
+          charIdx += 1
+          const key = `${blockKey}-c${pos}`
+          out.push(
+            <span
+              key={key}
+              data-char="1"
+              data-ci={charIdx}
+              data-pos={pos}
+              data-src={ctx.key}
+              data-word={brushMode ? w.text : undefined}
+              style={styleProp}
+              className={cn(
+                runCls,
+                brushMode && 'cursor-crosshair rounded-sm transition-colors hover:bg-accent/70',
+                manualMode && 'cursor-text rounded-sm transition-colors hover:bg-accent/70',
+                hlCls(false),
+              )}
+              onDoubleClick={
+                manualMode && !readOnly
+                  ? (e) => {
+                      e.stopPropagation()
+                      onToggleKeyword(w.text, occAt(ctx.plain, w.text, pos))
+                    }
+                  : undefined
+              }
+            >
+              {w.text}
+            </span>,
+          )
+          pos += w.text.length
+        }
+        if (pos >= runEndAbs) ri += 1
+      }
+      // run 之后的尾文本（防御）
+      if (pos < pEnd) {
+        const rest = pPlain.slice(pos - pStart)
+        if (rest) out.push(<span key={`${blockKey}-tail${pos}`}>{rest}</span>)
       }
 
-      // 字-level rendering for 挖空刷 / 手动挖空 / selection.
-      const chars = splitCharTokens(para)
       return (
-        <p key={paraKey} data-toc-para={tocPara} className="whitespace-pre-wrap">
-          {chars.map((w, i) => {
-            if (!w.isChar) return <span key={`w-${i}`}>{w.text}</span>
-            if (keywordSet.has(w.text)) {
-              return renderBlank(w.text)
-            }
-            charIdx += 1
-            const ci = charIdx
-            if (selectionMode) {
-              // 编辑模式: plain 字 stay plain — new blanks are added via the
-              // selection menu, not dblclick.
-              return (
-                <span
-                  key={`w-${i}`}
-                  data-char="1"
-                  data-ci={ci}
-                  className={cn(
-                    hlCls(false),
-                  )}
-                >
-                  {w.text}
-                </span>
-              )
-            }
-            return (
-              <span
-                key={`w-${i}`}
-                data-char="1"
-                data-ci={ci}
-                data-word={brushMode ? w.text : undefined}
-                className={cn(
-                  brushMode && 'cursor-crosshair rounded-sm transition-colors hover:bg-accent/70',
-                  manualMode && 'cursor-text rounded-sm transition-colors hover:bg-accent/70',
-                  hlCls(false),
-                )}
-                onDoubleClick={(e) => {
-                  e.stopPropagation()
-                  onToggleKeyword(w.text)
-                }}
-              >
-                {w.text}
-              </span>
-            )
-          })}
+        <p key={blockKey} data-toc-para={block.tocPara} className="whitespace-pre-wrap">
+          {out}
         </p>
       )
     }
 
-    // ---- layouts ----
-    if (chunks) {
-      // AI快速分块: numbered bordered blocks.
+    const renderBlock = (block: Block, i: number): React.ReactNode => {
+      switch (block.kind) {
+        case 'text':
+          return renderTextBlock(block, `t${i}`)
+        case 'image':
+          return (
+            <div key={`img${i}`} className="py-1">
+              { }
+              <img
+                src={block.src}
+                alt={block.alt || '课文配图'}
+                className="max-h-96 max-w-full rounded-xl border border-border object-contain"
+                loading="lazy"
+              />
+            </div>
+          )
+        case 'formula':
+          return <FormulaBlock key={`fx${i}`} tex={block.tex} display={block.display} />
+        case 'table':
+          return (
+            <div key={`tb${i}`} className="overflow-x-auto rounded-xl border border-border">
+              <table className="w-full border-collapse text-[0.95em]">
+                <tbody>
+                  {block.rows.map((row, ri2) => (
+                    <tr key={ri2} className={ri2 === 0 ? 'bg-muted/60 font-medium' : ''}>
+                      {row.map((cell, ci3) => (
+                        <td
+                          key={ci3}
+                          className="border border-border px-2.5 py-1.5 align-top leading-relaxed"
+                        >
+                          {cell}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+      }
+    }
+
+    const wrap = (nodes: React.ReactNode[]) => <div className="space-y-3">{nodes}</div>
+    const body = ctx.blocks.map((b, i) => renderBlock(b, i))
+
+    if (ctx.chunkIndex !== null) {
       return (
-        <div className="flex flex-col gap-3">
-          {chunks.map((chunk, ci2) => (
-            <div
-              key={`chunk-${ci2}`}
-              data-toc-chunk={ci2}
-              className="rounded-xl border border-border bg-card p-4 shadow-sm"
-            >
-              <div className="mb-2 flex items-center gap-2">
-                <span className="flex size-6 items-center justify-center rounded-full bg-emerald-600 text-xs font-semibold text-white">
-                  {ci2 + 1}
-                </span>
-                <span className="text-xs text-muted-foreground">
-                  第 {ci2 + 1} 块 · {chunk.length} 字
-                </span>
-              </div>
-              <div className="space-y-3">
-                {splitParagraphs(chunk).map((p, pi) => renderParagraph(p, `c${ci2}-p${pi}`))}
-              </div>
+        <div
+          key={srcKey}
+          data-toc-chunk={ctx.chunkIndex}
+          className="rounded-xl border border-border bg-card p-4 shadow-sm"
+        >
+          <div className="mb-2 flex items-center gap-2">
+            <span className="flex size-6 items-center justify-center rounded-full bg-emerald-600 text-xs font-semibold text-white">
+              {ctx.chunkIndex + 1}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              第 {ctx.chunkIndex + 1} 块 · {src.length} 字
+            </span>
+          </div>
+          {wrap(body)}
+        </div>
+      )
+    }
+    return wrap(body)
+  }
+
+  // ---- layouts ----
+  if (chunks) {
+    return (
+      <div className="flex flex-col gap-3">
+        {sources.map((s) => (
+          <React.Fragment key={s.key}>{renderSource(s)}</React.Fragment>
+        ))}
+      </div>
+    )
+  }
+
+  if (pages) {
+    return (
+      <div className="relative">
+        <div
+          ref={containerRef}
+          className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          onScroll={(e) => {
+            const el = e.currentTarget
+            const cur = Math.round(el.scrollLeft / Math.max(1, el.clientWidth))
+            if (cur !== page) setPage(cur)
+          }}
+        >
+          {sources.map((s) => (
+            <div key={s.key} className="w-full shrink-0 snap-center px-1">
+              {renderSource(s)}
             </div>
           ))}
         </div>
-      )
-    }
-
-    if (pages) {
-      // Paged mode: horizontal snap pages.
-      return (
-        <div className="relative">
-          <div
-            ref={containerRef}
-            className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-            onScroll={(e) => {
-              const el = e.currentTarget
-              const cur = Math.round(el.scrollLeft / Math.max(1, el.clientWidth))
-              if (cur !== page) setPage(cur)
-            }}
-          >
-            {pages.map((pageText, pi) => (
-              <div key={`page-${pi}`} className="w-full shrink-0 snap-center px-1">
-                <div className="space-y-3">
-                  {splitParagraphs(pageText).map((p, pi2) =>
-                    renderParagraph(p, `pg${pi}-p${pi2}`),
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-          {pages.length > 1 && (
-            <>
-              <button
-                type="button"
-                aria-label="上一页"
-                disabled={page <= 0}
-                onClick={() => scrollToPage(page - 1)}
-                className="absolute left-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background/90 shadow-md transition-opacity disabled:opacity-25"
-              >
-                ‹
-              </button>
-              <button
-                type="button"
-                aria-label="下一页"
-                disabled={page >= pages.length - 1}
-                onClick={() => scrollToPage(page + 1)}
-                className="absolute right-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background/90 shadow-md transition-opacity disabled:opacity-25"
-              >
-                ›
-              </button>
-            </>
-          )}
-        </div>
-      )
-    }
-
-    // Scroll mode: plain paragraphs.
-    return (
-      <div className="space-y-3">
-        {splitParagraphs(content).map((p, pi) => renderParagraph(p, `p${pi}`, pi))}
+        {pages.length > 1 && (
+          <>
+            <button
+              type="button"
+              aria-label="上一页"
+              disabled={page <= 0}
+              onClick={() => scrollToPage(page - 1)}
+              className="absolute left-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background/90 shadow-md transition-opacity disabled:opacity-25"
+            >
+              ‹
+            </button>
+            <button
+              type="button"
+              aria-label="下一页"
+              disabled={page >= pages.length - 1}
+              onClick={() => scrollToPage(page + 1)}
+              className="absolute right-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background/90 shadow-md transition-opacity disabled:opacity-25"
+            >
+              ›
+            </button>
+          </>
+        )}
       </div>
     )
   }
@@ -1166,9 +1543,43 @@ export function ClozeText({
       }}
       onContextMenu={handleRootContextMenu}
     >
-      {buildContent()}
+      {sources.map((s) => (
+        <React.Fragment key={s.key}>{renderSource(s)}</React.Fragment>
+      ))}
       {selMounted && selOverlay ? createPortal(selOverlay, document.body) : null}
       {selMounted && selMenuPanel ? createPortal(selMenuPanel, document.body) : null}
+    </div>
+  )
+}
+
+// 公式块：katex 渲染（不可挖空）。失败时回退为等宽文本。
+function FormulaBlock({ tex, display }: { tex: string; display: boolean }) {
+  let html: string | null = null
+  try {
+    html = katex.renderToString(tex.trim(), {
+      displayMode: display,
+      throwOnError: false,
+      output: 'html',
+    })
+  } catch {
+    html = null
+  }
+  if (html) {
+    return (
+      <div
+        className={cn(
+          'overflow-x-auto rounded-xl bg-muted/40 px-3 py-2',
+          display ? 'text-center' : '',
+        )}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    )
+  }
+  return (
+    <div className="overflow-x-auto rounded-xl bg-muted/40 px-3 py-2 font-mono text-sm">
+      {display ? '$$' : '$'}
+      {tex}
+      {display ? '$$' : '$'}
     </div>
   )
 }

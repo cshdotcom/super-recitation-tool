@@ -10,14 +10,18 @@ import {
   ChevronUp,
   FastForward,
   Gauge,
+  Languages,
   List,
   Loader2,
   Pause,
+  Pencil,
   Play,
+  Plus,
   Repeat,
   Repeat1,
   Rewind,
   Star,
+  Trash2,
   Volume2,
   X,
 } from 'lucide-react'
@@ -80,6 +84,79 @@ const PLAY_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 /** 每句音频缓存上限（超过后淘汰最早一句并释放 blob URL） */
 const MAX_CACHE_ENTRIES = 40
 
+// ---------------------------------------------------------------------------
+// 发音设置：用户自定义「原文 → 读法」替换规则（如 地 → de），合成前应用，
+// 让多音字/专名读得更准。按卡持久化于 AppState（tts:pron:<cardId>），
+// 无 cardId 时回退全局 tts:pron:global。
+// ---------------------------------------------------------------------------
+
+export interface PronRule {
+  /** 原文（将被替换的文本片段） */
+  from: string
+  /** 读法（替换后的文本，交给 TTS 发音） */
+  to: string
+}
+
+/** 全局发音规则 key（无 cardId 时的回退存储）。 */
+export const GLOBAL_PRON_KEY = 'tts:pron:global'
+
+/** 发音规则存储 key：优先卡片级，其次全局。 */
+export function pronStateKey(cardId?: string | null): string {
+  return cardId ? `tts:pron:${cardId}` : GLOBAL_PRON_KEY
+}
+
+/** Defensively parse the persisted rules JSON array [{ from, to }]. */
+export function parsePronRules(raw: unknown): PronRule[] {
+  if (typeof raw !== 'string' || !raw.trim()) return []
+  try {
+    const arr = JSON.parse(raw) as unknown
+    if (!Array.isArray(arr)) return []
+    const out: PronRule[] = []
+    for (const r of arr) {
+      if (!r || typeof r !== 'object') continue
+      const from = String((r as Partial<PronRule>).from ?? '')
+      const to = String((r as Partial<PronRule>).to ?? '')
+      if (from) out.push({ from, to })
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Apply ALL pronunciation rules to text BEFORE synthesis (every provider).
+ * Longest `from` first so longer phrases win; every occurrence is replaced.
+ */
+export function applyPronRules(text: string, rules: PronRule[]): string {
+  if (!text || rules.length === 0) return text
+  let out = text
+  for (const r of [...rules].sort((a, b) => b.from.length - a.from.length)) {
+    if (r.from && r.from !== r.to) out = out.split(r.from).join(r.to)
+  }
+  return out
+}
+
+// Module-level cache of the global rules — speakOnce()/useQuickTts() apply them
+// without prop drilling; the 发音设置 sheet refreshes the cache after saving.
+let globalPronCache: PronRule[] = []
+let globalPronReady = false
+async function ensureGlobalPronRules(): Promise<PronRule[]> {
+  if (globalPronReady) return globalPronCache
+  globalPronReady = true
+  try {
+    const vals = await getState([GLOBAL_PRON_KEY])
+    globalPronCache = parsePronRules(vals[GLOBAL_PRON_KEY])
+  } catch {
+    globalPronCache = []
+  }
+  return globalPronCache
+}
+function cacheGlobalPronRules(rules: PronRule[]): void {
+  globalPronCache = rules
+  globalPronReady = true
+}
+
 export interface TtsPlayerProps {
   text: string
   settings: SettingsData
@@ -93,6 +170,8 @@ export interface TtsPlayerProps {
   cardTitle?: string
   /** 难块收藏持久化 key（建议传 card.id，缺省退回 cardTitle / 全局默认）。 */
   favoritesKey?: string
+  /** 卡片 id：发音规则按卡存储（tts:pron:<cardId>），缺省用全局规则。 */
+  cardId?: string
   /** 关闭播放器：停止播放并清理后回调父级卸载本组件。 */
   onClose?: () => void
 }
@@ -283,6 +362,7 @@ export function TtsPlayer({
   onTimerEnd,
   cardTitle,
   favoritesKey,
+  cardId,
   onClose,
 }: TtsPlayerProps) {
   // Voice defaults for this context, captured once on mount.
@@ -353,6 +433,44 @@ export function TtsPlayer({
 
   // ---- 注音开关（占位：拼音数据源接入后生效） ----
   const [pinyinOn, setPinyinOn] = useLocalStorage('bb-tts-pinyin', false)
+
+  // ---- 发音规则（多音字/专名读法替换）：合成前应用，规则变化即重合成 ----
+  const pronKey = cardId ? `tts:pron:${cardId}` : GLOBAL_PRON_KEY
+  const [pronRules, setPronRules] = React.useState<PronRule[]>([])
+  const [pronVersion, setPronVersion] = React.useState(0)
+  const pronRef = React.useRef<PronRule[]>([])
+  pronRef.current = pronRules
+  React.useEffect(() => {
+    let alive = true
+    void getState([pronKey]).then((vals) => {
+      if (!alive) return
+      const rules = parsePronRules(vals[pronKey])
+      setPronRules(rules)
+      setPronVersion((v) => v + 1)
+    })
+    return () => {
+      alive = false
+    }
+  }, [pronKey])
+
+  // ---- 发音设置 sheet ----
+  const [pronOpen, setPronOpen] = React.useState(false)
+  const [pronPrefill, setPronPrefill] = React.useState<PronRule | null>(null)
+  const openPronSheet = React.useCallback((prefill: PronRule | null) => {
+    setPronPrefill(prefill)
+    setPronOpen(true)
+  }, [])
+  const commitPronRules = React.useCallback(
+    (rules: PronRule[]) => {
+      setPronRules(rules)
+      pronRef.current = rules
+      setPronVersion((v) => v + 1)
+      void putState(pronKey, JSON.stringify(rules))
+      if (!cardId) cacheGlobalPronRules(rules)
+      toast.success('发音规则已保存，重新播放生效')
+    },
+    [pronKey, cardId],
+  )
 
   // ---- 定时停止 timer ----
   const [timerTotal, setTimerTotal] = React.useState<number | null>(null)
@@ -576,7 +694,7 @@ export function TtsPlayer({
       toast.error('当前浏览器不支持语音合成，请使用 Chrome / Edge')
       return
     }
-    const s = sentences[idx]
+    const s = applyPronRules(sentences[idx] ?? '', pronRef.current)
     if (!s || !s.trim()) {
       toast.error('没有可朗读的内容')
       return
@@ -645,7 +763,7 @@ export function TtsPlayer({
     const gen = ++genRef.current
     audioRef.current?.pause()
     setAudioPlaying(false)
-    const cacheKey = `${providerRef.current}|${providerRef.current === 'custom' ? customVoiceRef.current.trim() : voiceRef.current}|${speedRef.current.toFixed(2)}|${idx}`
+    const cacheKey = `${providerRef.current}|${providerRef.current === 'custom' ? customVoiceRef.current.trim() : voiceRef.current}|${speedRef.current.toFixed(2)}|p${pronVersion}|${idx}`
     const cached = cacheRef.current.get(cacheKey)
     if (cached) {
       loadedIdxRef.current = idx
@@ -660,7 +778,7 @@ export function TtsPlayer({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            text: s,
+            text: applyPronRules(s, pronRef.current),
             voice:
               providerRef.current === 'custom'
                 ? customVoiceRef.current.trim() || undefined
@@ -820,8 +938,9 @@ export function TtsPlayer({
     )
   }
 
-  const handleReport = () => {
-    toast.success('已收到纠错反馈，我们会尽快核实')
+  // 纠错：打开发音设置，预填该句原文，让用户直接改读法。
+  const handleReport = (sentence: string) => {
+    openPronSheet({ from: sentence, to: '' })
   }
 
   const handleClose = () => {
@@ -1033,7 +1152,7 @@ export function TtsPlayer({
                     }}
                     onPlay={() => handleCardPlay(i)}
                     onToggleFavorite={() => toggleFavorite(s)}
-                    onReport={handleReport}
+                    onReport={() => handleReport(s)}
                   />
                 )
               })}
@@ -1070,7 +1189,7 @@ export function TtsPlayer({
                     pinyinOn={pinyinOn}
                     onPlay={() => handleCardPlay(index)}
                     onToggleFavorite={() => toggleFavorite(sentence)}
-                    onReport={handleReport}
+                    onReport={() => handleReport(sentence)}
                   />
                 )
               })}
@@ -1304,6 +1423,20 @@ export function TtsPlayer({
                       )}
                     </div>
                   )}
+
+                  <button
+                    type="button"
+                    onClick={() => openPronSheet(null)}
+                    className="mt-3 flex w-full items-center justify-between rounded-xl border border-border px-3 py-2 text-left text-sm transition-colors hover:bg-accent"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Languages className="size-4 text-muted-foreground" />
+                      发音设置
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      {pronRules.length > 0 ? `${pronRules.length} 条规则` : '多音字读法'}
+                    </span>
+                  </button>
                 </PopoverContent>
               </Popover>
             </div>
@@ -1453,7 +1586,133 @@ export function TtsPlayer({
           </div>
         </SheetContent>
       </Sheet>
+
+      {/* 发音设置：多音字/专名读法替换规则 */}
+      <PronSheet
+        open={pronOpen}
+        rules={pronRules}
+        prefill={pronPrefill}
+        onOpenChange={(v) => {
+          setPronOpen(v)
+          if (!v) setPronPrefill(null)
+        }}
+        onCommit={commitPronRules}
+      />
     </>
+  )
+}
+
+/**
+ * 发音设置 Sheet：维护「原文 → 读法」替换规则列表。
+ * 保存后立即生效（合成前替换，所有引擎），并按卡/全局持久化。
+ */
+function PronSheet({
+  open,
+  rules,
+  prefill,
+  onOpenChange,
+  onCommit,
+}: {
+  open: boolean
+  rules: PronRule[]
+  prefill: PronRule | null
+  onOpenChange: (v: boolean) => void
+  onCommit: (rules: PronRule[]) => void
+}) {
+  const [draft, setDraft] = React.useState<PronRule[]>([])
+
+  React.useEffect(() => {
+    if (!open) return
+    const next = [...rules.map((r) => ({ ...r }))]
+    if (prefill && !next.some((r) => r.from === prefill.from)) next.push({ ...prefill })
+    setDraft(next)
+  }, [open, rules, prefill])
+
+  const save = () => {
+    const cleaned = draft
+      .map((r) => ({ from: r.from.trim(), to: r.to.trim() }))
+      .filter((r) => r.from)
+    const seen = new Set<string>()
+    const deduped = cleaned.filter((r) => {
+      if (seen.has(r.from)) return false
+      seen.add(r.from)
+      return true
+    })
+    onCommit(deduped)
+    onOpenChange(false)
+  }
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="bottom" className="flex max-h-[82vh] flex-col rounded-t-3xl p-0">
+        <SheetHeader className="shrink-0 border-b border-border px-5 pb-3 pt-4">
+          <SheetTitle className="flex items-center gap-2 text-base">
+            <Languages className="size-4.5" strokeWidth={1.75} />
+            发音设置
+          </SheetTitle>
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            让某些字词按指定读法朗读，如多音字「地 → de」、专名替换。对所有朗读引擎生效。
+          </p>
+        </SheetHeader>
+        <div className="flex-1 space-y-2 overflow-y-auto px-5 py-4">
+          {draft.length === 0 && (
+            <p className="py-8 text-center text-sm text-muted-foreground">
+              还没有发音规则，点击下方按钮添加
+            </p>
+          )}
+          {draft.map((r, i) => (
+            <div
+              key={i}
+              className="flex items-center gap-2 rounded-2xl border border-border bg-card p-2"
+            >
+              <Input
+                value={r.from}
+                onChange={(e) =>
+                  setDraft((prev) =>
+                    prev.map((x, j) => (j === i ? { ...x, from: e.target.value } : x)),
+                  )
+                }
+                placeholder="原文，如：地"
+                aria-label="原文"
+                className="h-9 flex-1 text-sm"
+              />
+              <span className="shrink-0 text-xs text-muted-foreground">读作</span>
+              <Input
+                value={r.to}
+                onChange={(e) =>
+                  setDraft((prev) =>
+                    prev.map((x, j) => (j === i ? { ...x, to: e.target.value } : x)),
+                  )
+                }
+                placeholder="读法，如：de"
+                aria-label="读法"
+                className="h-9 flex-1 text-sm"
+              />
+              <button
+                type="button"
+                aria-label={`删除第 ${i + 1} 条规则`}
+                onClick={() => setDraft((prev) => prev.filter((_, j) => j !== i))}
+                className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+              >
+                <Trash2 className="size-4" />
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => setDraft((prev) => [...prev, { from: '', to: '' }])}
+            className="flex h-10 w-full items-center justify-center gap-1.5 rounded-2xl border border-dashed border-border text-sm text-muted-foreground transition-colors hover:border-primary/40 hover:text-primary"
+          >
+            <Plus className="size-4" /> 添加规则
+          </button>
+        </div>
+        <div className="shrink-0 border-t border-border px-5 py-3">
+          <Button className="h-11 w-full rounded-full" onClick={save}>
+            保存规则
+          </Button>
+        </div>
+      </SheetContent>
+    </Sheet>
   )
 }
 
@@ -1528,6 +1787,11 @@ export function useQuickTts(context: string, settings: SettingsData | null): Qui
 
   const browserVoices = useBrowserVoices(pref.provider === 'browser')
 
+  // 发音规则：懒加载全局规则，speak 前应用。
+  React.useEffect(() => {
+    void ensureGlobalPronRules()
+  }, [])
+
   const stop = React.useCallback(() => {
     genRef.current += 1
     window.speechSynthesis?.cancel()
@@ -1537,11 +1801,12 @@ export function useQuickTts(context: string, settings: SettingsData | null): Qui
 
   const speak = React.useCallback(
     (raw: string) => {
-      const t = raw.trim()
-      if (!t) {
+      const t0 = raw.trim()
+      if (!t0) {
         toast.error('没有可朗读的内容')
         return
       }
+      const t = globalPronReady ? applyPronRules(t0, globalPronCache) : t0
       if (pref.provider === 'browser') {
         const synth = window.speechSynthesis
         if (!synth) {
@@ -1834,4 +2099,105 @@ export function VoiceSpeedBar({
       </PopoverContent>
     </Popover>
   )
+}
+
+// ---------------------------------------------------------------------------
+// speakOnce: one-shot TTS with the DEFAULT configured provider for a context.
+// Used by the reader's selection popup (朗读) and other one-off speak spots so
+// they follow the user's voice prefs instead of always using the browser API.
+// ---------------------------------------------------------------------------
+let speakOnceAudio: HTMLAudioElement | null = null
+let speakOnceUrl: string | null = null
+let speakOnceGen = 0
+
+export function stopSpeakOnce(): void {
+  speakOnceGen += 1
+  try {
+    window.speechSynthesis?.cancel()
+  } catch {
+    /* ignore */
+  }
+  if (speakOnceAudio) {
+    speakOnceAudio.pause()
+    speakOnceAudio = null
+  }
+  if (speakOnceUrl) {
+    URL.revokeObjectURL(speakOnceUrl)
+    speakOnceUrl = null
+  }
+}
+
+export function speakOnce(
+  text: string,
+  opts: {
+    context: string
+    settings: SettingsData | null
+    onEnd?: () => void
+  },
+): void {
+  const raw = (text || '').trim()
+  if (!raw) {
+    toast.error('没有可朗读的内容')
+    return
+  }
+  stopSpeakOnce()
+  const gen = ++speakOnceGen
+  const pref = seedQuickPref(opts.context, opts.settings)
+  void ensureGlobalPronRules().then((rules) => {
+    if (gen !== speakOnceGen) return
+    const t = applyPronRules(raw, rules)
+    if (pref.provider === 'browser') {
+      const synth = window.speechSynthesis
+      if (!synth) {
+        toast.error('当前浏览器不支持语音合成，请使用 Chrome / Edge')
+        return
+      }
+      synth.cancel()
+      const chunks = splitSpeechChunks(t)
+      chunks.forEach((chunk, i) => {
+        const u = new SpeechSynthesisUtterance(chunk)
+        u.lang = 'zh-CN'
+        u.rate = pref.speed
+        if (i === chunks.length - 1) {
+          u.onend = () => {
+            if (gen === speakOnceGen) opts.onEnd?.()
+          }
+        }
+        synth.speak(u)
+      })
+      return
+    }
+    void (async () => {
+      try {
+        const res = await fetch('/api/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: t,
+            voice: pref.provider === 'custom' ? pref.voice.trim() || undefined : pref.voice,
+            speed: pref.speed,
+            provider: pref.provider,
+          }),
+        })
+        if (!res.ok) {
+          const err = (await res.json().catch(() => ({}))) as { error?: string }
+          throw new Error(err.error || '生成语音失败')
+        }
+        if (gen !== speakOnceGen) return
+        const blob = await res.blob()
+        speakOnceUrl = URL.createObjectURL(blob)
+        const audio = new Audio(speakOnceUrl)
+        audio.playbackRate = pref.speed
+        audio.onended = () => {
+          if (gen === speakOnceGen) opts.onEnd?.()
+        }
+        speakOnceAudio = audio
+        void audio.play()
+      } catch (err) {
+        if (gen === speakOnceGen) {
+          toast.error('朗读失败：' + (err instanceof Error ? err.message : '未知错误'))
+        }
+      }
+    })()
+  })
 }

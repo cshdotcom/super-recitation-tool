@@ -132,32 +132,32 @@
 
 /* ---------- 护眼绿 (eye-care green) ---------- */
 .green {
-  --background: oklch(0.945 0.038 148);
-  --foreground: oklch(0.24 0.03 150);
-  --card: oklch(0.975 0.03 150);
-  --card-foreground: oklch(0.24 0.03 150);
-  --popover: oklch(0.975 0.03 150);
-  --popover-foreground: oklch(0.24 0.03 150);
-  --primary: oklch(0.32 0.05 155);
-  --primary-foreground: oklch(0.97 0.03 150);
-  --secondary: oklch(0.9 0.045 148);
-  --secondary-foreground: oklch(0.28 0.04 152);
-  --muted: oklch(0.9 0.045 148);
-  --muted-foreground: oklch(0.5 0.04 152);
-  --accent: oklch(0.9 0.045 148);
-  --accent-foreground: oklch(0.28 0.04 152);
+  --background: oklch(0.965 0.018 152);
+  --foreground: oklch(0.27 0.02 152);
+  --card: oklch(0.985 0.012 152);
+  --card-foreground: oklch(0.27 0.02 152);
+  --popover: oklch(0.985 0.012 152);
+  --popover-foreground: oklch(0.27 0.02 152);
+  --primary: oklch(0.4 0.05 158);
+  --primary-foreground: oklch(0.97 0.015 152);
+  --secondary: oklch(0.93 0.022 152);
+  --secondary-foreground: oklch(0.28 0.022 152);
+  --muted: oklch(0.93 0.022 152);
+  --muted-foreground: oklch(0.5 0.025 152);
+  --accent: oklch(0.93 0.022 152);
+  --accent-foreground: oklch(0.28 0.022 152);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.82 0.045 150);
-  --input: oklch(0.82 0.045 150);
-  --ring: oklch(0.6 0.06 152);
-  --sidebar: oklch(0.96 0.035 149);
-  --sidebar-foreground: oklch(0.24 0.03 150);
-  --sidebar-primary: oklch(0.32 0.05 155);
-  --sidebar-primary-foreground: oklch(0.97 0.03 150);
-  --sidebar-accent: oklch(0.9 0.045 148);
-  --sidebar-accent-foreground: oklch(0.28 0.04 152);
-  --sidebar-border: oklch(0.82 0.045 150);
-  --sidebar-ring: oklch(0.6 0.06 152);
+  --border: oklch(0.86 0.025 152);
+  --input: oklch(0.86 0.025 152);
+  --ring: oklch(0.62 0.045 155);
+  --sidebar: oklch(0.975 0.014 152);
+  --sidebar-foreground: oklch(0.27 0.02 152);
+  --sidebar-primary: oklch(0.4 0.05 158);
+  --sidebar-primary-foreground: oklch(0.97 0.015 152);
+  --sidebar-accent: oklch(0.93 0.022 152);
+  --sidebar-accent-foreground: oklch(0.28 0.022 152);
+  --sidebar-border: oklch(0.86 0.025 152);
+  --sidebar-ring: oklch(0.62 0.045 155);
 }
 
 /* ---------- 羊皮纸 (sepia paper) ---------- */
