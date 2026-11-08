@@ -2,6 +2,9 @@
 
 // ChatTool — AI督背 (supervise) & AI问问 (ask) chat panel.
 // Features:
+//   • 服务端持久化：全部对话（含附图）存 SQLite（/api/chat-log），
+//     切卡片/刷新/换设备均从服务端加载历史；删除/清空同步服务端。
+//   • 语音输入：输入框与 AI 提问卡的自定义回答均支持麦克风一键转文字。
 //   • per-reply actions: copy (copy icon) and delete (trash icon — also drops
 //     the adjacent user message that this reply answers)
 //   • 清空对话 header button with AlertDialog confirmation
@@ -24,6 +27,7 @@ import {
   X,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { VoiceInput } from '@/components/recitation/voice-input'
 
 import { cn } from '@/lib/utils'
 import type { ChatMessage } from '@/lib/types'
@@ -54,9 +58,20 @@ interface ChatToolProps {
   content: string
   /** Ask mode allows attaching images (vision) to user messages. */
   allowImages?: boolean
+  /** 当前卡片 id — 对话历史按 cardId+mode 存在服务端。 */
+  cardId?: string
 }
 
 interface UIMessage {
+  id: string
+  /** 服务端 ChatLog 行 id（历史消息与已同步的新消息）。 */
+  sid?: string
+  role: 'user' | 'assistant'
+  content: string
+  images?: string[]
+}
+
+interface ServerChatMsg {
   id: string
   role: 'user' | 'assistant'
   content: string
@@ -77,6 +92,32 @@ interface AskBlock {
 type AskSegment =
   | { kind: 'md'; value: string }
   | { kind: 'ask'; ask: AskBlock }
+
+/** 把一条消息写入服务端 ChatLog，返回行 id（失败返回 null，静默降级）。 */
+async function persistMessage(
+  cardId: string,
+  mode: 'supervise' | 'ask',
+  m: UIMessage,
+): Promise<string | null> {
+  try {
+    const res = await fetch('/api/chat-log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        cardId,
+        mode,
+        role: m.role,
+        content: m.content,
+        images: m.images ?? [],
+      }),
+    })
+    if (!res.ok) return null
+    const data = (await res.json()) as { id?: string }
+    return data.id ?? null
+  } catch {
+    return null
+  }
+}
 
 function uid(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -239,6 +280,12 @@ function AskCard({
             className="h-8 bg-card text-xs"
             aria-label="自定义回答"
           />
+          <VoiceInput
+            size="sm"
+            context="ask"
+            disabled={busy}
+            onText={(t) => setCustom((p) => (p ? p + t : t))}
+          />
           <Button
             type="submit"
             size="icon"
@@ -256,24 +303,92 @@ function AskCard({
 
 // ---------- main component ----------
 
-export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) {
+export function ChatTool({ mode, content, allowImages = false, cardId }: ChatToolProps) {
   const [messages, setMessages] = React.useState<UIMessage[]>([])
   const [askAnswered, setAskAnswered] = React.useState<Record<string, string>>({})
   const [copiedId, setCopiedId] = React.useState<string | null>(null)
   const [input, setInput] = React.useState('')
   const [pending, setPending] = React.useState<PendingImage[]>([])
   const [loading, setLoading] = React.useState(false)
+  /** 服务端历史是否已加载完成（防止自动打招呼与历史重复）。 */
+  const [historyReady, setHistoryReady] = React.useState(false)
   const scrollRef = React.useRef<HTMLDivElement>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
   const seededRef = React.useRef(false)
   const copyTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const idRef = React.useRef(0)
+  const stateKey = React.useMemo(
+    () => (cardId ? `chat:ask:${mode}:${cardId}` : ''),
+    [mode, cardId],
+  )
 
   React.useEffect(() => {
     return () => {
       if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
     }
   }, [])
+
+  // ---------- 服务端历史加载 ----------
+  React.useEffect(() => {
+    if (!cardId) {
+      setHistoryReady(true)
+      return
+    }
+    let alive = true
+    setHistoryReady(false)
+    seededRef.current = false
+    const key = stateKey
+    ;(async () => {
+      try {
+        const res = await fetch(
+          `/api/chat-log?cardId=${encodeURIComponent(cardId)}&mode=${mode}`,
+        )
+        if (!res.ok) return
+        const data = (await res.json()) as { messages?: ServerChatMsg[] }
+        if (!alive) return
+        const list: UIMessage[] = (data.messages || []).map((m) => ({
+          id: m.id,
+          sid: m.id,
+          role: m.role,
+          content: m.content,
+          ...(m.images && m.images.length > 0 ? { images: m.images } : {}),
+        }))
+        setMessages(list)
+        if (list.length > 0) seededRef.current = true // 有历史则不再自动打招呼
+        // AI 提问卡的已回答状态
+        if (key) {
+          const stRes = await fetch(`/api/state?key=${encodeURIComponent(key)}`)
+          if (stRes.ok) {
+            const st = (await stRes.json()) as { values?: Record<string, string | null> }
+            const raw = st.values?.[key]
+            if (raw) {
+              try {
+                const parsed = JSON.parse(raw) as Record<string, string>
+                if (alive && parsed && typeof parsed === 'object') setAskAnswered(parsed)
+              } catch {}
+            }
+          }
+        }
+      } catch {
+        /* 加载失败 → 空对话，不影响使用 */
+      } finally {
+        if (alive) setHistoryReady(true)
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [cardId, mode, stateKey])
+
+  // 已回答状态同步到服务端
+  React.useEffect(() => {
+    if (!stateKey || !historyReady) return
+    void fetch('/api/state', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: stateKey, value: JSON.stringify(askAnswered) }),
+    }).catch(() => {})
+  }, [askAnswered, stateKey, historyReady])
 
   const send = React.useCallback(
     async (text: string, images: string[] = []) => {
@@ -289,15 +404,13 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
         return
       }
       idRef.current += 1
-      const nextMessages: UIMessage[] = [
-        ...messages,
-        {
-          id: `u-${idRef.current}-${Date.now().toString(36)}`,
-          role: 'user',
-          content: trimmed,
-          ...(imgs.length > 0 ? { images: imgs } : {}),
-        },
-      ]
+      const userMsg: UIMessage = {
+        id: `u-${idRef.current}-${Date.now().toString(36)}`,
+        role: 'user',
+        content: trimmed,
+        ...(imgs.length > 0 ? { images: imgs } : {}),
+      }
+      const nextMessages: UIMessage[] = [...messages, userMsg]
       setMessages(nextMessages)
       setInput('')
       setPending([])
@@ -323,10 +436,29 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
         const data = (await res.json()) as { reply: string }
         const reply = (data.reply || '').trim() || '（无回复）'
         idRef.current += 1
-        setMessages((prev) => [
-          ...prev,
-          { id: `a-${idRef.current}-${Date.now().toString(36)}`, role: 'assistant', content: reply },
-        ])
+        const aiMsg: UIMessage = {
+          id: `a-${idRef.current}-${Date.now().toString(36)}`,
+          role: 'assistant',
+          content: reply,
+        }
+        setMessages((prev) => [...prev, aiMsg])
+        // 服务端持久化（user + assistant 两条）；失败静默，不影响使用
+        if (cardId) {
+          void (async () => {
+            const sidU = await persistMessage(cardId, mode, userMsg)
+            if (sidU) {
+              setMessages((prev) =>
+                prev.map((x) => (x.id === userMsg.id ? { ...x, sid: sidU } : x)),
+              )
+            }
+            const sidA = await persistMessage(cardId, mode, aiMsg)
+            if (sidA) {
+              setMessages((prev) =>
+                prev.map((x) => (x.id === aiMsg.id ? { ...x, sid: sidA } : x)),
+              )
+            }
+          })()
+        }
       } catch (err) {
         toast.error(
           mode === 'supervise' ? '督背请求失败' : '提问请求失败',
@@ -341,17 +473,18 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
     [messages, content, mode, allowImages],
   )
 
-  // Auto-seed a greeting for supervise mode
+  // Auto-seed a greeting for supervise mode（仅在服务端历史为空时）
   React.useEffect(() => {
+    if (!historyReady) return
     if (seededRef.current) return
     if (!content.trim()) return
-    if (mode === 'supervise') {
+    if (mode === 'supervise' && messages.length === 0) {
       seededRef.current = true
       void send('开始背诵吧，请引导我。')
     } else {
       seededRef.current = true
     }
-  }, [mode, content, send])
+  }, [historyReady, mode, content, messages.length, send])
 
   React.useEffect(() => {
     const el = scrollRef.current
@@ -423,21 +556,39 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
 
   /** Delete an assistant reply together with the adjacent (preceding) user message. */
   const deleteReply = (idx: number) => {
+    const target = messages[idx]
+    if (!target || target.role !== 'assistant') return
+    const prevUser = idx > 0 && messages[idx - 1]?.role === 'user' ? messages[idx - 1] : null
     setMessages((prev) => {
-      const target = prev[idx]
-      if (!target || target.role !== 'assistant') return prev
       const next = [...prev]
       next.splice(idx, 1)
-      if (idx > 0 && next[idx - 1]?.role === 'user') {
-        next.splice(idx - 1, 1)
-      }
+      if (prevUser) next.splice(idx - 1, 1)
       return next
     })
+    // 同步删除服务端记录
+    for (const sid of [target.sid, prevUser?.sid]) {
+      if (sid) {
+        void fetch(`/api/chat-log?id=${encodeURIComponent(sid)}`, {
+          method: 'DELETE',
+        }).catch(() => {})
+      }
+    }
   }
 
   const clearConversation = () => {
     setMessages([])
     setAskAnswered({})
+    if (cardId) {
+      void fetch(
+        `/api/chat-log?cardId=${encodeURIComponent(cardId)}&mode=${mode}`,
+        { method: 'DELETE' },
+      ).catch(() => {})
+      if (stateKey) {
+        void fetch(`/api/state?key=${encodeURIComponent(stateKey)}`, {
+          method: 'DELETE',
+        }).catch(() => {})
+      }
+    }
     toast.success('对话已清空')
   }
 
@@ -634,10 +785,18 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
           onChange={(e) => setInput(e.target.value)}
           placeholder={
             mode === 'supervise'
-              ? '回复督背老师…'
-              : '输入你的问题…'
+              ? '回复督背老师…（可语音输入）'
+              : '输入你的问题…（可语音输入）'
           }
           disabled={loading}
+        />
+        {/* 语音输入：识别结果追加到输入框 */}
+        <VoiceInput
+          size="sm"
+          variant="outline"
+          context={mode === 'supervise' ? 'supervise' : 'ask'}
+          disabled={loading}
+          onText={(t) => setInput((prev) => (prev ? prev + t : t))}
         />
         <Button
           type="submit"

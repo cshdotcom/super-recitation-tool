@@ -28,6 +28,7 @@ import { TTS_VOICES } from '@/lib/types'
 import { clampSpeed, SPEED_OPTIONS, saveVoicePref } from '@/lib/voice-prefs'
 import { splitSentences } from '@/lib/sentences'
 import { useLocalStorage } from '@/lib/use-local-storage'
+import { getState, putState } from '@/lib/server-state'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -51,6 +52,8 @@ import { Switch } from '@/components/ui/switch'
 import { PhoneTapIll } from '@/components/recitation/illustrations'
 
 const CUSTOM_VOICE_KEY = 'tts-custom-voice'
+/** 服务端持久化 key（/api/state）— 自定义音色真源。 */
+const VOICE_STATE_KEY = 'ui:tts-custom-voice'
 
 /** Max chars per utterance — speechSynthesis silently drops long utterances. */
 const MAX_CHUNK_LEN = 120
@@ -374,11 +377,28 @@ export function TtsPlayer({
   }, [])
 
   // Restore persisted custom voice (SSR-safe); context pref wins.
+  // 服务端为真源：先读本地镜像立即回显，再拉服务端覆盖；本地旧值自动迁移。
   React.useEffect(() => {
+    let alive = true
     const stored = localStorage.getItem(CUSTOM_VOICE_KEY) || ''
     const next = seeded?.provider === 'custom' && seeded.voice ? seeded.voice : stored
     customVoiceRef.current = next
     setCustomVoice(next)
+    void getState([VOICE_STATE_KEY]).then((vals) => {
+      if (!alive) return
+      const sv = vals[VOICE_STATE_KEY]
+      if (typeof sv === 'string' && sv) {
+        if (!(seeded?.provider === 'custom' && seeded.voice)) {
+          customVoiceRef.current = sv
+          setCustomVoice(sv)
+        }
+      } else if (stored) {
+        void putState(VOICE_STATE_KEY, stored)
+      }
+    })
+    return () => {
+      alive = false
+    }
   }, [seeded])
 
   React.useEffect(() => {
@@ -771,7 +791,11 @@ export function TtsPlayer({
   const handleCustomVoiceChange = (v: string) => {
     customVoiceRef.current = v
     setCustomVoice(v)
-    localStorage.setItem(CUSTOM_VOICE_KEY, v)
+    // 服务端真源 + 本地镜像（离线兑底）
+    try {
+      localStorage.setItem(CUSTOM_VOICE_KEY, v)
+    } catch {}
+    void putState(VOICE_STATE_KEY, v)
   }
 
   const handleVoiceURIChange = (v: string) => {

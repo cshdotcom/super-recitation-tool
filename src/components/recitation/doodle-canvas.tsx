@@ -18,6 +18,7 @@ import { toast } from 'sonner'
 
 import { Slider } from '@/components/ui/slider'
 import { cn } from '@/lib/utils'
+import { useServerState } from '@/lib/use-server-state'
 import { LongPressMenu, type MenuAction } from '@/components/recitation/long-press-menu'
 import {
   isDoodleStroke,
@@ -211,7 +212,10 @@ export function DoodleCanvas({ strokes, onStrokesChange, active, menuActions }: 
   const [width, setWidth] = React.useState(4)
   // Custom palette (localStorage-persisted) + inline palette expansion in the
   // long-press menu.
-  const [customColors, setCustomColors] = React.useState<string[]>([])
+  const [customColors, setCustomColors] = useServerState<string[]>(
+    CUSTOM_COLORS_KEY,
+    [],
+  )
   const [colorsExpanded, setColorsExpanded] = React.useState(false)
   // Last non-eraser tool, so 切换橡皮 can toggle back.
   const lastToolRef = React.useRef<DoodleTool>('pen')
@@ -223,30 +227,10 @@ export function DoodleCanvas({ strokes, onStrokesChange, active, menuActions }: 
     setColor(darkInk())
   }, [darkInk])
 
-  // Load the persisted custom palette once.
-  React.useEffect(() => {
-    try {
-      const raw = window.localStorage.getItem(CUSTOM_COLORS_KEY)
-      if (!raw) return
-      const arr: unknown = JSON.parse(raw)
-      if (Array.isArray(arr)) {
-        setCustomColors(arr.filter((c): c is string => typeof c === 'string').slice(0, MAX_CUSTOM_COLORS))
-      }
-    } catch {
-      // corrupted localStorage — ignore
-    }
-  }, [])
+  // 自定义调色板已由 useServerState 服务端持久化（本地旧数据自动迁移）。
 
   const addCustomColor = (c: string) => {
-    setCustomColors((prev) => {
-      const next = [c, ...prev.filter((x) => x !== c)].slice(0, MAX_CUSTOM_COLORS)
-      try {
-        window.localStorage.setItem(CUSTOM_COLORS_KEY, JSON.stringify(next))
-      } catch {
-        // storage full / unavailable — palette still works for this session
-      }
-      return next
-    })
+    setCustomColors((prev) => [c, ...prev.filter((x) => x !== c)].slice(0, MAX_CUSTOM_COLORS))
   }
 
   const pickCustomColor = (c: string) => {

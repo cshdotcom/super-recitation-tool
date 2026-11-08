@@ -47,6 +47,7 @@ import type { AccountData, CardData, ProjectData } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
+import { VoiceInput } from '@/components/recitation/voice-input'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -338,7 +339,12 @@ export function HomeView({
                       onChange={(e) => setQuery(e.target.value)}
                       placeholder="搜索标题与内容…"
                       aria-label="搜索"
-                      className="w-36 bg-transparent text-sm outline-none placeholder:text-muted-foreground/60 sm:w-56"
+                      className="w-32 bg-transparent text-sm outline-none placeholder:text-muted-foreground/60 sm:w-48"
+                    />
+                    <VoiceInput
+                      size="sm"
+                      context="search"
+                      onText={(t) => setQuery((p) => (p ? p + t : t))}
                     />
                     <button
                       type="button"

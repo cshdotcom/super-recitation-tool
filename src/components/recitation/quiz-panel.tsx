@@ -24,6 +24,8 @@ import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
 import type { QuizQuestion } from '@/lib/types'
+import { putState, getState, deleteState } from '@/lib/server-state'
+import { VoiceInput } from '@/components/recitation/voice-input'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -84,8 +86,10 @@ const MAX_PER_TYPE = 10
 const POINT_STAGES = ['正在阅读课文…', '正在提炼核心考点…', '正在整理知识点…', '即将完成…']
 const GEN_STAGES = ['正在回顾知识点…', '正在编写题目…', '正在核对答案…', '即将完成…']
 
-// ---------- localStorage：作答记录（错题本展示「我的答案」用，key = cardId::question） ----------
+// ---------- 作答记录（错题本展示「我的答案」用，key = cardId::question） ----------
+// 服务端为主（/api/state key=quiz:user-answers），localStorage 仅作离线镜像。
 const USER_ANSWERS_KEY = 'sb:quiz:user-answers:v1'
+const SERVER_ANSWERS_KEY = 'quiz:user-answers'
 
 export interface QuizUserAnswer {
   userAnswer: string
@@ -96,33 +100,83 @@ export function userAnswerKey(cardId: string, question: string): string {
   return `${cardId}::${question}`
 }
 
-export function readQuizUserAnswers(): Record<string, QuizUserAnswer> {
+/** 内存缓存（避免每次作答都重新拉取）。 */
+let answersCache: Record<string, QuizUserAnswer> | null = null
+
+function readLocalAnswers(): Record<string, QuizUserAnswer> {
   if (typeof window === 'undefined') return {}
   try {
     const raw = window.localStorage.getItem(USER_ANSWERS_KEY)
-    return raw ? (JSON.parse(raw) as Record<string, QuizUserAnswer>) : {}
+    return raw
+      ? (JSON.parse(raw) as Record<string, QuizUserAnswer>)
+      : {}
   } catch {
     return {}
   }
 }
 
-export function recordQuizUserAnswer(cardId: string, question: string, userAnswer: string) {
-  if (typeof window === 'undefined' || !cardId || !question) return
+function writeLocalAnswers(all: Record<string, QuizUserAnswer>) {
+  if (typeof window === 'undefined') return
   try {
-    const all = readQuizUserAnswers()
-    const keys = Object.keys(all)
-    if (keys.length > 300) {
-      for (const k of keys.slice(0, keys.length - 300)) delete all[k]
-    }
-    all[userAnswerKey(cardId, question)] = { userAnswer: userAnswer.slice(0, 500), at: Date.now() }
     window.localStorage.setItem(USER_ANSWERS_KEY, JSON.stringify(all))
   } catch {
     /* ignore */
   }
 }
 
-// ---------- localStorage：作答草稿（key 含 cardId） ----------
+function trimAnswers(all: Record<string, QuizUserAnswer>) {
+  const keys = Object.keys(all)
+  if (keys.length <= 300) return all
+  const out: Record<string, QuizUserAnswer> = {}
+  for (const k of keys.slice(keys.length - 300)) out[k] = all[k]
+  return out
+}
+
+/** 服务端优先加载作答记录（首次调用时自动把本地旧数据迁移上服务端）。 */
+export async function fetchQuizUserAnswers(): Promise<Record<string, QuizUserAnswer>> {
+  if (answersCache) return answersCache
+  const local = readLocalAnswers()
+  try {
+    const values = await getState([SERVER_ANSWERS_KEY])
+    const raw = values[SERVER_ANSWERS_KEY]
+    if (raw) {
+      const server = JSON.parse(raw) as Record<string, QuizUserAnswer>
+      const merged = { ...local, ...server }
+      answersCache = merged
+      // 本地有而服务端没有（旧版本数据）→ 迁移上传
+      if (Object.keys(local).some((k) => !(k in server))) {
+        void putState(SERVER_ANSWERS_KEY, JSON.stringify(trimAnswers(merged)))
+      }
+      return merged
+    }
+    if (Object.keys(local).length > 0) {
+      // 服务端为空但本地有 → 全量迁移
+      void putState(SERVER_ANSWERS_KEY, JSON.stringify(trimAnswers(local)))
+    }
+  } catch {
+    /* 解析失败 → 使用本地镜像 */
+  }
+  answersCache = local
+  return local
+}
+
+/** 记录一次作答（同步写入内存 + 异步落库服务端 + 本地镜像）。 */
+export function recordQuizUserAnswer(cardId: string, question: string, userAnswer: string) {
+  if (typeof window === 'undefined' || !cardId || !question) return
+  void (async () => {
+    const all = await fetchQuizUserAnswers()
+    all[userAnswerKey(cardId, question)] = {
+      userAnswer: userAnswer.slice(0, 500),
+      at: Date.now(),
+    }
+    writeLocalAnswers(all)
+    await putState(SERVER_ANSWERS_KEY, JSON.stringify(trimAnswers(all)))
+  })()
+}
+
+// ---------- 作答草稿（key 含 cardId，服务端为主 + localStorage 镜像） ----------
 const draftKey = (cardId?: string) => `sb:quiz:draft:${cardId || 'adhoc'}`
+const draftStateKey = (cardId?: string) => `quiz:draft:${cardId || 'adhoc'}`
 
 interface QuizDraft {
   v: 1
@@ -314,27 +368,54 @@ export function QuizPanel({
     }
   }, [content, startStages, stopStages])
 
-  // 首次进入：检测同卡片的作答草稿 → 弹「恢复上次作答？」
+  // 首次进入：从服务端检测同卡片的作答草稿 → 弹「恢复上次作答？」
+  // （服务端为主，localStorage 只作离线镜像；发现仅本地有旧草稿时自动迁移上传）
   React.useEffect(() => {
     draftCheckedRef.current = true
-    try {
-      const raw = window.localStorage.getItem(draftKey(cardId))
-      if (!raw) return
-      const d = JSON.parse(raw) as QuizDraft
-      const ok =
-        d?.v === 1 &&
-        Array.isArray(d.questions) &&
-        d.questions.some(
-          (q) =>
-            q &&
-            typeof q.question === 'string' &&
-            typeof q.answer === 'string' &&
-            VALID_TYPES.includes(q.type),
-        ) &&
-        !d.prompted
-      if (ok) setPendingDraft(d)
-    } catch {
-      /* ignore */
+    let alive = true
+    void (async () => {
+      const validate = (d: unknown): d is QuizDraft => {
+        const x = d as QuizDraft
+        const ok =
+          x?.v === 1 &&
+          Array.isArray(x.questions) &&
+          x.questions.some(
+            (q) =>
+              q &&
+              typeof q.question === 'string' &&
+              typeof q.answer === 'string' &&
+              VALID_TYPES.includes(q.type),
+          ) &&
+          !x.prompted
+        return ok
+      }
+      // 1) 服务端草稿
+      try {
+        const values = await getState([draftStateKey(cardId)])
+        const raw = values[draftStateKey(cardId)]
+        if (raw) {
+          const d = JSON.parse(raw) as QuizDraft
+          if (alive && validate(d)) setPendingDraft(d)
+          return
+        }
+      } catch {
+        /* 服务端不可用 → 回退本地 */
+      }
+      // 2) 本地旧草稿（迁移上传后仍可恢复）
+      try {
+        const raw = window.localStorage.getItem(draftKey(cardId))
+        if (!raw) return
+        const d = JSON.parse(raw) as QuizDraft
+        if (validate(d)) {
+          if (alive) setPendingDraft(d)
+          void putState(draftStateKey(cardId), raw) // 迁移到服务端
+        }
+      } catch {
+        /* ignore */
+      }
+    })()
+    return () => {
+      alive = false
     }
   }, [cardId])
 
@@ -347,6 +428,7 @@ export function QuizPanel({
   }, [step, points.length, pointsLoading, pointsError, fetchPoints])
 
   const clearDraftStorage = React.useCallback(() => {
+    void deleteState(draftStateKey(cardId))
     try {
       window.localStorage.removeItem(draftKey(cardId))
     } catch {
@@ -355,17 +437,30 @@ export function QuizPanel({
   }, [cardId])
 
   const dismissDraft = () => {
-    try {
-      const raw = window.localStorage.getItem(draftKey(cardId))
-      if (raw) {
-        const d = JSON.parse(raw) as QuizDraft
-        d.prompted = true
-        window.localStorage.setItem(draftKey(cardId), JSON.stringify(d))
-      }
-    } catch {
-      /* ignore */
-    }
     setPendingDraft(null)
+    // 标记「已提示过」并写回服务端（+本地镜像），不再重复弹窗
+    void (async () => {
+      let d: QuizDraft | null = null
+      try {
+        const values = await getState([draftStateKey(cardId)])
+        const raw = values[draftStateKey(cardId)]
+        if (raw) d = JSON.parse(raw) as QuizDraft
+      } catch {}
+      if (!d) {
+        try {
+          const raw = window.localStorage.getItem(draftKey(cardId))
+          if (raw) d = JSON.parse(raw) as QuizDraft
+        } catch {}
+      }
+      if (d) {
+        d.prompted = true
+        const s = JSON.stringify(d)
+        void putState(draftStateKey(cardId), s)
+        try {
+          window.localStorage.setItem(draftKey(cardId), s)
+        } catch {}
+      }
+    })()
   }
 
   const restoreDraft = (d: QuizDraft) => {
@@ -393,21 +488,24 @@ export function QuizPanel({
 
   const saveDraft = () => {
     if (questions.length === 0) return
-    try {
-      const draft: QuizDraft = {
-        v: 1,
-        savedAt: Date.now(),
-        questions,
-        answers,
-        revealed: [...revealed],
-        favorites: [...favorites],
-        checkMode,
-      }
-      window.localStorage.setItem(draftKey(cardId), JSON.stringify(draft))
-      toast.success('已添加到草稿，下次打开可恢复')
-    } catch {
-      toast.error('草稿保存失败')
+    const draft: QuizDraft = {
+      v: 1,
+      savedAt: Date.now(),
+      questions,
+      answers,
+      revealed: [...revealed],
+      favorites: [...favorites],
+      checkMode,
     }
+    const s = JSON.stringify(draft)
+    // 服务端为主 + 本地镜像（离线兜底）
+    void putState(draftStateKey(cardId), s)
+    try {
+      window.localStorage.setItem(draftKey(cardId), s)
+    } catch {
+      /* ignore */
+    }
+    toast.success('已添加到草稿（已存服务端），下次打开可恢复')
   }
 
   // ---- Step2 → 生成题目 ----
@@ -997,25 +1095,51 @@ export function QuizPanel({
                       </div>
                     )}
 
-                    {/* 填空 / 简答 */}
+                    {/* 填空 / 简答（均支持语音输入） */}
                     {(q.type === 'fill' || isShort) && (
                       <div className="flex flex-col gap-2">
                         {isShort ? (
-                          <Textarea
-                            value={userAnswer}
-                            onChange={(e) => setAnswer(idx, e.target.value)}
-                            placeholder="在此输入你的答案…"
-                            rows={3}
-                            disabled={isRevealed}
-                            className="text-sm"
-                          />
+                          <div className="flex items-end gap-1.5">
+                            <Textarea
+                              value={userAnswer}
+                              onChange={(e) => setAnswer(idx, e.target.value)}
+                              placeholder="在此输入你的答案…（可语音输入）"
+                              rows={3}
+                              disabled={isRevealed}
+                              className="text-sm"
+                            />
+                            <VoiceInput
+                              size="sm"
+                              context="quiz"
+                              disabled={isRevealed}
+                              onText={(t) =>
+                                setAnswer(
+                                  idx,
+                                  (answers[idx] || '') + t,
+                                )
+                              }
+                            />
+                          </div>
                         ) : (
-                          <Input
-                            value={userAnswer}
-                            onChange={(e) => setAnswer(idx, e.target.value)}
-                            placeholder="在此输入你的答案…"
-                            disabled={isRevealed}
-                          />
+                          <div className="flex items-center gap-1.5">
+                            <Input
+                              value={userAnswer}
+                              onChange={(e) => setAnswer(idx, e.target.value)}
+                              placeholder="在此输入你的答案…（可语音输入）"
+                              disabled={isRevealed}
+                            />
+                            <VoiceInput
+                              size="sm"
+                              context="quiz"
+                              disabled={isRevealed}
+                              onText={(t) =>
+                                setAnswer(
+                                  idx,
+                                  (answers[idx] || '') + t,
+                                )
+                              }
+                            />
+                          </div>
                         )}
                       </div>
                     )}
@@ -1152,6 +1276,13 @@ export function QuizPanel({
             className="text-sm"
             placeholder="知识点内容"
           />
+          <div className="flex items-center justify-end">
+            <VoiceInput
+              size="sm"
+              context="quiz"
+              onText={(t) => setEditText((p) => (p ? p + t : t))}
+            />
+          </div>
           <ImportancePicker value={editImportance} onChange={setEditImportance} />
           <DialogFooter className="gap-2">
             <Button variant="outline" className="flex-1 rounded-full" onClick={() => setEditingPoint(null)}>
@@ -1179,8 +1310,15 @@ export function QuizPanel({
             onChange={(e) => setAddText(e.target.value)}
             rows={3}
             className="text-sm"
-            placeholder="例如：本文的中心思想…"
+            placeholder="例如：本文的中心思想…（可语音输入）"
           />
+          <div className="flex items-center justify-end">
+            <VoiceInput
+              size="sm"
+              context="quiz"
+              onText={(t) => setAddText((p) => (p ? p + t : t))}
+            />
+          </div>
           <ImportancePicker value={addImportance} onChange={setAddImportance} />
           <DialogFooter className="gap-2">
             <Button variant="outline" className="flex-1 rounded-full" onClick={() => setAddOpen(false)}>

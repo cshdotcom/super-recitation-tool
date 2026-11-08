@@ -125,6 +125,8 @@ export function ToolsSheet({
             originalText={content}
             keywords={card.keywords}
             settings={settings}
+            cardId={card.id}
+            cardTitle={card.title}
           />
         )
       case 'quiz':
@@ -138,9 +140,9 @@ export function ToolsSheet({
           />
         )
       case 'supervise':
-        return <ChatTool mode="supervise" content={content} />
+        return <ChatTool mode="supervise" content={content} cardId={card.id} />
       case 'ask':
-        return <ChatTool mode="ask" content={content} allowImages />
+        return <ChatTool mode="ask" content={content} allowImages cardId={card.id} />
       case 'mindmap':
         return (
           <MindmapView

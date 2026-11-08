@@ -168,3 +168,39 @@ model ReviewLog {
   durationSec Int      @default(0)
   createdAt   DateTime @default(now())
 }
+
+// AI问问 / AI督背 对话历史 — 服务端持久化，刷新/换设备不丢。
+// mode: ask(AI问问) | supervise(AI督背)；role: user | assistant。
+// images: JSON string[]（用户消息附图 dataURL，压缩后入库）。
+model ChatLog {
+  id        String   @id @default(uuid())
+  cardId    String   @default("")
+  mode      String   // ask | supervise
+  role      String   // user | assistant
+  content   String
+  images    String   @default("[]")
+  createdAt DateTime @default(now())
+}
+
+// 挖空背诵成绩记录 — 每次语音背诵/挖空自评打分后落库，服务端可查历史。
+// score: 准确率 0-100；missed/matched: JSON string[] 关键词。
+model ReciteLog {
+  id        String   @id @default(uuid())
+  cardId    String
+  cardTitle String   @default("")
+  score     Int      @default(0)
+  text      String   @default("")
+  missed    String   @default("[]")
+  matched   String   @default("[]")
+  createdAt DateTime @default(now())
+}
+
+// 通用 KV 状态（服务端持久化）— 答题草稿、作答记录、每日背诵计划进度、
+// 眼睛按钮位置、涂鸦调色板、TTS 音色记忆等一切原本散落在 localStorage
+// 的用户数据统一搬到这里，保证「所有数据都存在服务端」。
+// key 形如 "quiz:draft:<cardId>" / "plan:<cardId>:<YYYY-MM-DD>" / "ui:eyeFabPos"。
+model AppState {
+  key       String   @id
+  value     String   @default("")
+  updatedAt DateTime @updatedAt
+}

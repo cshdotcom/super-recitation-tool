@@ -37,10 +37,11 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import {
-  readQuizUserAnswers,
+  fetchQuizUserAnswers,
   recordQuizUserAnswer,
   userAnswerKey,
 } from '@/components/recitation/quiz-panel'
+import { VoiceInput } from '@/components/recitation/voice-input'
 
 interface WrongQuestionsViewProps {
   onBack: () => void
@@ -170,7 +171,14 @@ export function WrongQuestionsView({
   }, [autoRemove])
 
   React.useEffect(() => {
-    setUserAnswers(readQuizUserAnswers())
+    let alive = true
+    // 作答记录从服务端加载（自动迁移本地旧数据）
+    void fetchQuizUserAnswers().then((all) => {
+      if (alive) setUserAnswers(all)
+    })
+    return () => {
+      alive = false
+    }
   }, [])
 
   const loadStats = React.useCallback(async () => {
@@ -491,7 +499,7 @@ export function WrongQuestionsView({
     const total = mode === 'similar' ? similarItems.length : filteredItems.length
     setDone({ right, total })
     setMode('done')
-    setUserAnswers(readQuizUserAnswers())
+    void fetchQuizUserAnswers().then(setUserAnswers)
     Promise.all([loadStats(), loadItems()])
   }
 
@@ -1165,12 +1173,20 @@ function PracticeBoard({
             ))}
           </div>
         ) : (
-          <Input
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            placeholder="输入你的答案"
-            className="mt-4 h-11 rounded-xl"
-          />
+          <div className="mt-4 flex items-center gap-1.5">
+            <Input
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              placeholder="输入你的答案（可语音输入）"
+              className="h-11 rounded-xl"
+            />
+            <VoiceInput
+              size="sm"
+              context="quiz"
+              disabled={revealed}
+              onText={(t) => setInput((p) => (p ? p + t : t))}
+            />
+          </div>
         )}
       </div>
 

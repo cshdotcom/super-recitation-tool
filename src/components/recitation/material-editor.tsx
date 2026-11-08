@@ -65,6 +65,7 @@ import { toast } from 'sonner'
 import type { CardData, MaterialBlock } from '@/lib/types'
 import { extractClozeMarks, wrapClozeMark } from '@/lib/editor-cloze'
 import { cn } from '@/lib/utils'
+import { VoiceInput } from '@/components/recitation/voice-input'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -221,9 +222,13 @@ type AutoTextareaProps = Omit<React.ComponentProps<'textarea'>, 'ref' | 'value'>
   register: (el: HTMLTextAreaElement | null) => void
   /** 变化时触发重新量高（如全局字号/行距变化） */
   resizeKey?: string
+  /** 语音识别文本追加回调 — 提供时在右下角显示麦克风按钮 */
+  onVoiceText?: (text: string) => void
+  /** 语音输入上下文（音色偏好） */
+  voiceContext?: string
 }
 
-function AutoTextarea({ value, register, resizeKey, ...rest }: AutoTextareaProps) {
+function AutoTextarea({ value, register, resizeKey, onVoiceText, voiceContext, ...rest }: AutoTextareaProps) {
   const elRef = React.useRef<HTMLTextAreaElement | null>(null)
   React.useEffect(() => {
     const el = elRef.current
@@ -232,14 +237,26 @@ function AutoTextarea({ value, register, resizeKey, ...rest }: AutoTextareaProps
     el.style.height = `${el.scrollHeight}px`
   }, [value, resizeKey])
   return (
-    <Textarea
-      {...rest}
-      value={value}
-      ref={(el: HTMLTextAreaElement | null) => {
-        elRef.current = el
-        register(el)
-      }}
-    />
+    <div className="relative">
+      <Textarea
+        {...rest}
+        value={value}
+        ref={(el: HTMLTextAreaElement | null) => {
+          elRef.current = el
+          register(el)
+        }}
+      />
+      {onVoiceText && (
+        <div className="absolute bottom-1.5 right-1.5 z-10">
+          <VoiceInput
+            size="sm"
+            context={voiceContext || 'editor'}
+            disabled={rest.disabled}
+            onText={onVoiceText}
+          />
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -1375,9 +1392,11 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                       onChange={(e) => updateField(i, 'front', e.target.value)}
                       onFocus={() => handleTAFocus(i, 'front')}
                       onBlur={() => setKbUp(false)}
-                      placeholder="点击编辑核心论点"
+                      placeholder="点击编辑核心论点（可语音输入）"
                       aria-label={`第${i + 1}块核心论点（正面）`}
-                      className="min-h-11 resize-none rounded-xl border-0 bg-muted px-3 py-2.5 shadow-none focus-visible:ring-1"
+                      className="min-h-11 resize-none rounded-xl border-0 bg-muted px-3 py-2.5 pr-10 shadow-none focus-visible:ring-1"
+                      onVoiceText={(t) => updateField(i, 'front', block.front + t)}
+                      voiceContext="editor"
                     />
 
                     {/* 完整内容（背面）：编辑 / Markdown 预览 */}
@@ -1412,10 +1431,12 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                         onChange={(e) => updateField(i, 'back', e.target.value)}
                         onFocus={() => handleTAFocus(i, 'back')}
                         onBlur={() => setKbUp(false)}
-                        placeholder="新段落内容..."
+                        placeholder="新段落内容...（可语音输入）"
                         aria-label={`第${i + 1}块完整内容（背面）`}
                         resizeKey={`${fontSize}-${lineSpacing}`}
                         style={{ fontSize, lineHeight: lineSpacing }}
+                        onVoiceText={(t) => updateField(i, 'back', block.back + t)}
+                        voiceContext="editor"
                         className="min-h-28 resize-none rounded-xl border-0 bg-muted px-3 py-3 shadow-none focus-visible:ring-1"
                       />
                     )}

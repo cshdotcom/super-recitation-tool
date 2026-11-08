@@ -35,6 +35,7 @@ import { REVIEW_ACTIONS } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { ruleCloze, splitParagraphs } from '@/lib/cloze'
 import { todayKey, useLocalStorage } from '@/lib/use-local-storage'
+import { useServerState } from '@/lib/use-server-state'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -200,8 +201,8 @@ export function ReaderView({
   const [reviewMode, setReviewMode] = React.useState(false)
   // TTS 全屏播放器 Sheet
   const [ttsOpen, setTtsOpen] = React.useState(false)
-  // 眼睛悬浮球位置（可拖动，localStorage 记忆）
-  const [eyePos, setEyePos] = useLocalStorage<{ x: number; y: number } | null>(
+  // 眼睛悬浮球位置（可拖动；服务端持久化 + localStorage 即时水合）
+  const [eyePos, setEyePos] = useServerState<{ x: number; y: number } | null>(
     'eyeFabPos',
     null,
   )
@@ -212,11 +213,11 @@ export function ReaderView({
   // paged mode indicator
   const [page, setPage] = React.useState(0)
 
-  // daily plan progress (localStorage per card per day)
-  const [progress, setProgress] = useLocalStorage<number>(todayKey(card.id), 0)
-  // bottom bar visibility (client-side preference)
-  const [showQuickBar] = useLocalStorage<boolean>('showQuickBar', true)
-  const [showToolBar] = useLocalStorage<boolean>('showToolBar', true)
+  // daily plan progress（服务端持久化：plan-{cardId}-{yyyymmdd}）
+  const [progress, setProgress] = useServerState<number>(todayKey(card.id), 0)
+  // bottom bar visibility（同样存服务端，换设备不丢）
+  const [showQuickBar] = useServerState<boolean>('showQuickBar', true)
+  const [showToolBar] = useServerState<boolean>('showToolBar', true)
 
   const goal = card.plan?.goal ?? 10
   const paragraphs = React.useMemo(() => splitParagraphs(card.content), [card.content])

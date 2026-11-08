@@ -77,6 +77,9 @@ interface AsrRecorderProps {
   settings: SettingsData
   /** Feature context key for per-context voice defaults (VOICE_CONTEXTS). */
   context?: string
+  /** 当前卡片 id/标题 — 背诵成绩落库到服务端 ReciteLog。 */
+  cardId?: string
+  cardTitle?: string
 }
 
 interface AsrResult {
@@ -86,11 +89,23 @@ interface AsrResult {
   matched: string[]
 }
 
+/** 服务端返回的一条背诵记录。 */
+interface ReciteLogItem {
+  id: string
+  score: number
+  text: string
+  createdAt: string
+  missed: string[]
+  matched: string[]
+}
+
 export function AsrRecorder({
   originalText,
   keywords,
   settings,
   context = 'asr',
+  cardId,
+  cardTitle,
 }: AsrRecorderProps) {
   // Per-context ASR defaults captured once on mount (fall back to global).
   const [seeded] = React.useState(() => settings.voicePrefs?.[context]?.asr)
@@ -104,6 +119,26 @@ export function AsrRecorder({
   const [loading, setLoading] = React.useState(false)
   const [seconds, setSeconds] = React.useState(0)
   const [result, setResult] = React.useState<AsrResult | null>(null)
+  /** 服务端背诵记录（挖空/语音背诵历史，全部存在服务器）。 */
+  const [history, setHistory] = React.useState<ReciteLogItem[]>([])
+
+  // 加载服务端背诵记录
+  React.useEffect(() => {
+    if (!cardId) {
+      setHistory([])
+      return
+    }
+    let alive = true
+    fetch(`/api/recite-log?cardId=${encodeURIComponent(cardId)}&limit=10`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: { logs?: ReciteLogItem[] } | null) => {
+        if (alive && data?.logs) setHistory(data.logs)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [cardId])
 
   // MediaRecorder flow (zai / custom providers)
   const mediaRecorderRef = React.useRef<MediaRecorder | null>(null)
@@ -189,8 +224,40 @@ export function AsrRecorder({
       }
       setResult({ text, score, missed, matched })
       if (tid) toast.success(`识别完成 · 准确率 ${score}%`, { id: tid })
+      // 背诵成绩落库到服务端（ReciteLog），保证记录不丢失
+      if (cardId) {
+        void fetch('/api/recite-log', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cardId,
+            cardTitle: cardTitle || '',
+            score,
+            text,
+            missed,
+            matched,
+          }),
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d: { id?: string } | null) => {
+            if (d?.id) {
+              setHistory((prev) => [
+                {
+                  id: d.id as string,
+                  score,
+                  text,
+                  createdAt: new Date().toISOString(),
+                  missed,
+                  matched,
+                },
+                ...prev,
+              ].slice(0, 10))
+            }
+          })
+          .catch(() => {})
+      }
     },
-    [originalText, keywords],
+    [originalText, keywords, cardId, cardTitle],
   )
 
   // ---------- server flow (zai / custom): MediaRecorder ----------
@@ -593,6 +660,88 @@ export function AsrRecorder({
       {!originalText.trim() && (
         <div className="text-center text-xs text-muted-foreground">
           请先选择一张有内容的背书卡
+        </div>
+      )}
+
+      {/* 服务端背诵记录（挖空/语音背诵历史，存在服务器） */}
+      {cardId && history.length > 0 && (
+        <div className="flex flex-col gap-2 rounded-lg border bg-muted/20 p-3">
+          <div className="flex items-center justify-between">
+            <div className="text-xs font-medium text-muted-foreground">
+              背诵记录 · 已存服务端（{history.length}）
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                if (history.length === 0) return
+                void (async () => {
+                  const ok = await fetch(
+                    `/api/recite-log?cardId=${encodeURIComponent(cardId)}`,
+                    { method: 'DELETE' },
+                  ).catch(() => null)
+                  if (ok && ok.ok) {
+                    setHistory([])
+                    toast.success('背诵记录已清空')
+                  } else {
+                    toast.error('清空失败')
+                  }
+                })()
+              }}
+              className="rounded-full px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-red-600"
+            >
+              清空记录
+            </button>
+          </div>
+          <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+            {history.map((h) => (
+              <div
+                key={h.id}
+                className="flex items-center gap-2 rounded-md border bg-card px-2.5 py-1.5"
+              >
+                <span
+                  className={cn(
+                    'shrink-0 rounded-md px-1.5 py-0.5 text-xs font-semibold',
+                    h.score >= 80
+                      ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                      : h.score >= 60
+                        ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400'
+                        : 'bg-destructive/10 text-destructive',
+                  )}
+                >
+                  {h.score}%
+                </span>
+                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                  {h.text}
+                </span>
+                <span className="shrink-0 text-[10px] text-muted-foreground/70">
+                  {new Date(h.createdAt).toLocaleString('zh-CN', {
+                    month: 'numeric',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })}
+                </span>
+                <button
+                  type="button"
+                  aria-label="删除该条记录"
+                  onClick={() => {
+                    void fetch(`/api/recite-log?id=${encodeURIComponent(h.id)}`, {
+                      method: 'DELETE',
+                    })
+                      .then((r) => {
+                        if (r.ok) {
+                          setHistory((prev) => prev.filter((x) => x.id !== h.id))
+                        }
+                      })
+                      .catch(() => {})
+                  }}
+                  className="shrink-0 rounded p-0.5 text-muted-foreground/60 transition-colors hover:bg-accent hover:text-red-600"
+                >
+                  <XCircle className="size-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

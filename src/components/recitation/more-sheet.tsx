@@ -19,7 +19,7 @@ import { toast } from 'sonner'
 import type { CardData, ClozeStyle, PageMode, SettingsData, ThemeName } from '@/lib/types'
 import { THEME_OPTIONS } from '@/lib/types'
 import { cn } from '@/lib/utils'
-import { useLocalStorage } from '@/lib/use-local-storage'
+import { useServerState } from '@/lib/use-server-state'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import { FocusMode } from '@/components/recitation/focus-mode'
 import { Slider } from '@/components/ui/slider'
@@ -198,8 +198,8 @@ export function MoreSheet({
   const [templateExpanded, setTemplateExpanded] = React.useState(false)
   const [fontSizeDraft, setFontSizeDraft] = React.useState(settings.fontSize)
   const [focusOpen, setFocusOpen] = React.useState(false)
-  const [showQuickBar, setShowQuickBar] = useLocalStorage<boolean>('showQuickBar', true)
-  const [showToolBar, setShowToolBar] = useLocalStorage<boolean>('showToolBar', true)
+  const [showQuickBar, setShowQuickBar] = useServerState<boolean>('showQuickBar', true)
+  const [showToolBar, setShowToolBar] = useServerState<boolean>('showToolBar', true)
 
   React.useEffect(() => {
     if (open) {
