@@ -122,6 +122,18 @@ function parsePoints(raw: unknown): { text: string; importance: 'core' | 'second
   return out
 }
 
+/** 上游 AI/网络层报错 → 友好中文（避免把英文堆栈式错误直接透传给客户端）。 */
+function friendlyUpstreamError(msg: string): string {
+  if (
+    /API request failed|Failed to fetch|fetch failed|NetworkError|ECONN|socket|network|timeout|timed out|aborted/i.test(
+      msg,
+    )
+  ) {
+    return 'AI 服务暂时不可用，请稍后重试；多次失败请到「设置 → AI 配置」检查'
+  }
+  return msg
+}
+
 export async function POST(req: NextRequest) {
   try {
     const account = await getSessionUser()
@@ -277,6 +289,6 @@ export async function POST(req: NextRequest) {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('[POST /api/quiz] failed:', err)
-    return NextResponse.json({ error: msg }, { status: 500 })
+    return NextResponse.json({ error: friendlyUpstreamError(msg) }, { status: 500 })
   }
 }

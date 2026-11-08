@@ -96,8 +96,24 @@ export async function POST(req: NextRequest) {
         ? `你是一位严格而鼓励人的背书督背老师。用户正在背诵下面这段课文原文。任务：1) 引导用户逐句逐段背诵；2) 对照原文检查用户背诵，精确指出漏字、错字、多字；3) 多给提示而非直接给完整答案，除非用户明确说"想不起来"；4) 适时鼓励。每次回复简短，不超过180字。\n\n【课文原文】\n${content}${ASK_PROMPT}`
         : `你是这篇课文的阅读理解助手。根据下面这段课文原文回答用户的问题，帮助理解内容、主旨、写作手法、字词含义等。回答简明准确，不超过300字。\n\n【课文原文】\n${content}${ASK_PROMPT}`
 
+    // 上游要求至少一条 user 消息：空对话历史时补一条开场白，
+    // 避免只有 system 消息导致 API 400（messages 参数非法）。
+    const opener: ChatMessage[] =
+      incomingMessages.length === 0
+        ? [
+            {
+              role: 'user',
+              content:
+                mode === 'supervise'
+                  ? '老师好，请开始引导我背诵这篇课文。'
+                  : '请根据这篇课文给我讲讲主旨和重点，并向我提一个理解检查问题。',
+            },
+          ]
+        : []
+
     const finalMessages: ChatMessage[] = [
       { role: 'system', content: systemPrompt },
+      ...opener,
       ...incomingMessages,
     ]
 

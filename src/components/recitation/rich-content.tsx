@@ -24,11 +24,14 @@ import remarkMath from 'remark-math'
 import rehypeHighlight from 'rehype-highlight'
 import rehypeKatex from 'rehype-katex'
 import rehypeRaw from 'rehype-raw'
+// 化学公式扩展（\ce{H2O} 等）——必须在 rehype-katex 处理前导入以补丁同一 katex 实例
+import 'katex/contrib/mhchem'
 import 'katex/dist/katex.min.css'
 import { useTheme } from 'next-themes'
 import { Check, Copy } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
+import { expandSpanDirectives } from '@/lib/inline-style'
 import 'highlight.js/styles/github.css'
 
 // ---------- $ currency guard (math false-positive protection) ----------
@@ -380,7 +383,8 @@ export const RichContent = React.memo(function RichContent({
             rehypePlugins={[rehypeRaw, rehypeHighlight, rehypeKatex]}
             components={MARKDOWN_COMPONENTS}
           >
-            {guardDollarsOutsideCode(seg.value)}
+            {/* 先展开 %%样式|文字%% 指令（代码段内不动），再护住非数学的 $ 货币对 */}
+            {guardDollarsOutsideCode(expandSpanDirectives(seg.value))}
           </ReactMarkdown>
         ),
       )}

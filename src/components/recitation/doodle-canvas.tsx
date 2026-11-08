@@ -604,9 +604,9 @@ export function DoodleCanvas({ strokes, onStrokesChange, active, menuActions }: 
     <div
       ref={wrapRef}
       className={cn(
-        // z-30 while active: the toolbar inside must paint above the sticky
-        // quick-chips bar (z-20). z-[5] keeps it under text UI when idle.
-        active ? 'z-30' : 'z-[5]',
+        // 画布永远压在吸底菜单（z-20/z-30）之下，避免“画板盖住菜单”；
+        // 工具栏本身改为 fixed 悬浮（见下方 bottom 样式），不受内容区位置影响。
+        active ? 'z-10' : 'z-[5]',
         'absolute inset-0',
         active ? 'pointer-events-auto select-none' : 'pointer-events-none',
       )}
@@ -630,7 +630,10 @@ export function DoodleCanvas({ strokes, onStrokesChange, active, menuActions }: 
       </LongPressMenu>
 
       {active && (
-        <div className="absolute inset-x-2 bottom-2 z-20 rounded-2xl border border-border bg-background/95 p-2 shadow-xl backdrop-blur">
+        <div
+          style={{ bottom: 'var(--doodle-bottom, 12px)' }}
+          className="fixed inset-x-2 z-50 rounded-2xl border border-border bg-background/95 p-2 shadow-xl backdrop-blur"
+        >
           {/* Row 1: tools | undo/redo | clear */}
           <div className="no-scrollbar flex items-center gap-0.5 overflow-x-auto" role="toolbar" aria-label="涂鸦工具">
             {TOOLS.map((t) => {

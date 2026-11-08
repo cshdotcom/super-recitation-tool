@@ -211,6 +211,25 @@ export function ReaderView({
   // 进入卡片时间（评分时长上报用）
   const enterTimeRef = React.useRef<number>(Date.now())
 
+  // 涂鸦工具栏悬浮偏移：测量吸底菜单实时高度，注入 --doodle-bottom，
+  // 让涂鸦工具栏（fixed）始终悬浮在吸底菜单上方，不遮挡也不被遮挡。
+  const stickyBarRef = React.useRef<HTMLDivElement>(null)
+  React.useEffect(() => {
+    const el = stickyBarRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const apply = () => {
+      const h = el.getBoundingClientRect().height
+      document.documentElement.style.setProperty('--doodle-bottom', `${Math.round(h + 10)}px`)
+    }
+    apply()
+    const ro = new ResizeObserver(apply)
+    ro.observe(el)
+    return () => {
+      ro.disconnect()
+      document.documentElement.style.removeProperty('--doodle-bottom')
+    }
+  }, [])
+
   // paged mode indicator
   const [page, setPage] = React.useState(0)
 
@@ -646,7 +665,7 @@ export function ReaderView({
       toast.info('涂鸦模式：在正文上绘制笔迹，笔迹会自动保存')
     }
     if (nextMode === 'brush' && mode !== 'brush') {
-      toast.info('挖空刷：按住并滑过词语即可挖空')
+      toast.info('挖空刷：按住滑过一段文字，松手即挖成一个空')
     }
     if (nextMode === 'editor' && mode !== 'editor') {
       toast.info('挖空编辑：长按选择文字挖空，点击已挖空的词取消')
@@ -837,11 +856,9 @@ export function ReaderView({
         )}
 
         {/* ---------- Content ---------- */}
-        {/* pb reserves space for the doodle toolbar overlay while 涂鸦 mode is on */}
-        <section
-          className={cn('relative mt-4 min-h-[260px]', mode === 'doodle' && 'pb-36')}
-          aria-label="正文"
-        >
+        {/* 涂鸦工具栏已改为 fixed 悬浮在吸底菜单上方（--doodle-bottom 由下方测量注入），
+            内容区不再需要 pb-36 占位，画布也永远不会盖住吸底菜单 */}
+        <section className="relative mt-4 min-h-[260px]" aria-label="正文">
           <DoodleCanvas
             strokes={card.strokes}
             onStrokesChange={(strokes) => onUpdateCard({ ...card, strokes })}
@@ -879,7 +896,7 @@ export function ReaderView({
 
           {mode === 'brush' && (
             <div className="pointer-events-none absolute left-1/2 top-0 z-10 -translate-x-1/2 rounded-full bg-emerald-600 px-3 py-1 text-xs text-white shadow-lg">
-              挖空刷：按住滑过词语挖空
+              挖空刷：按住滑过一段文字，松手挖成一个空
             </div>
           )}
         </section>
@@ -980,7 +997,13 @@ export function ReaderView({
         </section>
 
         {/* ---------- Sticky bottom area ---------- */}
-        <div className="sticky bottom-0 z-20 -mx-4 mt-4 border-t border-border bg-background/95 px-4 pb-2 pt-3 backdrop-blur">
+        <div
+          ref={stickyBarRef}
+          className={cn(
+            'sticky bottom-0 z-20 -mx-4 mt-4 border-t border-border bg-background/95 px-4 pb-2 pt-3 backdrop-blur',
+            mode === 'doodle' && 'z-30',
+          )}
+        >
           {mode === 'editor' ? (
             <>
               <ClozeEditorBar
@@ -1015,7 +1038,7 @@ export function ReaderView({
                         <button
                           type="button"
                           className={cn(
-                            'flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs transition-colors',
+                            'flex min-h-9 shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs transition-colors',
                             ruleOpen
                               ? 'border-emerald-600/50 bg-emerald-500/10 text-emerald-600'
                               : 'border-border bg-card text-muted-foreground hover:text-foreground',
@@ -1060,7 +1083,7 @@ export function ReaderView({
                     type="button"
                     aria-pressed={active}
                     className={cn(
-                      'flex shrink-0 items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs transition-colors',
+                      'flex min-h-9 shrink-0 items-center gap-1.5 rounded-full border px-3.5 py-1.5 text-xs transition-colors',
                       active
                         ? 'border-emerald-600/50 bg-emerald-500/10 text-emerald-600'
                         : 'border-border bg-card text-muted-foreground hover:text-foreground',
@@ -1083,7 +1106,7 @@ export function ReaderView({
                   <button
                     key={t.key}
                     type="button"
-                    className="flex w-16 shrink-0 flex-col items-center gap-1 rounded-xl py-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    className="flex w-16 shrink-0 flex-col items-center gap-1 rounded-xl py-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                     onClick={() => openTool(t.key)}
                   >
                     <Icon className="size-5" strokeWidth={1.75} />
@@ -1093,7 +1116,7 @@ export function ReaderView({
               })}
               <button
                 type="button"
-                className="flex w-16 shrink-0 flex-col items-center gap-1 rounded-xl py-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                className="flex w-16 shrink-0 flex-col items-center gap-1 rounded-xl py-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                 onClick={() => openTool(null)}
               >
                 <LayoutGrid className="size-5" strokeWidth={1.75} />
@@ -1203,7 +1226,7 @@ export function ReaderView({
         onBrushMode={() => {
           setMoreOpen(false)
           setMode((cur) => (cur === 'brush' ? null : 'brush'))
-          toast.info('挖空刷：按住并滑过要挖空的字即可')
+          toast.info('挖空刷：按住滑过一段文字，松手挖成一个空')
         }}
       />
 

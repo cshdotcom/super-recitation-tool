@@ -44,6 +44,14 @@ interface CameraCaptureProps {
   onOpenChange: (open: boolean) => void
   /** Called with recognized text after a successful OCR (merged when multi-page). */
   onText: (text: string) => void
+  /**
+   * 'ocr'（默认）：识别文字后回调 onText；
+   * 'photo'：裁剪后直接把照片 dataURL 回调 onPhoto（编辑器“拍照插入”用）。
+   */
+  mode?: 'ocr' | 'photo'
+  onPhoto?: (dataUrl: string) => void
+  /** 独立相机页（新标签页 /?cam=1）：拍完自动回传 opener 并关闭 */
+  standalone?: boolean
 }
 
 interface PhotoItem {
@@ -75,7 +83,36 @@ const nextId = () => `ph-${Date.now().toString(36)}-${(_idCounter++).toString(36
 
 const clampZoom = (z: number) => Math.min(MAX_ZOOM, Math.max(1, z))
 
-export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps) {
+/** 按原图像素 box 裁出 dataURL（拍照插入用，保留较高质量） */
+function cropToDataUrl(
+  src: string,
+  box: { x: number; y: number; width: number; height: number },
+  maxW = 1600,
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => {
+      const bw = Math.max(1, box.width)
+      const bh = Math.max(1, box.height)
+      const w = Math.max(1, Math.min(maxW, Math.round(bw)))
+      const h = Math.max(1, Math.round((bh / bw) * w))
+      const canvas = document.createElement('canvas')
+      canvas.width = w
+      canvas.height = h
+      const ctx = canvas.getContext('2d')
+      if (!ctx) {
+        reject(new Error('画布不可用'))
+        return
+      }
+      ctx.drawImage(img, box.x, box.y, bw, bh, 0, 0, w, h)
+      resolve(canvas.toDataURL('image/jpeg', 0.9))
+    }
+    img.onerror = () => reject(new Error('图片解码失败'))
+    img.src = src
+  })
+}
+
+export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhoto, standalone = false }: CameraCaptureProps) {
   const videoRef = React.useRef<HTMLVideoElement>(null)
   const canvasRef = React.useRef<HTMLCanvasElement>(null)
   const streamRef = React.useRef<MediaStream | null>(null)
@@ -107,12 +144,17 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
   }, [])
 
   const startStream = React.useCallback(
-    async (mode: 'environment' | 'user') => {
+    async (camFacing: 'environment' | 'user') => {
       stopStream()
       setPermissionError(false)
+      // 浏览器/内嵌 iframe 不支持 getUserMedia：直接进入降级面板（可从相册选或新标签页打开）
+      if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+        setPermissionError(true)
+        return
+      }
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: mode, width: { ideal: 1920 }, height: { ideal: 1080 } },
+          video: { facingMode: camFacing, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: false,
         })
         streamRef.current = stream
@@ -275,6 +317,29 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
   // 完成裁剪：保存 cropPixels，回到取景器拍下一页
   const finishCrop = () => setViewMode('camera')
 
+  // photo 模式：导出当前裁剪结果并回调 onPhoto（独立页时回传 opener 并关闭）
+  const exportCurrentPhoto = async () => {
+    if (!current) return
+    try {
+      const out = current.cropPixels
+        ? await cropToDataUrl(current.dataUrl, current.cropPixels)
+        : current.dataUrl
+      if (standalone) {
+        try {
+          window.opener?.postMessage({ type: 'beishuba-camera-photo', dataUrl: out }, window.location.origin)
+        } catch {
+          /* opener 不可用时忽略 */
+        }
+        window.close()
+        return
+      }
+      onPhoto?.(out)
+      onOpenChange(false)
+    } catch (err) {
+      toast.error('导出照片失败：' + (err instanceof Error ? err.message : '未知错误'))
+    }
+  }
+
   // 取消裁剪：丢弃当前照片的裁剪状态
   const cancelCrop = () => {
     if (current) {
@@ -418,7 +483,19 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
             {permissionError && !current && (
               <div className="flex flex-col items-center gap-3 px-6 py-12 text-center text-sm text-zinc-400">
                 <Camera className="size-10 text-zinc-600" strokeWidth={1.25} />
-                相机不可用，请从相册选择图片识别
+                相机不可用或未授权，可从相册选择图片
+                {typeof window !== 'undefined' && window.self !== window.top && (
+                  <>
+                    <p className="text-xs text-zinc-500">预览面板可能拦截了相机权限，在新标签页打开即可正常唤起摄像头</p>
+                    <button
+                      type="button"
+                      onClick={() => window.open('/?cam=1', '_blank')}
+                      className="mt-1 rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-emerald-700"
+                    >
+                      在新标签页打开相机
+                    </button>
+                  </>
+                )}
               </div>
             )}
           </div>
@@ -489,10 +566,10 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
                 <Button
                   size="sm"
                   className="h-9 rounded-full bg-emerald-600 px-4 text-white hover:bg-emerald-700"
-                  onClick={finishCrop}
+                  onClick={mode === 'photo' ? () => void exportCurrentPhoto() : finishCrop}
                 >
                   <Scissors className="size-3.5" strokeWidth={1.75} />
-                  完成裁剪
+                  {mode === 'photo' ? '使用这张' : '完成裁剪'}
                 </Button>
               </div>
             </>
@@ -517,21 +594,31 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
                 </div>
               )}
 
-              {/* 识别全部并合并 */}
+              {/* 识别全部并合并（ocr）/ 使用当前照片（photo） */}
               {photos.length > 0 && (
                 <div className="px-4 pt-3">
-                  <Button
-                    className="h-11 w-full rounded-full bg-emerald-600 text-sm font-semibold text-white hover:bg-emerald-700"
-                    onClick={() => void handleRecognizeAll()}
-                    disabled={ocrLoading}
-                  >
-                    {ocrLoading ? (
-                      <Loader2 className="size-4 animate-spin" />
-                    ) : (
-                      <ScanText className="size-4" strokeWidth={1.75} />
-                    )}
-                    识别全部并合并{ocrTotal > 0 ? `（${ocrTotal} 页）` : ''}
-                  </Button>
+                  {mode === 'photo' ? (
+                    <Button
+                      className="h-11 w-full rounded-full bg-emerald-600 text-sm font-semibold text-white hover:bg-emerald-700"
+                      onClick={() => void exportCurrentPhoto()}
+                    >
+                      <Images className="size-4" strokeWidth={1.75} />
+                      使用当前照片
+                    </Button>
+                  ) : (
+                    <Button
+                      className="h-11 w-full rounded-full bg-emerald-600 text-sm font-semibold text-white hover:bg-emerald-700"
+                      onClick={() => void handleRecognizeAll()}
+                      disabled={ocrLoading}
+                    >
+                      {ocrLoading ? (
+                        <Loader2 className="size-4 animate-spin" />
+                      ) : (
+                        <ScanText className="size-4" strokeWidth={1.75} />
+                      )}
+                      识别全部并合并{ocrTotal > 0 ? `（${ocrTotal} 页）` : ''}
+                    </Button>
+                  )}
                 </div>
               )}
             </>

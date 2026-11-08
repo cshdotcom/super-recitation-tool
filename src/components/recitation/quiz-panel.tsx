@@ -79,40 +79,64 @@ interface QuizImageItem {
 function compressQuizImage(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
-    reader.onerror = () => reject(new Error('图片读取失败'))
+    reader.onerror = () => reject(new Error('图片读取失败，请换一张试试'))
     reader.onload = () => {
       const img = new Image()
-      img.onerror = () => reject(new Error('图片解析失败'))
+      img.onerror = () => reject(new Error('图片解析失败，请换一张试试'))
       img.onload = () => {
-        let w = img.width
-        let h = img.height
-        if (w > 1024 || h > 1024) {
-          const scale = Math.min(1024 / w, 1024 / h)
-          w = Math.round(w * scale)
-          h = Math.round(h * scale)
+        try {
+          // 多档尺寸逐级缩小 + 逐级降质，确保最终不超过服务端 400KB base64 限制
+          const scales = [1024, 768, 512, 384]
+          for (const maxSide of scales) {
+            let w = img.width
+            let h = img.height
+            if (w > maxSide || h > maxSide) {
+              const scale = Math.min(maxSide / w, maxSide / h)
+              w = Math.round(w * scale)
+              h = Math.round(h * scale)
+            }
+            const canvas = document.createElement('canvas')
+            canvas.width = w
+            canvas.height = h
+            const ctx = canvas.getContext('2d')
+            if (!ctx) {
+              reject(new Error('无法处理图片，请换一张试试'))
+              return
+            }
+            ctx.drawImage(img, 0, 0, w, h)
+            let quality = 0.85
+            let out = canvas.toDataURL('image/jpeg', quality)
+            while (out.length > IMAGE_B64_LIMIT && quality > 0.4) {
+              quality -= 0.15
+              out = canvas.toDataURL('image/jpeg', quality)
+            }
+            if (out.length <= IMAGE_B64_LIMIT) {
+              resolve(out)
+              return
+            }
+          }
+          reject(new Error('图片过大压缩后仍超限，请裁剪或换一张更小的图片'))
+        } catch {
+          reject(new Error('图片压缩失败，请换一张试试'))
         }
-        const canvas = document.createElement('canvas')
-        canvas.width = w
-        canvas.height = h
-        const ctx = canvas.getContext('2d')
-        if (!ctx) {
-          reject(new Error('无法处理图片'))
-          return
-        }
-        ctx.drawImage(img, 0, 0, w, h)
-        // 逐级降低质量，确保不超过服务端 400KB base64 限制
-        let quality = 0.85
-        let out = canvas.toDataURL('image/jpeg', quality)
-        while (out.length > IMAGE_B64_LIMIT && quality > 0.4) {
-          quality -= 0.15
-          out = canvas.toDataURL('image/jpeg', quality)
-        }
-        resolve(out)
       }
       img.src = reader.result as string
     }
     reader.readAsDataURL(file)
   })
+}
+
+/** 把 /api/quiz、/api/quiz-points 的报错转成可读中文
+ *  （服务端 500 会透传上游原始英文错误，直接展示对用户不友好）。 */
+function friendlyQuizError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err || '')
+  if (!msg) return 'AI 服务暂时不可用，请稍后重试'
+  if (/API request failed|Failed to fetch|fetch failed|NetworkError|ECONN|socket|network/i.test(msg)) {
+    return 'AI 服务暂时不可用，请稍后重试；多次失败请到「设置 → AI 配置」检查'
+  }
+  if (/timeout|timed out|aborted/i.test(msg)) return '请求超时，请检查网络后重试'
+  if (/Unexpected|JSON|parse/i.test(msg)) return 'AI 返回格式异常，请重试一次'
+  return msg
 }
 
 // ---------- 知识点 ----------
@@ -255,13 +279,40 @@ function normJudge(s: string): string {
   return t
 }
 
+/** choice/judge 的标准答案归一：
+ *  judge → 「正确/错误」二值；choice → 若 LLM 违约返回「A」-「H」字母，则映射到对应选项全文。 */
+function resolveChoiceAnswer(q: QuizQuestionX): string {
+  if (q.type === 'judge') return normJudge(q.answer)
+  const ans = (q.answer || '').trim()
+  const opts = q.options ?? []
+  if (opts.length > 0 && /^[A-Ha-h]$/.test(ans)) {
+    const idx = ans.toUpperCase().charCodeAt(0) - 65
+    if (idx >= 0 && idx < opts.length) return opts[idx]
+  }
+  return ans
+}
+
+/** 多选题正确答案解析：兼容「选项文本、选项文本」与「A、C」字母两种 LLM 输出。 */
+function parseMultiCorrect(q: QuizQuestionX): string[] {
+  const parts = (q.answer || '')
+    .split(/[、,，;；]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const opts = q.options ?? []
+  if (opts.length > 0 && parts.length > 0 && parts.every((p) => /^[A-Ha-h]$/.test(p))) {
+    const mapped = parts.map((p) => opts[p.toUpperCase().charCodeAt(0) - 65])
+    if (mapped.length === parts.length && mapped.every(Boolean)) return mapped
+  }
+  return parts
+}
+
 /** null = 需要自评（简答题） */
 function gradeAnswer(q: QuizQuestionX, userAns: string): boolean | null {
   const ans = (userAns || '').trim()
   if (!ans) return false
   switch (q.type) {
     case 'choice':
-      return ans === q.answer.trim()
+      return ans === resolveChoiceAnswer(q)
     case 'judge':
       return normJudge(ans) === normJudge(q.answer)
     case 'multi': {
@@ -269,10 +320,7 @@ function gradeAnswer(q: QuizQuestionX, userAns: string): boolean | null {
         .split(MULTI_SEP)
         .map((s) => s.trim())
         .filter(Boolean)
-      const correct = q.answer
-        .split(/[、,，;；]/)
-        .map((s) => s.trim())
-        .filter(Boolean)
+      const correct = parseMultiCorrect(q)
       if (picked.length === 0 || picked.length !== correct.length) return false
       return [...picked].sort().join('\u0002') === [...correct].sort().join('\u0002')
     }
@@ -424,7 +472,13 @@ export function QuizPanel({
       setPoints(pts)
       setSelectedPoints(new Set(pts.map((p) => p.id)))
     } catch (err) {
-      setPointsError(err instanceof Error ? err.message : '知识点生成失败')
+      const friendly = friendlyQuizError(err)
+      // 图片识别链路失败时给出「可退回文字出题」的引导，避免用户卡死在图片模式
+      setPointsError(
+        pointImages.length > 0 && /暂时不可用|超时|格式异常/.test(friendly)
+          ? `${friendly}；也可以移除图片，改用课文文字直接出题`
+          : friendly,
+      )
     } finally {
       stopStages()
       setPointsLoading(false)
@@ -460,6 +514,7 @@ export function QuizPanel({
           dataUrl,
         })),
       ])
+      toast.success(`已添加 ${urls.length} 张图片，将随知识点一起识别`)
     }
   }
 
@@ -643,7 +698,7 @@ export function QuizPanel({
         (q): q is QuizQuestionX =>
           !!q && typeof q.question === 'string' && typeof q.answer === 'string',
       )
-      if (qs.length === 0) throw new Error('AI 未返回题目，请重试')
+      if (qs.length === 0) throw new Error('AI 未返回有效题目，请重试')
       setQuestions(qs)
       setAnswers({})
       setRevealed(new Set())
@@ -657,8 +712,8 @@ export function QuizPanel({
       setStep('answering')
       toast.success(`已生成 ${qs.length} 道题`)
     } catch (err) {
-      // 友好错误（含服务端消息）留在「出题中」视图，提供重试 / 返回
-      setGenError(err instanceof Error ? err.message : '未知错误')
+      // 友好中文错误（含服务端消息）留在「出题中」视图，提供重试 / 返回
+      setGenError(friendlyQuizError(err))
     } finally {
       stopStages()
     }
@@ -833,6 +888,12 @@ export function QuizPanel({
       return next
     })
   }
+  // 反选：已选的取消、未选的勾上
+  const invertPoints = () => {
+    setSelectedPoints(
+      (prev) => new Set(points.filter((p) => !prev.has(p.id)).map((p) => p.id)),
+    )
+  }
   const openEditPoint = (p: PointItem) => {
     setEditingPoint(p)
     setEditText(p.text)
@@ -914,13 +975,23 @@ export function QuizPanel({
             onBack={() => setStep('idle')}
             right={
               points.length > 0 && !pointsLoading ? (
-                <button
-                  type="button"
-                  onClick={toggleAllPoints}
-                  className="text-xs text-muted-foreground transition-colors hover:text-foreground"
-                >
-                  {allSelected ? '取消全选' : '全选'}
-                </button>
+                <div className="flex items-center gap-2 text-xs">
+                  <button
+                    type="button"
+                    onClick={toggleAllPoints}
+                    className="text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    {allSelected ? '取消全选' : '全选'}
+                  </button>
+                  <span className="text-muted-foreground/40">·</span>
+                  <button
+                    type="button"
+                    onClick={invertPoints}
+                    className="text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    反选
+                  </button>
+                </div>
               ) : null
             }
           />
@@ -1169,12 +1240,7 @@ export function QuizPanel({
                 : isShort
                   ? selfJudge[idx] === true
                   : gradeAnswer(q, userAnswer) === true
-              const multiCorrect = isMulti
-                ? q.answer
-                    .split(/[、,，;；]/)
-                    .map((s) => s.trim())
-                    .filter(Boolean)
-                : null
+              const multiCorrect = isMulti ? parseMultiCorrect(q) : null
 
               return (
                 <li key={idx}>
@@ -1218,7 +1284,7 @@ export function QuizPanel({
                           const correctOpt = isRevealed
                             ? isMulti
                               ? multiCorrect?.includes(opt) ?? false
-                              : opt === q.answer
+                              : opt === resolveChoiceAnswer(q)
                             : false
                           const wrongPick = isRevealed && selected && !correctOpt
                           return (
@@ -1230,7 +1296,7 @@ export function QuizPanel({
                                 isMulti ? toggleMultiOption(idx, opt) : setAnswer(idx, opt)
                               }
                               className={cn(
-                                'flex items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition-colors',
+                                'flex min-h-[44px] items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition-colors',
                                 !isRevealed && selected
                                   ? 'border-emerald-500/50 bg-emerald-500/10'
                                   : 'hover:bg-accent',
@@ -1279,10 +1345,11 @@ export function QuizPanel({
                               context="quiz"
                               disabled={isRevealed}
                               onText={(t) =>
-                                setAnswer(
-                                  idx,
-                                  (answers[idx] || '') + t,
-                                )
+                                // 函数式追加：避免录音期间answers变化的闭包过期问题
+                                setAnswers((prev) => ({
+                                  ...prev,
+                                  [idx]: (prev[idx] || '') + t,
+                                }))
                               }
                             />
                           </div>
@@ -1299,10 +1366,11 @@ export function QuizPanel({
                               context="quiz"
                               disabled={isRevealed}
                               onText={(t) =>
-                                setAnswer(
-                                  idx,
-                                  (answers[idx] || '') + t,
-                                )
+                                // 函数式追加：避免录音期间answers变化的闭包过期问题
+                                setAnswers((prev) => ({
+                                  ...prev,
+                                  [idx]: (prev[idx] || '') + t,
+                                }))
                               }
                             />
                           </div>
@@ -1316,7 +1384,11 @@ export function QuizPanel({
                         <p>
                           <span className="text-muted-foreground">参考答案：</span>
                           <span className="font-medium text-emerald-700 dark:text-emerald-300">
-                            {isJudge ? normJudge(q.answer) : q.answer}
+                            {isJudge
+                              ? normJudge(q.answer)
+                              : isMulti
+                                ? parseMultiCorrect(q).join('、')
+                                : q.answer}
                           </span>
                         </p>
                         {isMulti && (

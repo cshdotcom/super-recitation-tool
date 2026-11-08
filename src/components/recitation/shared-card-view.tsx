@@ -13,6 +13,7 @@ import { toast } from 'sonner'
 import type { ShareInfo } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { normKeywordEntries, keywordTexts } from '@/lib/cloze'
+import { parseSpanDirective, spanStyleCss } from '@/lib/inline-style'
 import { ClozeText } from '@/components/recitation/cloze-text'
 import RichContent from '@/components/recitation/rich-content'
 import { Button } from '@/components/ui/button'
@@ -155,11 +156,10 @@ export function SharedCardView({ token, onExit }: SharedCardViewProps) {
       )
     }
     // 3) 编辑器自定义标记 → 标准 HTML
-    // 字色 %%#dc2626|文%% → <span style="color:#dc2626">（颜色值白名单校验）
-    s = s.replace(/%%([^|%\n]+)\|([\s\S]*?)%%/g, (_m, color: string, text: string) => {
-      const c = color.trim()
-      const safe = /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/.test(c) ? c : 'inherit'
-      return `<span style="color:${safe}">${text}</span>`
+    // 字色/字号 %%dir|文%% → <span style="…">（共享解析器：颜色白名单校验 + fs 字号）
+    s = s.replace(/%%([^|%\n]+)\|([\s\S]*?)%%/g, (_m, dir: string, text: string) => {
+      const css = spanStyleCss(parseSpanDirective(dir))
+      return css ? `<span style="${css}">${text}</span>` : text
     })
     // 荧光笔 ==文== → <mark>（嵌套时外层已存在 mark 也可接受）
     s = s.replace(/==([^=\n]+)==/g, '<mark class="rounded bg-amber-300/70 px-0.5 dark:bg-amber-500/40">$1</mark>')

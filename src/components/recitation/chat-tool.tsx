@@ -17,6 +17,8 @@
 //   • TTS 朗读：每条 AI 回复可点击喇叭播放（useQuickTts，按 ask/supervise
 //     上下文取音色）；顶栏可开关「自动朗读」（默认关，/api/state 记忆）与
 //     「音色设置」（引擎/音色/倍速，PATCH /api/settings + sb-voice-prefs-changed）。
+//   • 移动端：visualViewport 感知软键盘并等量收窄面板高度（输入框不被遮挡）；
+//     小图标按钮用 after 伪元素把触控热区扩到 ≥44px（视觉不变）。
 import * as React from 'react'
 import {
   Check,
@@ -81,6 +83,27 @@ const COMPRESS_OVER = 300 * 1024
 const MAX_IMAGE_DIM = 1024
 /** Assistant bubble internal scroll cap (px). */
 const REPLY_MAX_H = 320
+
+/** 小图标按钮的触控热区扩展（after 伪元素，视觉不变、命中区 ≥44px）。 */
+const HIT_AREA =
+  "relative after:absolute after:-inset-2 after:rounded-[inherit] after:content-['']"
+/** 更矮的文字按钮（如「清空对话」）用更大的外扩半径凑足 44px。 */
+const HIT_AREA_LG =
+  "relative after:absolute after:-inset-2.5 after:rounded-[inherit] after:content-['']"
+
+/** 移动端图标按钮 ≥44px 触控尺寸，sm 及以上恢复紧凑视觉尺寸。 */
+const TOUCH_SM = 'size-11 sm:size-9'
+const TOUCH_XS = 'size-11 sm:size-8'
+/** VoiceInput 的按钮在子元素上，用 arbitrary child variant 覆盖其尺寸。 */
+const TOUCH_MIC = '[&>button]:size-11 sm:[&>button]:size-8'
+
+/** 聚焦输入框后，等软键盘弹出动画结束再把元素滚入可视区（防遮挡兜底）。 */
+function keepInputVisible(e: React.FocusEvent<HTMLElement>) {
+  const el = e.currentTarget
+  window.setTimeout(() => {
+    el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }, 350)
+}
 
 interface ChatToolProps {
   mode: 'supervise' | 'ask'
@@ -157,8 +180,38 @@ function uid(): string {
   return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+/** Lenient parse of an ```ask payload: tolerates surrounding prose,
+ *  pretty-printed newlines and trailing commas. Returns null when the
+ *  payload is unusable (caller degrades to plain-text rendering). */
+function tryParseAskBlock(raw: string): AskBlock | null {
+  const candidates = [raw.trim()]
+  const brace = raw.match(/\{[\s\S]*\}/)
+  if (brace) candidates.push(brace[0])
+  for (const c of candidates) {
+    // second pass: strip trailing commas (common model slip)
+    for (const t of [c, c.replace(/,\s*([}\]])/g, '$1')]) {
+      try {
+        const obj = JSON.parse(t) as { question?: unknown; options?: unknown }
+        if (typeof obj?.question === 'string' && Array.isArray(obj.options)) {
+          const options = obj.options
+            .filter((o): o is string => typeof o === 'string' && o.trim().length > 0)
+            .map((o) => o.trim())
+            .slice(0, 6)
+          const question = obj.question.trim()
+          if (question && options.length > 0) {
+            return { question, options }
+          }
+        }
+      } catch {
+        // try the next candidate
+      }
+    }
+  }
+  return null
+}
+
 /** Split assistant content into markdown and ```ask segments.
- *  Invalid ask JSON degrades to the raw fenced code block. */
+ *  Invalid ask JSON degrades to the raw fenced code block (plain text). */
 function splitAskSegments(content: string): AskSegment[] {
   const parts = content.split(/```ask[ \t]*\r?\n?([\s\S]*?)```/g)
   const segs: AskSegment[] = []
@@ -167,20 +220,7 @@ function splitAskSegments(content: string): AskSegment[] {
       segs.push({ kind: 'md', value: parts[i] })
       continue
     }
-    let ask: AskBlock | null = null
-    try {
-      const obj = JSON.parse(parts[i]) as { question?: unknown; options?: unknown }
-      if (typeof obj?.question === 'string' && Array.isArray(obj.options)) {
-        const options = obj.options
-          .filter((o): o is string => typeof o === 'string' && o.trim().length > 0)
-          .slice(0, 6)
-        if (obj.question.trim() && options.length > 0) {
-          ask = { question: obj.question.trim(), options }
-        }
-      }
-    } catch {
-      // not valid JSON — fall through to raw rendering
-    }
+    const ask = tryParseAskBlock(parts[i])
     if (ask) {
       segs.push({ kind: 'ask', ask })
     } else {
@@ -333,7 +373,7 @@ function AskCard({
               disabled={done || busy}
               onClick={() => onSend(opt)}
               className={cn(
-                'flex w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left text-sm transition-colors',
+                'flex min-h-11 w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left text-sm transition-colors sm:min-h-0',
                 chosen
                   ? 'border-emerald-600 bg-emerald-600 text-white'
                   : 'border-border bg-card hover:border-emerald-500/60 hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-50',
@@ -361,21 +401,23 @@ function AskCard({
           <Input
             value={custom}
             onChange={(e) => setCustom(e.target.value)}
+            onFocus={keepInputVisible}
             placeholder="自定义回答…"
             disabled={busy}
-            className="h-8 bg-card text-xs"
+            className="h-10 bg-card text-xs sm:h-8"
             aria-label="自定义回答"
           />
           <VoiceInput
             size="sm"
             context="ask"
             disabled={busy}
+            className={TOUCH_MIC}
             onText={(t) => setCustom((p) => (p ? p + t : t))}
           />
           <Button
             type="submit"
             size="icon"
-            className="size-8 shrink-0"
+            className={TOUCH_XS}
             disabled={busy || !custom.trim()}
             aria-label="发送自定义回答"
           >
@@ -409,6 +451,30 @@ export function ChatTool({
   const seededRef = React.useRef(false)
   const copyTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const idRef = React.useRef(0)
+
+  // ---------- 移动端软键盘适配 ----------
+  // 键盘弹出压缩 visualViewport 时把面板高度等量收窄，输入框始终可见
+  // （layout viewport 不随键盘变化，仅靠 CSS 无法解决，需 JS 补偿）。
+  const [kbOffset, setKbOffset] = React.useState(0)
+  React.useEffect(() => {
+    const vv = window.visualViewport
+    if (!vv) return
+    const update = () => {
+      const hidden = Math.max(
+        0,
+        Math.round(window.innerHeight - vv.height - vv.offsetTop),
+      )
+      setKbOffset(hidden)
+    }
+    update()
+    vv.addEventListener('resize', update)
+    vv.addEventListener('scroll', update)
+    return () => {
+      vv.removeEventListener('resize', update)
+      vv.removeEventListener('scroll', update)
+    }
+  }, [])
+
   const stateKey = React.useMemo(
     () => (cardId ? `chat:ask:${mode}:${cardId}` : ''),
     [mode, cardId],
@@ -693,7 +759,7 @@ export function ChatTool({
     if (el) {
       el.scrollTop = el.scrollHeight
     }
-  }, [messages, loading])
+  }, [messages, loading, kbOffset])
 
   const removePending = (id: string) => {
     setPending((prev) => prev.filter((p) => p.id !== id))
@@ -761,18 +827,22 @@ export function ChatTool({
     const target = messages[idx]
     if (!target || target.role !== 'assistant') return
     const prevUser = idx > 0 && messages[idx - 1]?.role === 'user' ? messages[idx - 1] : null
+    if (speakingId === target.id) tts.stop() // 停掉正在朗读的被删回复
     setMessages((prev) => {
       const next = [...prev]
       next.splice(idx, 1)
       if (prevUser) next.splice(idx - 1, 1)
       return next
     })
-    // 清理被删消息的 ask 卡片已回答状态（避免服务端遗留孤儿状态）
+    // 已回答状态按 question 记忆 — 清理被删回复中 ask 卡片对应的键
     setAskAnswered((prev) => {
-      const ids = [target.id, prevUser?.id].filter(Boolean) as string[]
-      if (!ids.some((id) => id in prev)) return prev
+      const keys = splitAskSegments(target.content).flatMap((s) =>
+        s.kind === 'ask' ? [s.ask.question] : [],
+      )
+      const usable = keys.filter((q) => q in prev)
+      if (usable.length === 0) return prev
       const next = { ...prev }
-      for (const id of ids) delete next[id]
+      for (const q of usable) delete next[q]
       return next
     })
     // 同步删除服务端记录
@@ -786,8 +856,11 @@ export function ChatTool({
   }
 
   const clearConversation = () => {
+    tts.stop() // 清空时停掉朗读，避免孤儿播放
     setMessages([])
     setAskAnswered({})
+    // 允许督背模式在清空后重新自动打招呼
+    seededRef.current = false
     if (cardId) {
       void fetch(
         `/api/chat-log?cardId=${encodeURIComponent(cardId)}&mode=${mode}`,
@@ -804,13 +877,20 @@ export function ChatTool({
 
   // ---------- ask card plumbing ----------
 
-  const handleAskSend = (msgId: string, text: string) => {
-    setAskAnswered((prev) => ({ ...prev, [msgId]: text }))
+  // askAnswered 以 question 文本为键（而非消息 id）— 刷新/重载后消息 id
+  // 会变成服务端行 id，按 question 记忆才能让「已回答」状态跨会话生效。
+  const handleAskSend = (question: string, text: string) => {
+    setAskAnswered((prev) => ({ ...prev, [question]: text }))
     void send(text)
   }
 
   return (
-    <div className="flex h-[60vh] flex-col gap-3">
+    <div
+      className="flex h-[60vh] flex-col gap-3"
+      style={
+        kbOffset > 0 ? { height: `calc(60vh - ${kbOffset}px)` } : undefined
+      }
+    >
       {/* 顶部工具条：自动朗读开关 + 音色设置 */}
       <div className="flex items-center justify-end gap-1.5">
         <button
@@ -821,6 +901,7 @@ export function ChatTool({
           title={autoSpeak ? '关闭自动朗读' : '开启自动朗读'}
           className={cn(
             'flex h-8 items-center gap-1.5 rounded-full border px-2.5 text-xs transition-colors',
+            HIT_AREA,
             autoSpeak
               ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
               : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground',
@@ -837,6 +918,7 @@ export function ChatTool({
               title="音色设置"
               className={cn(
                 'flex size-8 items-center justify-center rounded-full border transition-colors',
+                HIT_AREA,
                 voiceOpen
                   ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
                   : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground',
@@ -956,7 +1038,7 @@ export function ChatTool({
 
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto rounded-md"
+        className="flex-1 overflow-y-auto rounded-md [scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:min-h-6 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent"
       >
         <div className="flex flex-col gap-3 p-1">
           {messages.length > 0 && (
@@ -965,7 +1047,10 @@ export function ChatTool({
                 <AlertDialogTrigger asChild>
                   <button
                     type="button"
-                    className="flex items-center gap-1 rounded-full px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    className={cn(
+                      'flex items-center gap-1 rounded-full px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                      HIT_AREA_LG,
+                    )}
                   >
                     <Trash2 className="size-3.5" strokeWidth={1.75} />
                     清空对话
@@ -1034,9 +1119,9 @@ export function ChatTool({
                       <AskCard
                         key={i}
                         ask={seg.ask}
-                        answered={askAnswered[m.id]}
+                        answered={askAnswered[seg.ask.question]}
                         busy={loading}
-                        onSend={(text) => handleAskSend(m.id, text)}
+                        onSend={(text) => handleAskSend(seg.ask.question, text)}
                       />
                     ) : seg.value.trim() ? (
                       <RichContent
@@ -1056,6 +1141,7 @@ export function ChatTool({
                       title={speakingId === m.id ? '停止朗读' : '朗读该回复'}
                       className={cn(
                         'flex size-7 items-center justify-center rounded-lg transition-colors hover:bg-accent',
+                        HIT_AREA,
                         speakingId === m.id
                           ? 'text-emerald-600'
                           : 'text-muted-foreground hover:text-foreground',
@@ -1071,7 +1157,10 @@ export function ChatTool({
                       type="button"
                       onClick={() => void copyReply(m)}
                       aria-label="复制该回复"
-                      className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                      className={cn(
+                        'flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+                        HIT_AREA,
+                      )}
                     >
                       {copiedId === m.id ? (
                         <Check className="size-3.5 text-emerald-600" strokeWidth={2} />
@@ -1083,7 +1172,10 @@ export function ChatTool({
                       type="button"
                       onClick={() => deleteReply(idx)}
                       aria-label="删除该回复（连带相邻提问）"
-                      className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-red-600"
+                      className={cn(
+                        'flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-red-600',
+                        HIT_AREA,
+                      )}
                     >
                       <Trash2 className="size-3.5" strokeWidth={1.75} />
                     </button>
@@ -1119,7 +1211,7 @@ export function ChatTool({
                 type="button"
                 onClick={() => removePending(p.id)}
                 aria-label="移除图片"
-                className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full bg-destructive text-white shadow"
+                className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full bg-destructive text-white shadow after:absolute after:-inset-3 after:rounded-[inherit] after:content-['']"
               >
                 <X className="size-3" />
               </button>
@@ -1144,6 +1236,7 @@ export function ChatTool({
               size="icon"
               variant="outline"
               aria-label="添加图片"
+              className={TOUCH_SM}
               onClick={() => fileInputRef.current?.click()}
               disabled={loading || pending.length >= MAX_IMAGES}
             >
@@ -1154,6 +1247,7 @@ export function ChatTool({
         <Input
           value={input}
           onChange={(e) => setInput(e.target.value)}
+          onFocus={keepInputVisible}
           placeholder={
             mode === 'supervise'
               ? '回复督背老师…（可语音输入）'
@@ -1167,11 +1261,13 @@ export function ChatTool({
           variant="outline"
           context={mode === 'supervise' ? 'supervise' : 'ask'}
           disabled={loading}
+          className={TOUCH_MIC}
           onText={(t) => setInput((prev) => (prev ? prev + t : t))}
         />
         <Button
           type="submit"
           size="icon"
+          className={TOUCH_SM}
           disabled={loading || (!input.trim() && pending.length === 0)}
           aria-label="发送"
         >

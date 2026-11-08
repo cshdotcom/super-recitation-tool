@@ -64,6 +64,10 @@ const ReviewDueView = NextDynamic(
   () => import('@/components/recitation/review-due-view').then((m) => m.ReviewDueView),
   { ssr: false, loading: () => <PageSkeleton /> },
 )
+const CameraCapture = NextDynamic(
+  () => import('@/components/recitation/camera-capture').then((m) => m.CameraCapture),
+  { ssr: false, loading: () => null },
+)
 
 function PageSkeleton() {
   return (
@@ -101,6 +105,14 @@ function blocksToContent(blocks: MaterialBlock[]): string {
 export default function Page() {
   const router = useRouter()
   const { setTheme } = useTheme()
+
+  // 独立相机页：新标签页 /?cam=1 —— 预览面板/内嵌 iframe 拦截相机权限时的降级方案。
+  // 拍摄裁剪完成后由 CameraCapture（standalone）postMessage 回传 opener 并自动关闭本页。
+  const [standaloneCamera] = React.useState(
+    () =>
+      typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('cam') === '1',
+  )
 
   const [view, setView] = React.useState<View>('home')
   const [cards, setCards] = React.useState<CardData[]>([])
@@ -699,6 +711,30 @@ export default function Page() {
   }, [])
 
   // ---------- gated rendering ----------
+  // 独立相机页：跳过登录门控（新标签页共享同源会话），全屏相机 + 拍完自动回传关闭
+  if (standaloneCamera) {
+    return (
+      <div className="fixed inset-0 z-50 bg-black" aria-label="独立相机页">
+        <CameraCapture
+          open
+          standalone
+          mode="photo"
+          onOpenChange={() => {
+            try {
+              window.close()
+            } catch {
+              /* 某些环境不允许脚本关闭，忽略 */
+            }
+          }}
+          onText={() => {}}
+          onPhoto={() => {
+            /* standalone 模式内部已 postMessage 给 opener 并 window.close() */
+          }}
+        />
+      </div>
+    )
+  }
+
   if (authLoading || !authed) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background text-muted-foreground">
@@ -865,6 +901,7 @@ export default function Page() {
         editing={false}
         onImport={handleImport}
         onCancel={handleCancelImport}
+        onDirectEdit={handleNewCard}
       />
 
       {/* 卡片 ⋯ 菜单里的分享弹窗 */}

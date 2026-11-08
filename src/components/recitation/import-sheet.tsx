@@ -34,6 +34,8 @@ interface ImportSheetProps {
   editing?: boolean
   onImport: (payload: ImportPayload) => void
   onCancel?: () => void
+  /** 「直接输入内容」：直接打开超级编辑器（不经过本面板的旧文本框） */
+  onDirectEdit?: () => void
 }
 
 const IMPORT_ENTRIES = [
@@ -52,6 +54,7 @@ export function ImportSheet({
   editing = false,
   onImport,
   onCancel,
+  onDirectEdit,
 }: ImportSheetProps) {
   const [mode, setMode] = React.useState<'choose' | 'input'>('choose')
   const [text, setText] = React.useState('')
@@ -108,11 +111,24 @@ export function ImportSheet({
         throw new Error('未能从文件中提取到文字')
       }
       toast.success('文件解析完成', { id: toastId })
-      startInput('file', payload.content)
-      if (payload.title) setTitle(payload.title)
+      // 文件解析成功：直接进入超级编辑器（不再经过旧文本框二次确认）
+      onImport({
+        title: payload.title?.trim() || '未命名背诵',
+        content: payload.content,
+        keywords: [],
+      })
+      onOpenChange(false)
     } catch (err) {
+      // 区分网络中断与服务器报错，提示更人性化
+      const networkDown =
+        err instanceof TypeError ||
+        (err instanceof Error && /fetch|network|failed to fetch/i.test(err.message))
       toast.error(
-        err instanceof Error ? err.message : '文件解析失败，请重试',
+        networkDown
+          ? '网络连接失败，请检查网络后重试'
+          : err instanceof Error
+            ? err.message
+            : '文件解析失败，请重试',
         { id: toastId },
       )
     } finally {
@@ -231,7 +247,15 @@ export function ImportSheet({
 
             {/* black pill button */}
             <Button
-              onClick={() => startInput('paste')}
+              onClick={() => {
+                // 直接输入 → 超级编辑器；未提供回调时回退到本面板输入
+                if (onDirectEdit) {
+                  onOpenChange(false)
+                  onDirectEdit()
+                  return
+                }
+                startInput('paste')
+              }}
               className="mt-2 h-12 w-full rounded-full bg-primary text-sm font-semibold text-primary-foreground hover:bg-primary/90"
             >
               <SquarePen className="size-4" strokeWidth={1.75} />

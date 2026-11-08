@@ -6,6 +6,7 @@ import { Copy, Eraser, Eye, Flag, RotateCcw, Volume2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
+import { parseSpanDirective } from '@/lib/inline-style'
 import {
   computeBlankRanges,
   occAt,
@@ -15,6 +16,8 @@ import {
 import type { ClozeStyle, KwEntry } from '@/lib/types'
 import { LongPressMenu, type MenuAction } from '@/components/recitation/long-press-menu'
 import katex from 'katex'
+// 化学公式扩展（\ce{}）——补丁与 RichContent 共享的同一 katex 实例
+import 'katex/contrib/mhchem'
 
 const LONG_PRESS_MS = 420
 const MOVE_TOLERANCE = 12
@@ -40,11 +43,16 @@ interface InlineRun {
   cls?: string
   code?: boolean
   color?: string
+  /** 选中文字字号（%%fs:18|文%%），px；覆盖段落基准字号 */
+  fontSize?: number
+  /** 行内公式 TeX（$…$ 或同行 $$…$$），渲染时不可挖空 */
   math?: string
+  /** true = $$…$$ 展示型（同行内出现） */
+  mathDisplay?: boolean
 }
 
 const INLINE_RE =
-  /\$([^$\n]+)\$|%%([^|\n]+)\|([^%\n]*)%%|==([^=\n]+)==|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|`([^`\n]+)`|\*([^*\n]+)\*/g
+  /\$\$([^$\n]+?)\$\$|\$([^$\n]+)\$|%%([^|\n]+)\|([^%\n]*)%%|==([^=\n]+)==|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|`([^`\n]+)`|\*([^*\n]+)\*/g
 
 function parseInline(line: string): { runs: InlineRun[]; plain: string } {
   const runs: InlineRun[] = []
@@ -58,26 +66,32 @@ function parseInline(line: string): { runs: InlineRun[]; plain: string } {
       plain += line.slice(last, m.index)
     }
     if (m[1] !== undefined) {
-      runs.push({ text: m[1], start: plain.length, cls: 'italic text-primary/90', math: m[1] })
+      // 行内出现的 $$…$$ 展示公式（同行前有文字时也能渲染）
+      runs.push({ text: m[1], start: plain.length, math: m[1], mathDisplay: true })
       plain += m[1]
     } else if (m[2] !== undefined) {
-      runs.push({ text: m[3] ?? '', start: plain.length, color: m[2] })
-      plain += m[3] ?? ''
-    } else if (m[4] !== undefined) {
-      runs.push({ text: m[4], start: plain.length, cls: 'rounded-sm bg-amber-300/70 px-0.5 dark:bg-amber-500/40' })
-      plain += m[4]
+      runs.push({ text: m[2], start: plain.length, cls: 'italic text-primary/90', math: m[2] })
+      plain += m[2]
+    } else if (m[3] !== undefined) {
+      // %%样式|文字%%：共享解析器支持颜色（#hex/名称）与字号 fs:18，可组合 %%color:#dc2626;fs:18|文%%
+      const st = parseSpanDirective(m[3])
+      runs.push({ text: m[4] ?? '', start: plain.length, color: st.color, fontSize: st.fontSize })
+      plain += m[4] ?? ''
     } else if (m[5] !== undefined) {
-      runs.push({ text: m[5], start: plain.length, cls: 'font-bold' })
+      runs.push({ text: m[5], start: plain.length, cls: 'rounded-sm bg-amber-300/70 px-0.5 dark:bg-amber-500/40' })
       plain += m[5]
     } else if (m[6] !== undefined) {
-      runs.push({ text: m[6], start: plain.length, cls: 'line-through opacity-70' })
+      runs.push({ text: m[6], start: plain.length, cls: 'font-bold' })
       plain += m[6]
     } else if (m[7] !== undefined) {
-      runs.push({ text: m[7], start: plain.length, code: true })
+      runs.push({ text: m[7], start: plain.length, cls: 'line-through opacity-70' })
       plain += m[7]
     } else if (m[8] !== undefined) {
-      runs.push({ text: m[8], start: plain.length, cls: 'italic' })
+      runs.push({ text: m[8], start: plain.length, code: true })
       plain += m[8]
+    } else if (m[9] !== undefined) {
+      runs.push({ text: m[9], start: plain.length, cls: 'italic' })
+      plain += m[9]
     }
     last = m.index + m[0].length
   }
@@ -118,12 +132,13 @@ function parseImageLine(line: string): { alt: string; src: string } | null {
   return { alt: m[1], src: m[2] }
 }
 
-// 段落块：text（可挖空）| image | formula | table
+// 段落块：text（可挖空）| image | formula | table | code（mermaid/html等，RichContent 渲染）
 type Block =
   | { kind: 'text'; runs: InlineRun[]; plain: string; plainStart: number; tocPara?: number }
   | { kind: 'image'; alt: string; src: string }
   | { kind: 'formula'; tex: string; display: boolean }
   | { kind: 'table'; rows: string[][] }
+  | { kind: 'code'; lang: string; code: string }
 
 /**
  * 把一段文本拆成可渲染块，并给出每段纯文本在「全局 plain」中的偏移，
@@ -175,6 +190,22 @@ function buildBlocks(content: string): { blocks: Block[]; plain: string } {
         i += 1
         continue
       }
+    }
+
+    // 围栏代码块：```lang ... ```（mermaid 思维导图/流程图、html 块、其它代码）
+    if (trimmed.startsWith('```')) {
+      const lang = trimmed.replace(/^`+/, '').trim()
+      let j = i + 1
+      const buf: string[] = []
+      while (j < rawLines.length && !rawLines[j].text.trim().startsWith('```')) {
+        buf.push(rawLines[j].text)
+        j += 1
+      }
+      // 闭合存在时消费闭合行；未闭合时也渲染已收集内容（容错）
+      const closed = j < rawLines.length
+      blocks.push({ kind: 'code', lang, code: buf.join('\n') })
+      i = closed ? j + 1 : j
+      continue
     }
 
     // 独立公式块 $$ ... $$（单行或多行）
@@ -308,7 +339,6 @@ export function ClozeText({
   const containerRef = React.useRef<HTMLDivElement>(null)
   const rootRef = React.useRef<HTMLDivElement>(null)
   const draggingRef = React.useRef(false)
-  const touchedRef = React.useRef<Set<string>>(new Set())
   const [page, setPage] = React.useState(0)
   // 查看答案 (per-blank menu): single blanks revealed for 2s, independent of
   // the global showAnswers toggle.
@@ -1091,10 +1121,66 @@ export function ClozeText({
     </div>
   ) : null
 
-  // ---- brush drag handlers (work for both mouse and touch) ----
+  // ---- 挖空刷：一次连续滑动 = 一个空（松手才提交） ----
+  // 拖动期间只收集字元素并做临时高亮；pointerup 时按渲染源分组、取连续区间，
+  // 每个源提交一个挖空（区间含标点/跨词），与「划过的部分是一个空」一致。
+  const brushAccRef = React.useRef<Map<string, HTMLElement[]>>(new Map())
+
+  const brushAddEl = (el: HTMLElement) => {
+    const srcKey = el.dataset.src || 'root'
+    const list = brushAccRef.current.get(srcKey) ?? []
+    if (!list.includes(el)) {
+      list.push(el)
+      brushAccRef.current.set(srcKey, list)
+      // 临时高亮（松手后由正式挖空样式接管）
+      el.classList.add('rounded-sm', 'bg-accent')
+    }
+  }
+
+  const commitBrush = () => {
+    const groups = brushAccRef.current
+    if (groups.size === 0) return
+    let committed = 0
+    for (const [srcKey, els] of groups) {
+      if (els.length === 0) continue
+      const src = sources.find((s) => s.key === srcKey)
+      if (!src) continue
+      // 按位置排序，取 min..max 连续区间（划过的部分连成一个空）
+      const sorted = [...els].sort((a, b) => Number(a.dataset.pos) - Number(b.dataset.pos))
+      const first = sorted[0]
+      const last = sorted[sorted.length - 1]
+      const startPos = Number(first.dataset.pos)
+      const lastPos = Number(last.dataset.pos)
+      const lastLen = Array.from(last.dataset.word || last.textContent || '').length
+      const text = src.plain.slice(startPos, lastPos + lastLen).trim()
+      if (!text) continue
+      // 已是完整挖空词时不重复提交
+      const occ = occAt(src.plain, text, startPos)
+      if (isOccBlanked(text, occ)) continue
+      onSelectionCloze?.(text, occ)
+      committed += 1
+    }
+    for (const list of groups.values()) {
+      for (const el of list) el.classList.remove('rounded-sm', 'bg-accent')
+    }
+    brushAccRef.current = new Map()
+    if (committed > 0) {
+      toast.success(`已挖空 ${committed} 处`)
+    }
+  }
+
+  // latest-ref：window pointerup 监听只挂一次，回调始终取最新
+  const commitBrushRef = React.useRef(commitBrush)
+  React.useEffect(() => {
+    commitBrushRef.current = commitBrush
+  })
+
   React.useEffect(() => {
     const end = () => {
-      draggingRef.current = false
+      if (draggingRef.current) {
+        draggingRef.current = false
+        commitBrushRef.current()
+      }
     }
     window.addEventListener('pointerup', end)
     window.addEventListener('pointercancel', end)
@@ -1104,37 +1190,20 @@ export function ClozeText({
     }
   }, [])
 
-  // 由元素上的 data-src 找到所属渲染源的 plain
-  const brushPlainOf = (el: HTMLElement): string => {
-    const key = el.dataset.src || 'root'
-    return sources.find((s) => s.key === key)?.plain ?? content
-  }
-
-  // 挖空刷 = 只刷入不擦除：扫过的字若未挖空则挖空该次出现。
-  // data-pos 记录该字在渲染源 plain 中的绝对下标，data-src 标记所属渲染源。
+  // 挖空刷按下：开始收集（不再逐字立即挖空）
   const handleBrushPointerDown = (e: React.PointerEvent) => {
     if (!brushMode) return
     draggingRef.current = true
-    touchedRef.current.clear()
+    brushAccRef.current = new Map()
     const target = e.target as HTMLElement
-    const wordEl = target.closest?.('[data-word][data-pos]') as HTMLElement | null
-    if (wordEl?.dataset.word) {
-      const w = wordEl.dataset.word
-      touchedRef.current.add(w)
-      if (!isTextBlanked(w)) {
-        onToggleKeyword(w, occAt(brushPlainOf(wordEl), w, Number(wordEl.dataset.pos)))
-      }
-    }
+    const wordEl = target.closest?.('[data-char][data-pos]') as HTMLElement | null
+    if (wordEl) brushAddEl(wordEl)
   }
   const handleBrushPointerMove = (e: React.PointerEvent) => {
     if (!brushMode || !draggingRef.current) return
     const el = document.elementFromPoint(e.clientX, e.clientY)
-    const wordEl = el?.closest('[data-word][data-pos]') as HTMLElement | null
-    if (!wordEl?.dataset.word) return
-    const w = wordEl.dataset.word
-    if (touchedRef.current.has(w) || isTextBlanked(w)) return
-    touchedRef.current.add(w)
-    onToggleKeyword(w, occAt(brushPlainOf(wordEl), w, Number(wordEl.dataset.pos)))
+    const wordEl = el?.closest('[data-char][data-pos]') as HTMLElement | null
+    if (wordEl) brushAddEl(wordEl)
   }
 
   const scrollToPage = (idx: number) => {
@@ -1373,6 +1442,19 @@ export function ClozeText({
           while (ri < runs.length && pStart + runs[ri].start + runs[ri].text.length <= pos) ri += 1
           continue
         }
+        // 行内公式 run：katex 渲染（不可挖空、不逐字拆分），pos 连续推进保证后续 data-pos 正确
+        if (run.math) {
+          const before = pPlain.slice(pos - pStart, run.start)
+          if (before) out.push(<span key={`${blockKey}-mb${pos}`}>{before}</span>)
+          out.push(
+            <span key={`${blockKey}-m${runStart}`} className="inline-block align-middle">
+              <FormulaBlock tex={run.math} display={!!run.mathDisplay} inline />
+            </span>,
+          )
+          pos = runEndAbs
+          ri += 1
+          continue
+        }
         // 在 run 内：下一段到 run 末尾或下一个空白起点
         const nextBlank = ctx.blanks.find((bb) => bb.start > pos && bb.start < runEndAbs)
         const segEnd = nextBlank ? Math.min(nextBlank.start, runEndAbs) : runEndAbs
@@ -1380,7 +1462,13 @@ export function ClozeText({
         const runCls = run.code
           ? 'rounded bg-muted px-1 py-0.5 font-mono text-[0.92em]'
           : run.cls
-        const styleProp = run.color ? { color: run.color } : undefined
+        const styleProp =
+          run.color || run.fontSize
+            ? {
+                color: run.color,
+                fontSize: run.fontSize ? `${run.fontSize}px` : undefined,
+              }
+            : undefined
         const chars = splitCharTokens(segPlain)
         for (let ci2 = 0; ci2 < chars.length; ci2++) {
           const w = chars[ci2]
@@ -1457,6 +1545,8 @@ export function ClozeText({
           )
         case 'formula':
           return <FormulaBlock key={`fx${i}`} tex={block.tex} display={block.display} />
+        case 'code':
+          return <CodeBlockSegment key={`cb${i}`} lang={block.lang} code={block.code} />
         case 'table':
           return (
             <div key={`tb${i}`} className="overflow-x-auto rounded-xl border border-border">
@@ -1579,11 +1669,22 @@ export function ClozeText({
         handleRootPointerMove(e)
       }}
       onPointerUp={(e) => {
-        draggingRef.current = false
+        // 挖空刷：松手提交（根容器的 pointerup 先于 window 监听触发，必须在这里提交）
+        if (brushMode && draggingRef.current) {
+          draggingRef.current = false
+          commitBrush()
+        } else {
+          draggingRef.current = false
+        }
         handleRootPointerEnd(e)
       }}
       onPointerCancel={(e) => {
-        draggingRef.current = false
+        if (brushMode && draggingRef.current) {
+          draggingRef.current = false
+          commitBrush()
+        } else {
+          draggingRef.current = false
+        }
         handleRootPointerEnd(e)
       }}
       onContextMenu={handleRootContextMenu}
@@ -1598,7 +1699,8 @@ export function ClozeText({
 }
 
 // 公式块：katex 渲染（不可挖空）。失败时回退为等宽文本。
-function FormulaBlock({ tex, display }: { tex: string; display: boolean }) {
+// inline=true 时输出 <span>（段落 <p> 内不允许嵌套 <div>）。
+function FormulaBlock({ tex, display, inline }: { tex: string; display: boolean; inline?: boolean }) {
   let html: string | null = null
   try {
     html = katex.renderToString(tex.trim(), {
@@ -1610,14 +1712,24 @@ function FormulaBlock({ tex, display }: { tex: string; display: boolean }) {
     html = null
   }
   if (html) {
+    const cls = cn(
+      'overflow-x-auto bg-muted/40 px-3 py-2',
+      display && !inline ? 'text-center' : '',
+    )
+    if (inline) {
+      return <span className={cls} dangerouslySetInnerHTML={{ __html: html }} />
+    }
     return (
-      <div
-        className={cn(
-          'overflow-x-auto rounded-xl bg-muted/40 px-3 py-2',
-          display ? 'text-center' : '',
-        )}
-        dangerouslySetInnerHTML={{ __html: html }}
-      />
+      <div className={cn(cls, 'rounded-xl')} dangerouslySetInnerHTML={{ __html: html }} />
+    )
+  }
+  if (inline) {
+    return (
+      <span className="rounded bg-muted/40 px-1 font-mono text-[0.92em]">
+        {display ? '$$' : '$'}
+        {tex}
+        {display ? '$$' : '$'}
+      </span>
     )
   }
   return (
@@ -1625,6 +1737,31 @@ function FormulaBlock({ tex, display }: { tex: string; display: boolean }) {
       {display ? '$$' : '$'}
       {tex}
       {display ? '$$' : '$'}
+    </div>
+  )
+}
+
+// 代码/图表块：mermaid（思维导图/流程图/树状图）、html、其它语言 → RichContent 渲染。
+// React.lazy 按需加载，避免给纯文本背诵场景增加体积。
+const RichContentLazy = React.lazy(
+  () => import('@/components/recitation/rich-content').then((m) => ({ default: m.RichContent })),
+)
+
+function CodeBlockSegment({ lang, code }: { lang: string; code: string }) {
+  const isHtml = /^html?$/i.test(lang.trim())
+  // html 块直接交给 rehypeRaw 渲染；其余包回围栏（mermaid → SVG，其它 → 高亮代码）
+  const content = isHtml ? code : `\`\`\`${(lang || 'text').trim()}\n${code}\n\`\`\``
+  return (
+    <div className="my-1">
+      <React.Suspense
+        fallback={
+          <div className="rounded-xl bg-muted/50 py-6 text-center text-xs text-muted-foreground">
+            图表/代码渲染中…
+          </div>
+        }
+      >
+        <RichContentLazy content={content} />
+      </React.Suspense>
     </div>
   )
 }
