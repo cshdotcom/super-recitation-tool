@@ -657,11 +657,11 @@ export function HomeView({
             <Plus className="size-6" strokeWidth={2.25} aria-hidden />
           </button>
 
-          {/* 复习 */}
+          {/* 复习（点击自动显示待复习列表；统计/日历在顶栏日历按钮） */}
           <button
             type="button"
             aria-label="复习"
-            onClick={onOpenReviewStats}
+            onClick={onOpenReviewDue}
             className="flex min-w-[72px] flex-col items-center justify-center gap-0.5 rounded-full px-4 py-1.5 text-foreground transition-transform active:scale-95"
           >
             <CalendarCheck className="size-5" strokeWidth={2} aria-hidden />

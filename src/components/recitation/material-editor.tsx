@@ -269,7 +269,8 @@ function buildTableTemplate(rows: number, cols: number): string {
   const body = Array.from({ length: Math.max(rows - 1, 1) }, () =>
     `| ${Array.from({ length: cols }, () => '单元格').join(' | ')} |`,
   )
-  return [head, sep, ...body].join('\n')
+  // 末尾补一个换行：插入点在句子中间时，避免后续文字粘在最后一行表格上导致 Markdown 表格解析失败
+  return [head, sep, ...body].join('\n') + '\n'
 }
 
 /** 预览用：把 {{挖空}} 显示为加粗（关键词提取用 extractClozeMarks） */

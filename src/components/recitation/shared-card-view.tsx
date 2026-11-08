@@ -12,7 +12,9 @@ import { toast } from 'sonner'
 
 import type { ShareInfo } from '@/lib/types'
 import { cn } from '@/lib/utils'
+import { normKeywordEntries, keywordTexts } from '@/lib/cloze'
 import { ClozeText } from '@/components/recitation/cloze-text'
+import RichContent from '@/components/recitation/rich-content'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 
@@ -21,7 +23,8 @@ interface SharedCard {
   id: string
   title: string
   content: string
-  keywords: string[]
+  /** 旧版 string[] 或新版 [{t, occ}] 均可（读取时归一化）。 */
+  keywords: unknown[]
   createdAt: string
   updatedAt: string
 }
@@ -41,9 +44,6 @@ interface SharedCardViewProps {
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
-
-/** Whole-paragraph markdown image: ![alt](src) — src may be a data URI. */
-const PARAGRAPH_IMAGE_RE = /^!\[([^\]]*)\]\(([^)\s]+)\)\s*$/
 
 function getExpiryBadge(share: ShareInfo | null): { label: string; className: string } {
   const ok =
@@ -135,56 +135,38 @@ export function SharedCardView({ token, onExit }: SharedCardViewProps) {
   // the (currently required) prop signature without persisting anything.
   const noopKeyword = React.useCallback(() => {}, [])
 
-  // Memoized keyword-highlighted paragraphs. Safe against empty / duplicate /
-  // overlapping keywords: dedupe, drop empties, longest-first alternation.
-  const renderParagraphs = React.useCallback((card: SharedCard): React.ReactNode[] => {
-    const paragraphs = card.content.split('\n')
-    const keywords = Array.from(
-      new Set(card.keywords.map((k) => k.trim()).filter((k) => k.length > 0)),
-    ).sort((a, b) => b.length - a.length)
-    const keywordSet = new Set(keywords)
-
-    const renderText = (text: string, keyPrefix: string): React.ReactNode[] => {
-      if (keywords.length === 0) return [text]
-      const re = new RegExp(`(${keywords.map(escapeRegExp).join('|')})`, 'g')
-      const parts = text.split(re)
-      return parts.map((part, i) =>
-        keywordSet.has(part) ? (
-          <mark
-            key={`${keyPrefix}-${i}`}
-            className="rounded-md bg-emerald-500/15 px-1 py-0.5 font-medium text-emerald-700 dark:text-emerald-300"
-          >
-            {part}
-          </mark>
-        ) : (
-          <React.Fragment key={`${keyPrefix}-${i}`}>{part}</React.Fragment>
-        ),
+  // 阅读 tab：超级编辑器富文本渲染（颜色/荧光笔/表格/公式/图片/挖空标记），
+  // 并叠加关键词高亮。与主阅读器观感一致。
+  const guestHtml = React.useMemo(() => {
+    if (state.status !== 'ok') return ''
+    const kws = keywordTexts(normKeywordEntries(state.card.keywords))
+      .map((k) => k.trim())
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length)
+    let s = String(state.card.content ?? '')
+    // 1) 转义原生 HTML（防注入；RichContent 的 rehypeRaw 只应渲染我们生成的标签）
+    s = s.replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    // 2) 关键词高亮（先于自定义标记，标记符号不会被关键词误伤）
+    if (kws.length) {
+      const re = new RegExp(`(${kws.map(escapeRegExp).join('|')})`, 'g')
+      s = s.replace(
+        re,
+        '<mark class="rounded-md bg-emerald-500/15 px-1 py-0.5 font-medium text-emerald-700 dark:text-emerald-300">$1</mark>',
       )
     }
-
-    return paragraphs.map((p, i) => {
-      if (!p.trim()) return <div key={`p-${i}`} className="h-3" aria-hidden />
-      // Markdown image paragraphs (e.g. ![图](data:image/...)) render as <img>.
-      const img = p.trim().match(PARAGRAPH_IMAGE_RE)
-      if (img) {
-        return (
-          <div key={`p-${i}`}>
-            { }
-            <img
-              src={img[2]}
-              alt={img[1] || '课文配图'}
-              className="max-w-full rounded-xl border border-border"
-            />
-          </div>
-        )
-      }
-      return (
-        <p key={`p-${i}`} className="text-[15px] leading-8 text-foreground/90">
-          {renderText(p, `p-${i}`)}
-        </p>
-      )
+    // 3) 编辑器自定义标记 → 标准 HTML
+    // 字色 %%#dc2626|文%% → <span style="color:#dc2626">（颜色值白名单校验）
+    s = s.replace(/%%([^|%\n]+)\|([\s\S]*?)%%/g, (_m, color: string, text: string) => {
+      const c = color.trim()
+      const safe = /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/.test(c) ? c : 'inherit'
+      return `<span style="color:${safe}">${text}</span>`
     })
-  }, [])
+    // 荧光笔 ==文== → <mark>（嵌套时外层已存在 mark 也可接受）
+    s = s.replace(/==([^=\n]+)==/g, '<mark class="rounded bg-amber-300/70 px-0.5 dark:bg-amber-500/40">$1</mark>')
+    // 挖空标记 {{词}} → 加粗（阅读态提示重点）
+    s = s.replace(/\{\{([^}]+)\}\}/g, '<strong>$1</strong>')
+    return s
+  }, [state])
 
   const badge = state.status === 'ok' ? getExpiryBadge(state.share) : null
 
@@ -290,7 +272,9 @@ export function SharedCardView({ token, onExit }: SharedCardViewProps) {
             </div>
 
             {tab === 'read' ? (
-              <div className="mt-6 space-y-3">{renderParagraphs(state.card)}</div>
+              <div className="mt-6">
+                <RichContent content={guestHtml} className="text-[15px] leading-8 text-foreground/90" />
+              </div>
             ) : (
               <div className="mt-6">
                 <div className="mb-4 flex items-center justify-between gap-3">

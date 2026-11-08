@@ -23,6 +23,7 @@ import { toast } from 'sonner'
 
 import type { CardData, ShareInfo } from '@/lib/types'
 import { cn } from '@/lib/utils'
+import { stripMarkup } from '@/lib/sentences'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import {
   AlertDialog,
@@ -237,7 +238,7 @@ export function ShareDialog({
         <div className="rounded-2xl border border-border bg-card px-4 py-3.5">
           <p className="truncate text-sm font-bold">{card.title}</p>
           <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
-            {card.content.slice(0, 80) || '（空内容）'}
+            {stripMarkup(card.content).slice(0, 80) || '（空内容）'}
           </p>
           <p className="mt-2 text-[11px] text-muted-foreground/70">
             {card.content.length} 字 · {card.keywords.length} 处挖空

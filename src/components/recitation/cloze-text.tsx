@@ -443,6 +443,30 @@ export function ClozeText({
     (text: string) => sources.some((s) => s.blanks.some((b) => b.text === text)),
     [sources],
   )
+  /** 按出现序号判断：同一字的第 N 次出现是否已被挖空（跨句隔离的关键）。 */
+  const isOccBlanked = React.useCallback(
+    (text: string, occ: number | null) => {
+      if (occ === null || occ < 0) return isTextBlanked(text)
+      return sources.some((s) => s.blanks.some((b) => b.text === text && b.occ === occ))
+    },
+    [sources, isTextBlanked],
+  )
+  /** 由字元素上的 data-src/data-pos 精确解析所属出现序号（点第二处“明月”不再误伤第一处）。 */
+  const occFromCharEl = React.useCallback(
+    (el: HTMLElement | null, text: string): number | null => {
+      if (!el) return null
+      // 挖空词 span：data-word 是答案文本；普通字 span：用 textContent。
+      const t = el.dataset.word || text
+      if (!t) return null
+      const srcKey = el.dataset.src
+      const pos = Number(el.dataset.pos)
+      if (srcKey === undefined || Number.isNaN(pos)) return null
+      const src = sources.find((s) => s.key === srcKey)
+      if (!src) return null
+      return occAt(src.plain, t, pos)
+    },
+    [sources],
+  )
 
 
   // ===========================================================================
@@ -467,6 +491,8 @@ export function ClozeText({
     above: boolean
     text: string
     isKeyword: boolean
+    /** 打开菜单时解析的精确出现序号（null = 未解析，走首个出现回退）。 */
+    occ?: number | null
   } | null>(null)
   // 手柄尖端坐标（拖拽时实时更新）；menuOpen=false 时只显示手柄不显示菜单。
   const [selTips, setSelTips] = React.useState<{
@@ -642,7 +668,7 @@ export function ClozeText({
     charIdxFromPoint(e.clientX, e.clientY)
 
   const openMenuForRange = React.useCallback(
-    (a: number, f: number, at?: { x: number; y: number }) => {
+    (a: number, f: number, at?: { x: number; y: number }, occ?: number | null) => {
       const els = getCharEls()
       const lo = Math.max(0, Math.min(a, f))
       const hi = Math.min(els.length - 1, Math.max(a, f))
@@ -652,6 +678,7 @@ export function ClozeText({
       const layout = computeSelLayout(a, f)
       if (!layout) return
       const { bbox, above } = layout
+      const kw = isOccBlanked(text, occ ?? null)
       const SEL_MENU_W = 208
       const x = Math.min(
         Math.max((bbox.left + bbox.right) / 2, SEL_MENU_W / 2 + VIEWPORT_INSET),
@@ -663,7 +690,8 @@ export function ClozeText({
         y: py ? bbox.top - 10 : bbox.bottom + 10,
         above: py,
         text,
-        isKeyword: isTextBlanked(text),
+        isKeyword: kw,
+        occ: occ ?? null,
       })
       if (at) {
         setSelMenu({
@@ -671,13 +699,14 @@ export function ClozeText({
           y: at.y,
           above: at.y > window.innerHeight / 2,
           text,
-          isKeyword: isTextBlanked(text),
+          isKeyword: kw,
+          occ: occ ?? null,
         })
       } else {
         setSelMenu(mk(x, above))
       }
     },
-    [extractSelText, getCharEls, computeSelLayout, isTextBlanked],
+    [extractSelText, getCharEls, computeSelLayout, isOccBlanked],
   )
 
   // ---- pointer flow (touch long-press → drag selection with handles) ----
@@ -704,7 +733,7 @@ export function ClozeText({
       }
       selectingRef.current = true
       highlightRange(idx, idx)
-      openMenuForRange(idx, idx)
+      openMenuForRange(idx, idx, undefined, occFromCharEl(charEl, charEl.textContent ?? ''))
     }, LONG_PRESS_MS)
   }
 
@@ -823,12 +852,19 @@ export function ClozeText({
         window.innerWidth - SEL_MENU_WIDTH / 2 - VIEWPORT_INSET,
       )
       const y = Math.min(Math.max(e.clientY, VIEWPORT_INSET + 8), window.innerHeight - 8)
+      // 尝试从选区起点解析精确出现序号（拖选第二处「明月」也能精准挖空这一处）。
+      const anchorEl = (sel!.anchorNode?.parentElement ?? null)?.closest?.(
+        '[data-char]',
+      ) as HTMLElement | null
+      const occSel = occFromCharEl(anchorEl, selText)
+      const occValid = occSel !== null && occSel >= 0
       setSelMenu({
         x,
         y,
         above: y > window.innerHeight / 2,
         text: selText,
-        isKeyword: isTextBlanked(selText),
+        isKeyword: occValid ? isOccBlanked(selText, occSel) : isTextBlanked(selText),
+        occ: occValid ? occSel : null,
       })
       return
     }
@@ -836,8 +872,14 @@ export function ClozeText({
     // No native selection: select the 字 under the cursor.
     const idx = charIdxFromEvent(e)
     if (idx < 0) return
+    const underEl = getCharEls()[idx] ?? (e.target as HTMLElement).closest?.('[data-char]')
     highlightRange(idx, idx)
-    openMenuForRange(idx, idx, { x: e.clientX, y: e.clientY })
+    openMenuForRange(
+      idx,
+      idx,
+      { x: e.clientX, y: e.clientY },
+      occFromCharEl(underEl as HTMLElement | null, (underEl as HTMLElement | null)?.textContent ?? ''),
+    )
   }
 
   const handleSelMenuAction = (key: string) => {
@@ -847,7 +889,8 @@ export function ClozeText({
       case 'cloze': {
         if (readOnly) break
         const text = cur.text
-        const occ = resolveSelection(text).occ
+        // 优先用打开菜单时记录的精确出现序号；拖选路径回退到首个出现。
+        const occ = cur.occ ?? resolveSelection(text).occ
         if (cur.isKeyword) {
           // already blanked → uncloze
           if (selectionMode) {
@@ -1221,6 +1264,8 @@ export function ClozeText({
           data-word={text}
           data-char="1"
           data-ci={ci}
+          data-pos={b.start}
+          data-src={ctx.key}
           onClick={(e) => {
             e.stopPropagation()
             if (!brushMode) {

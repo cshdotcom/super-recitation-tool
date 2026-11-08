@@ -260,9 +260,6 @@ export function LoginView({ registered, onAuthed }: LoginViewProps) {
           )}
         </div>
 
-        <p className="mt-6 text-center text-[11px] text-muted-foreground/70">
-          数据仅存储于本机，账号用于保护你的背诵内容
-        </p>
       </div>
     </main>
   )
