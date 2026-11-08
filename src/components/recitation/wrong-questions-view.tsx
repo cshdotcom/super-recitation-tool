@@ -594,15 +594,17 @@ export function WrongQuestionsView({
   }
 
   // ---- 导出 CSV ----
-  const exportCSV = () => {
-    if (filteredItems.length === 0) {
-      toast('当前筛选下没有错题')
+  // items 参数：缺省=当前筛选全部；传入子集=批量导出选中。
+  const exportCSV = (items?: QuizItemData[]) => {
+    const list = items ?? filteredItems
+    if (list.length === 0) {
+      toast(items ? '未选中任何错题' : '当前筛选下没有错题')
       return
     }
     const esc = (v: unknown) => `"${String(v ?? '').replace(/"/g, '""')}"`
     const rows: string[][] = [
       ['题目', '类型', '我的答案', '正确答案', '错误次数', '来源卡片', '时间'],
-      ...filteredItems.map((i) => [
+      ...list.map((i) => [
         i.question,
         DISPLAY_LABEL[displayType(i)] ?? i.type,
         userAnswers[userAnswerKey(i.cardId, i.question)]?.userAnswer ?? '',
@@ -617,10 +619,46 @@ export function WrongQuestionsView({
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `错题本_${new Date().toISOString().slice(0, 10)}.csv`
+    const tag = items && items.length < filteredItems.length ? `_选中${items.length}` : ''
+    a.download = `错题本_${new Date().toISOString().slice(0, 10)}${tag}.csv`
     a.click()
     URL.revokeObjectURL(url)
-    toast.success(`已导出 ${filteredItems.length} 道错题`)
+    toast.success(`已导出 ${list.length} 道错题`)
+  }
+
+  // ---- 智能选错题：按错次/收藏/时间自动勾选 ----
+  const smartSelect = (mode: 'ge3' | 'ge5' | 'fav' | 'recent7' | 'invert') => {
+    const filtered = filteredItems
+    if (filtered.length === 0) {
+      toast('当前筛选下没有错题')
+      return
+    }
+    let next: Set<string>
+    switch (mode) {
+      case 'ge3':
+        next = new Set(filtered.filter((i) => i.wrongCount >= 3).map((i) => i.id))
+        toast.success(`已选错次≥3 的 ${next.size} 道`)
+        break
+      case 'ge5':
+        next = new Set(filtered.filter((i) => i.wrongCount >= 5).map((i) => i.id))
+        toast.success(`已选错次≥5 的 ${next.size} 道`)
+        break
+      case 'fav':
+        next = new Set(filtered.filter((i) => i.favorite).map((i) => i.id))
+        toast.success(`已选收藏的 ${next.size} 道`)
+        break
+      case 'recent7': {
+        const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000
+        next = new Set(filtered.filter((i) => i.updatedAt >= cutoff).map((i) => i.id))
+        toast.success(`已选近 7 天错的 ${next.size} 道`)
+        break
+      }
+      case 'invert':
+        next = new Set(filtered.filter((i) => !selected.has(i.id)).map((i) => i.id))
+        toast.success(`已反选 ${next.size} 道`)
+        break
+    }
+    setSelected(next)
   }
 
   // ---- 顶栏返回 ----
@@ -718,13 +756,40 @@ export function WrongQuestionsView({
             </div>
           )}
           {mode === 'list' && selectMode && (
-            <button
-              type="button"
-              onClick={toggleSelectAll}
-              className="ml-auto shrink-0 text-sm text-muted-foreground transition-colors hover:text-foreground"
-            >
-              {allSelected ? '取消全选' : '全选'}
-            </button>
+            <div className="ml-auto flex shrink-0 items-center gap-1">
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="智能选择"
+                    className="rounded-full px-2 py-1 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  >
+                    <Sparkles className="inline size-4 align-[-2px]" strokeWidth={1.75} />
+                    <span className="ml-0.5">智能</span>
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onClick={() => smartSelect('ge5')}>
+                    错次 ≥ 5（高频错）
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => smartSelect('ge3')}>
+                    错次 ≥ 3
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => smartSelect('fav')}>
+                    收藏的错题
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => smartSelect('recent7')}>
+                    最近 7 天错的
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => smartSelect('invert')}>
+                    反选
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={toggleSelectAll}>
+                    {allSelected ? '取消全选' : '全选'}
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           )}
         </div>
       </header>
@@ -1083,11 +1148,22 @@ export function WrongQuestionsView({
 
       {/* 底部：多选批量操作栏 / 去练习 */}
       {mode === 'list' && selectMode ? (
-        <div className="fixed inset-x-0 bottom-6 z-40 flex justify-center px-4">
+        <div className="fixed inset-x-0 bottom-[calc(1.5rem+env(safe-area-inset-bottom))] z-40 flex justify-center px-4">
           <div className="w-full max-w-2xl rounded-2xl border border-border bg-card/95 p-3 shadow-lg shadow-black/10 backdrop-blur">
             <p className="pb-2 text-center text-xs text-muted-foreground">
               已选 {selected.size} 道错题
             </p>
+            <div className="mb-2">
+              <button
+                type="button"
+                disabled={selected.size === 0 || batchBusy}
+                onClick={() => exportCSV(selectedItems)}
+                className="flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-border bg-card text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
+              >
+                <Download className="size-4" strokeWidth={1.75} />
+                导出选中（{selected.size}）
+              </button>
+            </div>
             <div className="grid grid-cols-4 gap-2">
               <button
                 type="button"
@@ -1156,7 +1232,7 @@ export function WrongQuestionsView({
           </div>
         </div>
       ) : mode === 'list' ? (
-        <div className="fixed inset-x-0 bottom-6 z-40 flex justify-center px-4">
+        <div className="fixed inset-x-0 bottom-[calc(1.5rem+env(safe-area-inset-bottom))] z-40 flex justify-center px-4">
           <button
             type="button"
             onClick={startPractice}

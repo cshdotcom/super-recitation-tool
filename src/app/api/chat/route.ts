@@ -17,6 +17,57 @@ const MAX_IMAGE_B64_LENGTH = 2 * 1024 * 1024
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}))
+
+    // ---- AI 改题模式：判断学生答案是否可接受（规则匹配过严时的人工兜底） ----
+    // 输入 { mode:'grade', question, userAnswer, correctAnswer, type, options? }
+    // 输出 { right: boolean, reason: string }
+    if (body?.mode === 'grade') {
+      const question: string = typeof body?.question === 'string' ? body.question : ''
+      const userAnswer: string = typeof body?.userAnswer === 'string' ? body.userAnswer : ''
+      const correctAnswer: string = typeof body?.correctAnswer === 'string' ? body.correctAnswer : ''
+      const type: string = typeof body?.type === 'string' ? body.type : ''
+      if (!question || !correctAnswer) {
+        return NextResponse.json({ error: '题目与正确答案不能为空' }, { status: 400 })
+      }
+      const optionsPart = Array.isArray(body?.options) && body.options.length > 0
+        ? `\n选项：${(body.options as string[]).map((o, i) => `${String.fromCharCode(65 + i)}. ${o}`).join('  ')}`
+        : ''
+      const gradeSystem = `你是严谨的语文判题老师。判断学生的回答相对于标准答案是否正确。
+规则：
+- 选择题/判断题：答案与标准答案一致才算对（选项文本等价即可，如「A」等价于选项A的全文）。
+- 填空题：答案的核心含义与标准答案一致即可，允许标点、同义词、近义表述差异（如「因为」≈「由于」、「地」≈「的」在合理语境下）。
+- 简答题：要点覆盖即算对，不要求字面一致；只要学生答出标准答案的关键信息即判对。
+- 完全无关/答非所问/空白 → 错。
+只返回严格 JSON：{"right": true或false, "reason": "一句话说明判定依据"}，不要任何额外解释。`
+      const userMsg = `题型：${type || '未标注'}${optionsPart}
+题目：${question}
+标准答案：${correctAnswer}
+学生答案：${userAnswer || '（未作答）'}
+请判定。`
+      const config = await getAIConfig()
+      const reply = await chatComplete(
+        [
+          { role: 'system', content: gradeSystem },
+          { role: 'user', content: userMsg },
+        ],
+        config,
+      )
+      // 从回复里提取 JSON（容忍 ```json 围栏）
+      const m = reply.match(/\{[\s\S]*\}/)
+      let right = false
+      let reason = 'AI 已判定'
+      if (m) {
+        try {
+          const parsed = JSON.parse(m[0]) as { right?: unknown; reason?: unknown }
+          right = parsed.right === true
+          if (typeof parsed.reason === 'string') reason = parsed.reason
+        } catch {
+          /* 解析失败用默认值 */
+        }
+      }
+      return NextResponse.json({ right, reason })
+    }
+
     const content: string = typeof body?.content === 'string' ? body.content : ''
     if (!content.trim()) {
       return NextResponse.json({ error: '课文内容不能为空' }, { status: 400 })

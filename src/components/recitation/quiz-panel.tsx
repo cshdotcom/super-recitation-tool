@@ -510,6 +510,9 @@ export function QuizPanel({
   const [checked, setChecked] = React.useState(false)
   const [selfJudge, setSelfJudge] = React.useState<Record<number, boolean>>({})
   const [reported, setReported] = React.useState<Set<number>>(new Set())
+  // 改判覆盖（手动或 AI 改题后翻转判定，覆盖规则匹配结果）
+  const [override, setOverride] = React.useState<Record<number, boolean>>({})
+  const [aiJudging, setAiJudging] = React.useState<Set<number>>(new Set())
   /** 「我不会」标记的题号 — 立即按答错上报并强制计错。 */
   const [dontKnow, setDontKnow] = React.useState<Set<number>>(new Set())
   const [quizStart, setQuizStart] = React.useState<number>(Date.now())
@@ -853,6 +856,61 @@ export function QuizPanel({
     if (q) reportItem(q, right, answers[idx] || '')
   }
 
+  // ---- 改判：规则批改过严时手动翻转对/错（覆盖原判定，静默重报） ----
+  const manualOverride = (idx: number, right: boolean) => {
+    setOverride((prev) => ({ ...prev, [idx]: right }))
+    if (!reported.has(idx)) {
+      setReported((prev) => new Set(prev).add(idx))
+    }
+    const q = questions[idx]
+    if (q) reportItem(q, right, answers[idx] || '', true)
+    toast.success(right ? '已改判为「答对」' : '已改判为「答错」')
+  }
+
+  // ---- AI 改题：把题目/学生答案/标准答案交给 AI 判定（填空简答规则匹配过严时用） ----
+  const aiRejudge = async (idx: number) => {
+    const q = questions[idx]
+    if (!q) return
+    setAiJudging((prev) => new Set(prev).add(idx))
+    const tid = toast.loading('AI 正在重新判题…')
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'grade',
+          question: q.question,
+          userAnswer: answers[idx] || '',
+          correctAnswer: q.type === 'judge' ? normJudge(q.answer) : q.answer,
+          type: q.type,
+          options: q.type === 'judge' ? ['正确', '错误'] : q.options ?? [],
+        }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.error || 'AI 判题失败')
+      }
+      const data = (await res.json()) as { right: boolean; reason: string }
+      setOverride((prev) => ({ ...prev, [idx]: data.right }))
+      if (!reported.has(idx)) {
+        setReported((prev) => new Set(prev).add(idx))
+      }
+      reportItem(q, data.right, answers[idx] || '', true)
+      toast.success(
+        `${data.right ? '答对' : '答错'}：${data.reason || 'AI 已判定'}`,
+        { id: tid },
+      )
+    } catch (err) {
+      toast.error('AI 改题失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+    } finally {
+      setAiJudging((prev) => {
+        const n = new Set(prev)
+        n.delete(idx)
+        return n
+      })
+    }
+  }
+
   // ---- 「我不会」：立即按答错上报，展示答案并锁定输入 ----
   const markDontKnow = (idx: number) => {
     const q = questions[idx]
@@ -910,14 +968,16 @@ export function QuizPanel({
     questions.forEach((q, i) => {
       if (!reported.has(i)) return
       total++
-      if (q.type === 'short') {
+      if (override[i] !== undefined) {
+        if (override[i]) right++
+      } else if (q.type === 'short') {
         if (selfJudge[i]) right++
       } else if (!dontKnow.has(i) && gradeAnswer(q, answers[i] || '') === true) {
         right++
       }
     })
     return { total, right }
-  }, [questions, reported, selfJudge, answers, dontKnow])
+  }, [questions, reported, selfJudge, answers, dontKnow, override])
 
   const clearAnswers = () => {
     setAnswers({})
@@ -926,6 +986,8 @@ export function QuizPanel({
     setSelfJudge({})
     setReported(new Set())
     setDontKnow(new Set())
+    setOverride({})
+    setAiJudging(new Set())
     setQuizStart(Date.now())
   }
 
@@ -1389,11 +1451,14 @@ export function QuizPanel({
               const pickedSet = isMulti
                 ? new Set(userAnswer.split(MULTI_SEP).filter(Boolean))
                 : null
-              const isRight = dontKnow.has(idx)
-                ? false
-                : isShort
-                  ? selfJudge[idx] === true
-                  : gradeAnswer(q, userAnswer) === true
+              const hasOverride = override[idx] !== undefined
+              const isRight = hasOverride
+                ? override[idx]
+                : dontKnow.has(idx)
+                  ? false
+                  : isShort
+                    ? selfJudge[idx] === true
+                    : gradeAnswer(q, userAnswer) === true
               const multiCorrect = isMulti ? parseMultiCorrect(q) : null
 
               return (
@@ -1578,9 +1643,9 @@ export function QuizPanel({
                       </div>
                     )}
 
-                    {/* 判定结果 */}
+                    {/* 判定结果 + 改判/AI改题（规则批改过严时可纠正） */}
                     {isReported && (
-                      <div className="flex items-center justify-end gap-1 text-xs font-medium">
+                      <div className="flex flex-wrap items-center justify-end gap-1.5 text-xs font-medium">
                         {isRight ? (
                           <span className="flex items-center gap-1 text-emerald-600">
                             <CheckCircle2 className="size-3.5" /> 答对
@@ -1590,6 +1655,34 @@ export function QuizPanel({
                             <XCircle className="size-3.5" /> 答错
                           </span>
                         )}
+                        {hasOverride && (
+                          <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">
+                            已改判
+                          </span>
+                        )}
+                        {/* 改判按钮：手动翻转对/错（覆盖规则判定，静默重报错题统计） */}
+                        <button
+                          type="button"
+                          disabled={aiJudging.has(idx)}
+                          onClick={() => manualOverride(idx, !isRight)}
+                          className="rounded-full border border-border px-2 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
+                        >
+                          改判为{isRight ? '错' : '对'}
+                        </button>
+                        {/* AI 改题：交给 AI 判定（填空/简答规则匹配过严时用） */}
+                        <button
+                          type="button"
+                          disabled={aiJudging.has(idx)}
+                          onClick={() => void aiRejudge(idx)}
+                          className="flex items-center gap-0.5 rounded-full border border-emerald-300 px-2 py-0.5 text-[11px] text-emerald-700 transition-colors hover:bg-emerald-50 disabled:opacity-40 dark:border-emerald-700 dark:text-emerald-300 dark:hover:bg-emerald-900/30"
+                        >
+                          {aiJudging.has(idx) ? (
+                            <Loader2 className="size-3 animate-spin" />
+                          ) : (
+                            <Sparkles className="size-3" />
+                          )}
+                          AI 改题
+                        </button>
                       </div>
                     )}
 
