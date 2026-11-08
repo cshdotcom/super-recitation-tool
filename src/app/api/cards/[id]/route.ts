@@ -92,8 +92,8 @@ export async function PATCH(
       data.mindmaps = JSON.stringify(docs.slice(0, 50))
     }
     // 文字编辑工具 Q&A blocks: [{ front, back, hidden? }] (persisted JSON string).
-    // Sanitized: max 200 blocks, front/back strings capped at 20000 chars,
-    // hidden stored only when it is exactly true.
+    // Sanitized: max 200 blocks, front/back strings capped at 500000 chars
+    // (allows embedded base64 images ~375KB each), hidden stored only when true.
     if (Array.isArray(body?.blocks)) {
       const list = (body.blocks as unknown[]).slice(0, 200)
       const blocks = list.map((raw) => {
@@ -103,8 +103,8 @@ export async function PATCH(
           hidden?: unknown
         }
         return {
-          front: typeof b.front === 'string' ? b.front.slice(0, 20000) : '',
-          back: typeof b.back === 'string' ? b.back.slice(0, 20000) : '',
+          front: typeof b.front === 'string' ? b.front.slice(0, 500000) : '',
+          back: typeof b.back === 'string' ? b.back.slice(0, 500000) : '',
           ...(b.hidden === true ? { hidden: true } : {}),
         }
       })

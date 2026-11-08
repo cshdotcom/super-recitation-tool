@@ -3,7 +3,7 @@
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import { motion } from 'framer-motion'
-import { ChevronLeft, MoreHorizontal, Pencil, Plus, Trash2 } from 'lucide-react'
+import { ChevronLeft, Eye, MoreHorizontal, Pencil, Plus, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type { ReviewPlanData } from '@/lib/types'
@@ -111,6 +111,7 @@ export function PlanManagerView({ onBack }: PlanManagerViewProps) {
     <EditScreen
       key={screen.plan?.id ?? 'new'}
       plan={screen.plan}
+      readOnly={screen.plan?.builtIn ?? false}
       onCancel={() => setScreen({ mode: 'list' })}
       onSaved={handleSaved}
     />
@@ -245,20 +246,41 @@ function PlanCard({
   onEdit: () => void
   onDelete: () => void
 }) {
-  const subtitle = plan.builtIn
-    ? '基于记忆曲线，在最佳时间提醒复习'
-    : `复习 ${plan.days.length} 次 · ${plan.days.map(dayLabel).join(' / ')}`
+  const scheduleText = `复习 ${plan.days.length} 次 · ${plan.days.map(dayLabel).join(' / ')}`
 
   return (
     <div className="relative rounded-2xl border-0 bg-card px-6 py-8 text-center shadow-sm">
       <h3 className="text-2xl font-bold">{plan.name}</h3>
-      <p
-        className={cn('mt-3 text-muted-foreground', !plan.builtIn && 'truncate')}
-        title={!plan.builtIn ? subtitle : undefined}
-      >
-        {subtitle}
-      </p>
-      {!plan.builtIn && <PlanMenuButton plan={plan} onEdit={onEdit} onDelete={onDelete} />}
+      {plan.builtIn ? (
+        <div className="mt-3 px-2">
+          <p className="text-muted-foreground">基于记忆曲线，在最佳时间提醒复习</p>
+          <p
+            className="mt-1 truncate text-xs text-muted-foreground/70"
+            title={scheduleText}
+          >
+            {scheduleText}
+          </p>
+        </div>
+      ) : (
+        <p
+          className="mt-3 truncate text-muted-foreground"
+          title={scheduleText}
+        >
+          {scheduleText}
+        </p>
+      )}
+      {plan.builtIn ? (
+        <button
+          type="button"
+          onClick={onEdit}
+          aria-label={`查看计划：${plan.name}`}
+          className="absolute right-3 top-3 flex size-8 items-center justify-center rounded-full text-muted-foreground/50 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Eye className="size-5" strokeWidth={1.75} />
+        </button>
+      ) : (
+        <PlanMenuButton plan={plan} onEdit={onEdit} onDelete={onDelete} />
+      )}
     </div>
   )
 }
@@ -368,25 +390,26 @@ function PlanMenuButton({
   )
 }
 
-// ==================== 编辑页（新建/修改） ====================
+// ==================== 详情/编辑页（查看=只读，编辑=可改） ====================
 
 function EditScreen({
   plan,
+  readOnly = false,
   onCancel,
   onSaved,
 }: {
   plan: ReviewPlanData | null
+  readOnly?: boolean
   onCancel: () => void
   onSaved: () => void
 }) {
   const [name, setName] = React.useState(plan?.name ?? '')
-  // New plans start with 0 rows (screenshot: 复习时间安排（0天）); the first
-  // appended row defaults to 现在 (0), later rows continue from the last day.
+  // 新计划从 0 行开始；查看/编辑现有计划时从已有天数开始。
   const [days, setDays] = React.useState<number[]>(plan ? [...plan.days] : [])
   const [saving, setSaving] = React.useState(false)
   const [dayDialogRow, setDayDialogRow] = React.useState<number | null>(null)
 
-  const canSave = name.trim().length > 0 && days.length > 0 && !saving
+  const canSave = !readOnly && name.trim().length > 0 && days.length > 0 && !saving
 
   const appendRow = React.useCallback(() => {
     setDays((prev) => {
@@ -432,7 +455,7 @@ function EditScreen({
 
   return (
     <>
-      <ViewHeader title="复习计划" onBack={onCancel} />
+      <ViewHeader title={readOnly ? '查看复习计划' : '复习计划'} onBack={onCancel} />
 
       <main className="mx-auto w-full max-w-2xl flex-1 px-4 pb-10 pt-8">
         {/* 名称输入卡片 */}
@@ -442,8 +465,13 @@ function EditScreen({
             onChange={(e) => setName(e.target.value)}
             placeholder="请输入名称"
             aria-label="计划名称"
+            aria-readonly={readOnly}
+            readOnly={readOnly}
             maxLength={30}
-            className="h-16 w-full rounded-2xl border-0 bg-transparent text-center text-lg text-foreground outline-none placeholder:text-muted-foreground/60"
+            className={cn(
+              'h-16 w-full rounded-2xl border-0 bg-transparent text-center text-lg text-foreground outline-none placeholder:text-muted-foreground/60',
+              readOnly && 'cursor-default',
+            )}
           />
         </div>
 
@@ -477,36 +505,46 @@ function EditScreen({
                     )}
                   />
                   <span className="text-lg font-bold">第{i + 1}次</span>
-                  <button
-                    type="button"
-                    onClick={() => setDayDialogRow(i)}
-                    aria-label={`设置第${i + 1}次复习时间，当前${dayLabel(d)}`}
-                    className="ml-auto flex h-10 shrink-0 items-center rounded-lg bg-muted px-4 text-base font-medium text-emerald-600 transition-colors hover:bg-muted/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    {dayLabel(d)}
-                  </button>
+                  {readOnly ? (
+                    <span className="ml-auto flex h-10 shrink-0 items-center rounded-lg bg-muted px-4 text-base font-medium text-emerald-600">
+                      {dayLabel(d)}
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setDayDialogRow(i)}
+                      aria-label={`设置第${i + 1}次复习时间，当前${dayLabel(d)}`}
+                      className="ml-auto flex h-10 shrink-0 items-center rounded-lg bg-muted px-4 text-base font-medium text-emerald-600 transition-colors hover:bg-muted/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      {dayLabel(d)}
+                    </button>
+                  )}
                 </div>
               </React.Fragment>
             ))
           )}
-          {/* + 添加按钮 */}
-          {days.length > 0 && (
-            <div
-              aria-hidden
-              className="ml-[9px] h-6 border-l border-dotted border-zinc-300"
-            />
+          {/* + 添加按钮（仅可编辑时） */}
+          {!readOnly && (
+            <>
+              {days.length > 0 && (
+                <div
+                  aria-hidden
+                  className="ml-[9px] h-6 border-l border-dotted border-zinc-300"
+                />
+              )}
+              <div className="flex h-12 items-center">
+                <button
+                  type="button"
+                  onClick={appendRow}
+                  disabled={days.length >= MAX_ROWS}
+                  aria-label="添加复习时间"
+                  className="flex size-9 items-center justify-center rounded-full bg-zinc-900 text-white shadow-md transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-30"
+                >
+                  <Plus className="size-5" strokeWidth={1.75} />
+                </button>
+              </div>
+            </>
           )}
-          <div className="flex h-12 items-center">
-            <button
-              type="button"
-              onClick={appendRow}
-              disabled={days.length >= MAX_ROWS}
-              aria-label="添加复习时间"
-              className="flex size-9 items-center justify-center rounded-full bg-zinc-900 text-white shadow-md transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-30"
-            >
-              <Plus className="size-5" strokeWidth={1.75} />
-            </button>
-          </div>
         </div>
 
         {/* 取消 / 保存 */}
@@ -517,21 +555,23 @@ function EditScreen({
             disabled={saving}
             className="h-14 flex-1 rounded-2xl border border-zinc-300 bg-white text-lg text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 dark:border-border dark:bg-card"
           >
-            取消
+            {readOnly ? '返回' : '取消'}
           </button>
-          <button
-            type="button"
-            onClick={() => void handleSave()}
-            disabled={!canSave}
-            className="h-14 flex-1 rounded-2xl bg-zinc-900 text-lg font-medium text-white shadow-sm transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-40"
-          >
-            保存
-          </button>
+          {!readOnly && (
+            <button
+              type="button"
+              onClick={() => void handleSave()}
+              disabled={!canSave}
+              className="h-14 flex-1 rounded-2xl bg-zinc-900 text-lg font-medium text-white shadow-sm transition-colors hover:bg-zinc-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-40"
+            >
+              保存
+            </button>
+          )}
         </div>
       </main>
 
-      {/* 复习时间选择弹窗 */}
-      {dayDialogRow !== null && dayDialogRow < days.length ? (
+      {/* 复习时间选择弹窗（仅可编辑时） */}
+      {!readOnly && dayDialogRow !== null && dayDialogRow < days.length ? (
         <DayPickerDialog
           rowIdx={dayDialogRow}
           current={days[dayDialogRow]}

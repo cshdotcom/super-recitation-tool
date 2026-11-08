@@ -1,6 +1,6 @@
 'use client'
 
-// 分享管理：全部分享链接列表 + 批量操作（延长有效期 / 取消分享 / 删除）
+// 分享管理：全部分享链接列表 + 单个删除 + 批量操作（延长有效期 / 删除所选）
 import * as React from 'react'
 import { ArrowLeft, Copy, Link2, Loader2, SquareCheckBig, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -34,8 +34,10 @@ export function ShareManagerView({ onBack }: { onBack: () => void }) {
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
   const [batchMode, setBatchMode] = React.useState(false)
   const [confirmDelete, setConfirmDelete] = React.useState(false)
+  const [singleDeleteId, setSingleDeleteId] = React.useState<string | null>(null)
   const [extendDays, setExtendDays] = React.useState('7')
   const [busy, setBusy] = React.useState(false)
+  const [busySingle, setBusySingle] = React.useState(false)
 
   const load = React.useCallback(async () => {
     try {
@@ -96,7 +98,7 @@ export function ShareManagerView({ onBack }: { onBack: () => void }) {
         method: 'DELETE',
       })
       if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '操作失败')
-      toast.success(`已取消 ${selected.size} 个分享`)
+      toast.success(`已删除 ${selected.size} 个分享`)
       setSelected(new Set())
       setBatchMode(false)
       setConfirmDelete(false)
@@ -107,6 +109,33 @@ export function ShareManagerView({ onBack }: { onBack: () => void }) {
       setBusy(false)
     }
   }
+
+  const deleteSingle = async () => {
+    if (!singleDeleteId) return
+    setBusySingle(true)
+    try {
+      const res = await fetch(`/api/shares/${encodeURIComponent(singleDeleteId)}`, {
+        method: 'DELETE',
+      })
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || '删除失败')
+      toast.success('已删除该分享')
+      // 若删除的项处于选中态，同步移除
+      setSelected((prev) => {
+        if (!prev.has(singleDeleteId)) return prev
+        const n = new Set(prev)
+        n.delete(singleDeleteId)
+        return n
+      })
+      setSingleDeleteId(null)
+      await load()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '删除失败')
+    } finally {
+      setBusySingle(false)
+    }
+  }
+
+  const singleDeleteRow = shares?.find((s) => s.id === singleDeleteId) ?? null
 
   return (
     <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col px-4">
@@ -204,6 +233,15 @@ export function ShareManagerView({ onBack }: { onBack: () => void }) {
                     >
                       <Copy className="size-4" strokeWidth={1.75} />
                     </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      aria-label="删除该分享"
+                      disabled={busySingle}
+                      onClick={() => setSingleDeleteId(s.id)}
+                    >
+                      <Trash2 className="size-4" strokeWidth={1.75} />
+                    </Button>
                   </div>
                 </li>
               )
@@ -237,11 +275,11 @@ export function ShareManagerView({ onBack }: { onBack: () => void }) {
           <Button
             variant="destructive"
             className="flex-1 rounded-full"
-            disabled={busy}
+            disabled={busy || selected.size === 0}
             onClick={() => setConfirmDelete(true)}
           >
             <Trash2 className="size-4" strokeWidth={1.75} />
-            取消分享
+            删除所选
           </Button>
         </div>
       )}
@@ -249,8 +287,8 @@ export function ShareManagerView({ onBack }: { onBack: () => void }) {
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <AlertDialogContent className="rounded-2xl sm:max-w-sm">
           <AlertDialogHeader>
-            <AlertDialogTitle>取消 {selected.size} 个分享？</AlertDialogTitle>
-            <AlertDialogDescription>取消后原链接立即失效，访客将无法再访问。</AlertDialogDescription>
+            <AlertDialogTitle>删除所选 {selected.size} 个分享？</AlertDialogTitle>
+            <AlertDialogDescription>删除后原链接立即失效，访客将无法再访问，且不可恢复。</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
@@ -258,7 +296,35 @@ export function ShareManagerView({ onBack }: { onBack: () => void }) {
               className="bg-destructive text-white hover:bg-destructive/90"
               onClick={() => void batchDelete()}
             >
-              确认取消
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={!!singleDeleteId}
+        onOpenChange={(v) => {
+          if (!v) setSingleDeleteId(null)
+        }}
+      >
+        <AlertDialogContent className="rounded-2xl sm:max-w-sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除该分享？</AlertDialogTitle>
+            <AlertDialogDescription>
+              {singleDeleteRow
+                ? `「${singleDeleteRow.cardTitle}」的分享链接将立即失效，访客无法再访问，且不可恢复。`
+                : '该分享链接将立即失效，访客将无法再访问，且不可恢复。'}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              disabled={busySingle}
+              onClick={() => void deleteSingle()}
+            >
+              {busySingle ? '删除中…' : '确认删除'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

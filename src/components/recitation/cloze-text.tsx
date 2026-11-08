@@ -372,6 +372,58 @@ export function ClozeText({
     tempTimersRef.current.set(idx, t)
   }
 
+  // ---------------------------------------------------------------------------
+  // Stuck-orange fix: the parent `revealed` set is add-only in some callers
+  // (reader-view's handleReveal early-returns when idx is already present), so
+  // tapping a revealed blank could never clear it — the blank stayed amber
+  // (orange) forever. We layer a local `hiddenBlanks` override on top of the
+  // prop: effectiveRevealed = revealed.has(idx) && !hiddenBlanks.has(idx).
+  // Tapping cycles a blank  empty → revealed (calls onReveal) → hidden (local
+  // override) → revealed again. When showAnswers is globally on, tapping a
+  // blank that is NOT individually revealed is a no-op so the global reveal
+  // can't permanently lock individual blanks.
+  // ---------------------------------------------------------------------------
+  const [hiddenBlanks, setHiddenBlanks] = React.useState<Set<number>>(new Set())
+
+  // Drop stale overrides when the parent's revealed set changes (e.g. the
+  // parent resets on text change) — keep only entries still backed by the prop.
+  React.useEffect(() => {
+    setHiddenBlanks((prev) => {
+      if (prev.size === 0) return prev
+      let changed = false
+      const next = new Set<number>()
+      for (const idx of prev) {
+        if (revealed.has(idx)) next.add(idx)
+        else changed = true
+      }
+      return changed ? next : prev
+    })
+  }, [revealed])
+
+  const toggleBlank = (idx: number) => {
+    const inProp = revealed.has(idx)
+    const inHidden = hiddenBlanks.has(idx)
+    if (inProp && !inHidden) {
+      // Currently revealed → hide locally (toggle off without mutating parent).
+      setHiddenBlanks((prev) => {
+        const n = new Set(prev)
+        n.add(idx)
+        return n
+      })
+    } else if (inHidden) {
+      // Locally hidden → re-reveal (remove the local override).
+      setHiddenBlanks((prev) => {
+        const n = new Set(prev)
+        n.delete(idx)
+        return n
+      })
+    } else if (!showAnswers) {
+      // Fresh reveal — only when showAnswers is off, so the global reveal
+      // can't lock individual blanks that were never explicitly tapped.
+      onReveal(idx)
+    }
+  }
+
   // 朗读 — 优先外部注入的引擎（默认配置），否则浏览器 speechSynthesis。
   const speakText = React.useCallback(
     (text: string) => {
@@ -1255,7 +1307,9 @@ export function ClozeText({
       const text = b.text
       charIdx += 1
       const ci = charIdx
-      const isRevealed = revealed.has(idx)
+      // effectiveRevealed accounts for the local hiddenBlanks override so a
+      // blank the user toggled off stops showing the amber "revealed" tint.
+      const isRevealed = revealed.has(idx) && !hiddenBlanks.has(idx)
       const tempOn = tempRevealed.has(idx)
       const visible = showAnswers || isRevealed || tempOn
       const effRevealed = isRevealed || tempOn
@@ -1339,7 +1393,7 @@ export function ClozeText({
             e.stopPropagation()
             if (!brushMode) {
               if (selectionMode) onToggleKeyword(text, b.occ)
-              else onReveal(idx)
+              else toggleBlank(idx)
             }
           }}
           onDoubleClick={
@@ -1355,7 +1409,7 @@ export function ClozeText({
               e.preventDefault()
               if (!brushMode) {
                 if (selectionMode) onToggleKeyword(text, b.occ)
-                else onReveal(idx)
+                else toggleBlank(idx)
               }
             }
           }}

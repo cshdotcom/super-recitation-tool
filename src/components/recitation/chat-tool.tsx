@@ -357,73 +357,68 @@ function AskCard({
       )}
       aria-label="AI 提问卡片"
     >
-      <div className="mb-2 flex items-start gap-2">
-        <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
-          <Sparkles className="size-3.5" strokeWidth={2} />
-        </span>
-        <p className="text-sm font-medium leading-relaxed">{ask.question}</p>
-      </div>
-      <div className="space-y-1.5">
-        {ask.options.map((opt) => {
-          const chosen = done && answered === opt
-          return (
-            <button
-              key={opt}
-              type="button"
-              disabled={done || busy}
-              onClick={() => onSend(opt)}
-              className={cn(
-                'flex min-h-11 w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left text-sm transition-colors sm:min-h-0',
-                chosen
-                  ? 'border-emerald-600 bg-emerald-600 text-white'
-                  : 'border-border bg-card hover:border-emerald-500/60 hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-50',
-              )}
-            >
-              <span className="min-w-0 break-words">{opt}</span>
-              {chosen && <Check className="size-4 shrink-0" strokeWidth={2.5} />}
-            </button>
-          )
-        })}
-      </div>
       {done ? (
-        <div className="mt-2 flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
-          <Check className="size-3.5" strokeWidth={2.5} />
-          已回答：{answered}
+        // 已回答后折叠为单行提示：不再持续展示问题/选项/输入框，
+        // 避免每次渲染都像「弹出提问框」一样重新冒出来。
+        <div className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
+          <Check className="size-3.5 shrink-0" strokeWidth={2.5} />
+          <span className="min-w-0 break-words">已回答：{answered}</span>
         </div>
       ) : (
-        <form
-          className="mt-2 flex items-center gap-1.5"
-          onSubmit={(e) => {
-            e.preventDefault()
-            submitCustom()
-          }}
-        >
-          <Input
-            value={custom}
-            onChange={(e) => setCustom(e.target.value)}
-            onFocus={keepInputVisible}
-            placeholder="自定义回答…"
-            disabled={busy}
-            className="h-10 bg-card text-xs sm:h-8"
-            aria-label="自定义回答"
-          />
-          <VoiceInput
-            size="sm"
-            context="ask"
-            disabled={busy}
-            className={TOUCH_MIC}
-            onText={(t) => setCustom((p) => (p ? p + t : t))}
-          />
-          <Button
-            type="submit"
-            size="icon"
-            className={TOUCH_XS}
-            disabled={busy || !custom.trim()}
-            aria-label="发送自定义回答"
+        <>
+          <div className="mb-2 flex items-start gap-2">
+            <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+              <Sparkles className="size-3.5" strokeWidth={2} />
+            </span>
+            <p className="text-sm font-medium leading-relaxed">{ask.question}</p>
+          </div>
+          <div className="space-y-1.5">
+            {ask.options.map((opt) => (
+              <button
+                key={opt}
+                type="button"
+                disabled={busy}
+                onClick={() => onSend(opt)}
+                className="flex min-h-11 w-full items-center justify-between gap-2 rounded-xl border border-border bg-card px-3 py-2 text-left text-sm transition-colors hover:border-emerald-500/60 hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-50 sm:min-h-0"
+              >
+                <span className="min-w-0 break-words">{opt}</span>
+              </button>
+            ))}
+          </div>
+          <form
+            className="mt-2 flex items-center gap-1.5"
+            onSubmit={(e) => {
+              e.preventDefault()
+              submitCustom()
+            }}
           >
-            <Send className="size-3.5" />
-          </Button>
-        </form>
+            <Input
+              value={custom}
+              onChange={(e) => setCustom(e.target.value)}
+              onFocus={keepInputVisible}
+              placeholder="自定义回答…"
+              disabled={busy}
+              className="h-10 bg-card text-xs sm:h-8"
+              aria-label="自定义回答"
+            />
+            <VoiceInput
+              size="sm"
+              context="ask"
+              disabled={busy}
+              className={TOUCH_MIC}
+              onText={(t) => setCustom((p) => (p ? p + t : t))}
+            />
+            <Button
+              type="submit"
+              size="icon"
+              className={TOUCH_XS}
+              disabled={busy || !custom.trim()}
+              aria-label="发送自定义回答"
+            >
+              <Send className="size-3.5" />
+            </Button>
+          </form>
+        </>
       )}
     </div>
   )

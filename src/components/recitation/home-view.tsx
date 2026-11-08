@@ -47,7 +47,7 @@ import {
 } from 'lucide-react'
 
 import type { AccountData, CardData, ProjectData } from '@/lib/types'
-import { cn } from '@/lib/utils'
+import { cn, formatBadge } from '@/lib/utils'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import { VoiceInput } from '@/components/recitation/voice-input'
@@ -299,6 +299,11 @@ export function HomeView({
 
   // ⋯ 菜单里的「上移/下移」：在当前展示顺序上交换（拖拽中则基于临时顺序）
   const nudgeCard = (cardId: string, dir: -1 | 1) => {
+    // 上移/下移依赖 ord 排序生效：若当前不是 custom，自动切到 custom，
+    // 否则即便 ord 已更新，列表仍按时间/字母排序，视觉上“无效果”。
+    if (sortMode !== 'custom') {
+      setSortMode('custom')
+    }
     const ids = [...(dragIds ?? visibleCards.map((c) => c.id))]
     const i = ids.indexOf(cardId)
     const j = i + dir
@@ -562,7 +567,7 @@ export function HomeView({
               待复习
               {dueCount > 0 && (
                 <span className="relative flex size-5 items-center justify-center rounded-full bg-foreground text-[10px] font-bold text-background">
-                  {dueCount > 99 ? '99+' : dueCount}
+                  {formatBadge(dueCount)}
                   <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-emerald-500 ring-2 ring-background" />
                 </span>
               )}
@@ -660,12 +665,17 @@ export function HomeView({
           {/* 复习（点击自动显示待复习列表；统计/日历在顶栏日历按钮） */}
           <button
             type="button"
-            aria-label="复习"
+            aria-label={dueCount > 0 ? `复习（待复习 ${formatBadge(dueCount)} 张）` : '复习'}
             onClick={onOpenReviewDue}
-            className="flex min-w-[72px] flex-col items-center justify-center gap-0.5 rounded-full px-4 py-1.5 text-foreground transition-transform active:scale-95"
+            className="relative flex min-w-[72px] flex-col items-center justify-center gap-0.5 rounded-full px-4 py-1.5 text-foreground transition-transform active:scale-95"
           >
             <CalendarCheck className="size-5" strokeWidth={2} aria-hidden />
             <span className="text-[10px] font-medium leading-none">复习</span>
+            {dueCount > 0 && (
+              <span className="absolute right-2 top-0.5 flex min-w-[16px] h-4 items-center justify-center rounded-full bg-emerald-600 px-1 text-[9px] font-bold leading-none text-white ring-2 ring-background">
+                {formatBadge(dueCount)}
+              </span>
+            )}
           </button>
         </nav>
       </div>
@@ -1170,7 +1180,7 @@ function ProjRow({
     >
       {icon}
       <span className="min-w-0 flex-1 truncate text-sm">{label}</span>
-      {count > 0 && <span className="text-xs text-muted-foreground">{count}</span>}
+      {count > 0 && <span className="text-xs text-muted-foreground">{formatBadge(count)}</span>}
     </button>
   )
 }

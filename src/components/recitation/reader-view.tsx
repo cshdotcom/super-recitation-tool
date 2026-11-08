@@ -973,13 +973,6 @@ export function ReaderView({
               )}
               AI生成标题
             </Button>
-            <button
-              type="button"
-              className="text-xs text-muted-foreground transition-colors hover:text-foreground"
-              onClick={() => toast.info('感谢反馈！我们会继续改进')}
-            >
-              反馈
-            </button>
           </div>
           {aiTitle && (
             <div className="mt-2 flex items-center justify-center gap-2">

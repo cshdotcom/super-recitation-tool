@@ -10,6 +10,10 @@
  */
 export function stripMarkup(content: string): string {
   let s = String(content ?? '')
+  // 围栏代码块（```lang ... ``` / ~~~ ... ~~~）整块移除——
+  // mermaid/代码不应被朗读，避免播放器把源码当课文读。
+  s = s.replace(/```[\s\S]*?(?:```|$)/g, ' ')
+  s = s.replace(/~~~[\s\S]*?(?:~~~|$)/g, ' ')
   // 图片（含 base64 dataURL）→ 移除；链接 [text](url) → text
   s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
   s = s.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')

@@ -370,7 +370,9 @@ export function QuizPanel({
   autoRemove = 2,
 }: QuizPanelProps) {
   // ---- 向导步骤 ----
-  const [step, setStep] = React.useState<Step>(content.trim() ? 'points' : 'idle')
+  // 始终从 idle 开始：必须由用户点「开始出题」显式触发，
+  // 不再因背书卡有内容就自动进入 points 步骤（避免每次打开都自动弹题）。
+  const [step, setStep] = React.useState<Step>('idle')
   /** Step2 生成题目失败的友好错误（留在出题中视图，可重试）。 */
   const [genError, setGenError] = React.useState<string | null>(null)
 

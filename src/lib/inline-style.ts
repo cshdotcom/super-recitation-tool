@@ -15,6 +15,7 @@
 export interface InlineSpanStyle {
   color?: string
   fontSize?: number
+  underline?: boolean
 }
 
 const COLOR_VALUE_RE =
@@ -51,6 +52,8 @@ function parsePair(raw: string): InlineSpanStyle {
     const n = parseFloat(value)
     const px = clampPx(n)
     if (px) out.fontSize = px
+  } else if (k === 'u' || k === 'underline' || k === '下划线') {
+    out.underline = true
   }
   return out
 }
@@ -85,6 +88,10 @@ export function parseSpanDirective(directive: string): InlineSpanStyle {
   // bare color token (#hex / rgb() / named)
   const v = NAMED_ALIASES[dir.toLowerCase()] ?? dir
   if (COLOR_VALUE_RE.test(v)) return { color: v }
+  // bare underline directive
+  if (dir.toLowerCase() === 'u' || dir.toLowerCase() === 'underline') {
+    return { underline: true }
+  }
   return {}
 }
 
@@ -93,6 +100,7 @@ export function spanStyleCss(style: InlineSpanStyle): string {
   const parts: string[] = []
   if (style.color) parts.push(`color:${style.color}`)
   if (style.fontSize) parts.push(`font-size:${style.fontSize}px`)
+  if (style.underline) parts.push('text-decoration:underline')
   return parts.join(';')
 }
 

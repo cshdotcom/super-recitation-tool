@@ -147,12 +147,14 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
     async (camFacing: 'environment' | 'user') => {
       stopStream()
       setPermissionError(false)
-      // 浏览器/内嵌 iframe 不支持 getUserMedia：直接进入降级面板（可从相册选或新标签页打开）
+      // 浏览器/内嵌 iframe 不支持 getUserMedia：toast 提示 + 进入降级面板（预览区会出现"选择图片"降级按钮）
       if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+        toast.error('无法访问摄像头，请检查权限')
         setPermissionError(true)
         return
       }
       try {
+        // 真实在线相机：getUserMedia 取流 → <video> 实时取景器（主路径）
         const stream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: camFacing, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: false,
@@ -162,15 +164,9 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
           videoRef.current.srcObject = stream
           void videoRef.current.play().catch(() => {})
         }
-      } catch (err) {
-        if (
-          err instanceof DOMException &&
-          (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError')
-        ) {
-          toast.error('未授予相机权限，可从相册选择图片识别')
-        } else {
-          toast.error('无法访问相机，可从相册选择图片识别')
-        }
+      } catch {
+        // 拒绝授权 / 无摄像头 / 被拦截：统一提示，并在预览区提供"选择图片"降级按钮
+        toast.error('无法访问摄像头，请检查权限')
         setPermissionError(true)
       }
     },
@@ -483,14 +479,34 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
             {permissionError && !current && (
               <div className="flex flex-col items-center gap-3 px-6 py-12 text-center text-sm text-zinc-400">
                 <Camera className="size-10 text-zinc-600" strokeWidth={1.25} />
-                相机不可用或未授权，可从相册选择图片
+                <p>无法访问摄像头，请检查权限</p>
+                {/* 降级按钮：仅在相机不可用时出现，明确标注"选择图片"，不作为主操作 */}
+                <label
+                  className="mt-1 flex cursor-pointer items-center gap-1.5 rounded-full bg-white/10 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-white/20"
+                  aria-label="选择图片（相机不可用降级）"
+                >
+                  <Images className="size-4" strokeWidth={1.75} />
+                  选择图片
+                  <input
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0]
+                      if (f) handlePickFile(f)
+                      e.target.value = ''
+                    }}
+                  />
+                </label>
                 {typeof window !== 'undefined' && window.self !== window.top && (
                   <>
-                    <p className="text-xs text-zinc-500">预览面板可能拦截了相机权限，在新标签页打开即可正常唤起摄像头</p>
+                    <p className="mt-2 text-xs text-zinc-500">
+                      预览面板可能拦截了相机权限，在新标签页打开即可正常唤起摄像头
+                    </p>
                     <button
                       type="button"
                       onClick={() => window.open('/?cam=1', '_blank')}
-                      className="mt-1 rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-emerald-700"
+                      className="rounded-full bg-emerald-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-emerald-700"
                     >
                       在新标签页打开相机
                     </button>
@@ -655,27 +671,13 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
             </div>
           )}
 
-          {/* bottom action bar: 相册 | 快门/裁剪模式 | 翻转相机 */}
+          {/* bottom action bar: [占位] | 快门/裁剪模式 | 翻转相机
+              ⚠️ 不再在此处渲染 <input type="file">：原先常驻的相册 label 与快门按钮同级，
+              会被用户误认为"相机按钮"从而打开文件选择器。getUserMedia 真实取景器为唯一主路径；
+              相机不可用 (permissionError) 时，"选择图片"降级按钮出现在上方预览区的错误提示中。 */}
           <div className="flex items-center justify-between px-6 py-4">
-            <label
-              className={cn(
-                'flex size-11 cursor-pointer items-center justify-center rounded-full bg-white/10 transition-colors hover:bg-white/20',
-                inCropMode && 'pointer-events-none opacity-30',
-              )}
-              aria-label="从相册选择"
-            >
-              <Images className="size-5" strokeWidth={1.75} />
-              <input
-                type="file"
-                accept="image/*"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0]
-                  if (f) handlePickFile(f)
-                  e.target.value = ''
-                }}
-              />
-            </label>
+            {/* 左槽位占位：保持 [快门] 居中、[翻转] 居右的三段式布局平衡，不渲染任何文件选择器 */}
+            <span className="size-11" aria-hidden />
 
             {inCropMode ? (
               <span className="text-xs text-zinc-400">裁剪模式</span>

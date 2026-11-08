@@ -1,18 +1,20 @@
 'use client'
 
 import * as React from 'react'
+import JSZip from 'jszip'
 import {
-  Braces,
   CalendarClock,
   ChevronRight,
   Cpu,
   Database,
+  Download,
   Globe,
   KeyRound,
   Loader2,
   Mic,
   Palette,
   Trash2,
+  Upload,
   Volume2,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -394,6 +396,9 @@ export function SettingsSheet({
   })
   const [saving, setSaving] = React.useState(false)
   const [savingVoice, setSavingVoice] = React.useState(false)
+  const [exporting, setExporting] = React.useState(false)
+  const [importing, setImporting] = React.useState(false)
+  const importInputRef = React.useRef<HTMLInputElement>(null)
   // Locally-saved per-context voice defaults (refreshes the summaries right
   // away; the server PATCH happens inside saveVoicePref).
   const [savedVoicePrefs, setSavedVoicePrefs] = React.useState<Record<string, VoicePref>>({})
@@ -446,17 +451,369 @@ export function SettingsSheet({
     }
   }
 
-  const handleExportAll = () => {
-    const blob = new Blob([JSON.stringify({ cards }, null, 2)], {
-      type: 'application/json',
-    })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = '背书吧-全部数据.json'
-    a.click()
-    URL.revokeObjectURL(url)
-    toast.success('已导出全部数据')
+  // 导出全部数据为 zip 压缩包（cards / projects / settings / quiz / chat /
+  // review / focus / plans / shares / recite-log）。所有数据通过现有 GET
+  // 接口客户端拉取后打包，不新建后端路由。
+  const handleExportAll = React.useCallback(async () => {
+    if (exporting) return
+    setExporting(true)
+    const tid = toast.loading('正在收集数据…')
+    try {
+      const safeJson = async (res: Response) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return (await res.json()) as unknown
+      }
+
+      // 并行拉取所有「无依赖」数据源
+      const [cardsRes, projectsRes, settingsRes, quizFavRes, quizWrongRes, plansRes, sharesRes, reciteRes, focusRes, focusLogRes, reviewStatsRes] =
+        await Promise.all([
+          fetch('/api/cards').then(safeJson).catch(() => null),
+          fetch('/api/projects').then(safeJson).catch(() => null),
+          fetch('/api/settings').then(safeJson).catch(() => null),
+          fetch('/api/quiz-items?favorite=1').then(safeJson).catch(() => null),
+          fetch('/api/quiz-items?wrong=1').then(safeJson).catch(() => null),
+          fetch('/api/plans').then(safeJson).catch(() => null),
+          fetch('/api/shares').then(safeJson).catch(() => null),
+          fetch('/api/recite-log?all=1&limit=100').then(safeJson).catch(() => null),
+          fetch(`/api/focus?tzOffset=${new Date().getTimezoneOffset()}`).then(safeJson).catch(() => null),
+          fetch(`/api/focus/log?tzOffset=${new Date().getTimezoneOffset()}`).then(safeJson).catch(() => null),
+          fetch(`/api/review?tzOffset=${new Date().getTimezoneOffset()}`).then(safeJson).catch(() => null),
+        ])
+
+      toast.loading('正在拉取对话记录…', { id: tid })
+
+      // chat-log 必须按 cardId + mode 拉取（GET 不支持 all），上限 200 张卡避免请求过多。
+      const cardsArr =
+        (cardsRes as { cards?: { id: string }[] } | null)?.cards ?? []
+      const chatLogBatches = await Promise.all(
+        cardsArr.slice(0, 200).map(async (c) => {
+          const out: Record<string, unknown> = { cardId: c.id }
+          for (const mode of ['ask', 'supervise'] as const) {
+            try {
+              const r = await fetch(
+                `/api/chat-log?cardId=${encodeURIComponent(c.id)}&mode=${mode}`,
+              )
+              if (r.ok) out[mode] = await r.json()
+            } catch {}
+          }
+          return out
+        }),
+      )
+
+      toast.loading('正在打包 zip…', { id: tid })
+
+      const zip = new JSZip()
+      zip.file('manifest.json', JSON.stringify({
+        app: '背书吧',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        files: [
+          'cards.json', 'projects.json', 'settings.json', 'quiz-items.json',
+          'chat-log.json', 'review-stats.json', 'focus.json', 'focus-logs.json',
+          'plans.json', 'shares.json', 'recite-logs.json',
+        ],
+      }, null, 2))
+      zip.file('cards.json', JSON.stringify(cardsRes, null, 2))
+      zip.file('projects.json', JSON.stringify(projectsRes, null, 2))
+      zip.file('settings.json', JSON.stringify(settingsRes, null, 2))
+      zip.file('quiz-items.json', JSON.stringify({
+        favorites: (quizFavRes as { items?: unknown[] } | null)?.items ?? [],
+        wrong: (quizWrongRes as { items?: unknown[] } | null)?.items ?? [],
+      }, null, 2))
+      zip.file('chat-log.json', JSON.stringify({ logs: chatLogBatches }, null, 2))
+      zip.file('review-stats.json', JSON.stringify(reviewStatsRes, null, 2))
+      zip.file('focus.json', JSON.stringify(focusRes, null, 2))
+      zip.file('focus-logs.json', JSON.stringify(focusLogRes, null, 2))
+      zip.file('plans.json', JSON.stringify(plansRes, null, 2))
+      zip.file('shares.json', JSON.stringify(sharesRes, null, 2))
+      zip.file('recite-logs.json', JSON.stringify(reciteRes, null, 2))
+
+      const blob = await zip.generateAsync({ type: 'blob' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      const ts = new Date()
+      const stamp =
+        `${ts.getFullYear()}${String(ts.getMonth() + 1).padStart(2, '0')}` +
+        `${String(ts.getDate()).padStart(2, '0')}-${String(ts.getHours()).padStart(2, '0')}` +
+        `${String(ts.getMinutes()).padStart(2, '0')}`
+      a.download = `背书吧-数据备份-${stamp}.zip`
+      a.click()
+      URL.revokeObjectURL(url)
+      toast.success('已导出全部数据', { id: tid })
+    } catch (err) {
+      toast.error(
+        '导出失败：' + (err instanceof Error ? err.message : '未知错误'),
+        { id: tid },
+      )
+    } finally {
+      setExporting(false)
+    }
+  }, [exporting])
+
+  // 导入 zip：解析每个 JSON 后通过现有 POST/PATCH 接口写回。
+  // - cards/projects/plans/focus/recite-log/chat-log/review/quiz-items 走 POST（新建）
+  // - settings 走 PATCH（upsert singleton）
+  // - 内置 plan / share 无法直接导入，跳过并在结果里提示。
+  const handleImportZip = React.useCallback(
+    async (file: File) => {
+      if (importing) return
+      setImporting(true)
+      const tid = toast.loading('正在解析压缩包…')
+      try {
+        const zip = await JSZip.loadAsync(file)
+        const readJson = async (name: string): Promise<unknown | null> => {
+          const entry = zip.file(name)
+          if (!entry) return null
+          try {
+            return JSON.parse(await entry.async('string'))
+          } catch {
+            return null
+          }
+        }
+
+        const postJson = async (url: string, body: unknown) => {
+          const r = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          })
+          if (!r.ok) {
+            const e = await r.json().catch(() => ({}))
+            throw new Error((e as { error?: string }).error || `HTTP ${r.status}`)
+          }
+          return r
+        }
+
+        const stats = {
+          cards: 0, projects: 0, settings: 0, quizFav: 0, chat: 0,
+          review: 0, focus: 0, focusLog: 0, plans: 0, recite: 0,
+          errors: 0,
+        }
+
+        // 1) settings — upsert singleton
+        const settingsData = (await readJson('settings.json')) as
+          | Record<string, unknown>
+          | null
+        if (settingsData && typeof settingsData === 'object') {
+          toast.loading('正在导入设置…', { id: tid })
+          try {
+            await fetch('/api/settings', {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(settingsData),
+            })
+            stats.settings = 1
+          } catch {
+            stats.errors += 1
+          }
+        }
+
+        // 2) projects — POST 每个新建
+        const projectsPayload = (await readJson('projects.json')) as
+          | { projects?: { name?: string }[] }
+          | null
+        const projects = projectsPayload?.projects ?? []
+        if (projects.length > 0) {
+          toast.loading(`正在导入项目 (0/${projects.length})…`, { id: tid })
+          let i = 0
+          for (const p of projects) {
+            try {
+              await postJson('/api/projects', { name: p.name ?? '未命名' })
+              stats.projects += 1
+            } catch {
+              stats.errors += 1
+            }
+            i += 1
+            if (i % 3 === 0) {
+              toast.loading(`正在导入项目 (${i}/${projects.length})…`, { id: tid })
+            }
+          }
+        }
+
+        // 3) plans — 跳过内置，自定义全部 POST
+        const plansPayload = (await readJson('plans.json')) as
+          | { plans?: { name?: string; days?: number[]; builtIn?: boolean }[] }
+          | null
+        const plans = plansPayload?.plans ?? []
+        const customPlans = plans.filter((p) => !p.builtIn)
+        if (customPlans.length > 0) {
+          toast.loading(`正在导入复习计划 (0/${customPlans.length})…`, { id: tid })
+          let i = 0
+          for (const p of customPlans) {
+            try {
+              await postJson('/api/plans', {
+                name: p.name ?? '导入计划',
+                days: Array.isArray(p.days) ? p.days : [0],
+              })
+              stats.plans += 1
+            } catch {
+              stats.errors += 1
+            }
+            i += 1
+            if (i % 2 === 0) {
+              toast.loading(`正在导入复习计划 (${i}/${customPlans.length})…`, { id: tid })
+            }
+          }
+        }
+
+        // 4) focus contents — POST 每个新建
+        const focusPayload = (await readJson('focus.json')) as
+          | { contents?: { name?: string; minutes?: number; bg?: string }[] }
+          | null
+        const focusContents = focusPayload?.contents ?? []
+        if (focusContents.length > 0) {
+          toast.loading(`正在导入专注内容 (0/${focusContents.length})…`, { id: tid })
+          let i = 0
+          for (const c of focusContents) {
+            try {
+              await postJson('/api/focus', {
+                name: c.name ?? '专注内容',
+                minutes: typeof c.minutes === 'number' ? c.minutes : 25,
+                bg: typeof c.bg === 'string' ? c.bg : '',
+              })
+              stats.focus += 1
+            } catch {
+              stats.errors += 1
+            }
+            i += 1
+            if (i % 2 === 0) {
+              toast.loading(`正在导入专注内容 (${i}/${focusContents.length})…`, { id: tid })
+            }
+          }
+        }
+
+        // 5) cards — POST 每张新建（保留 content/keywords/blocks）
+        const cardsPayload = (await readJson('cards.json')) as
+          | { cards?: Record<string, unknown>[] }
+          | null
+        const cardList = cardsPayload?.cards ?? []
+        if (cardList.length > 0) {
+          toast.loading(`正在导入卡片 (0/${cardList.length})…`, { id: tid })
+          let i = 0
+          for (const c of cardList) {
+            try {
+              await postJson('/api/cards', c)
+              stats.cards += 1
+            } catch {
+              stats.errors += 1
+            }
+            i += 1
+            if (i % 2 === 0 || i === cardList.length) {
+              toast.loading(`正在导入卡片 (${i}/${cardList.length})…`, { id: tid })
+            }
+          }
+        }
+
+        // 6) quiz-items — 仅恢复收藏（POST favorite=true upsert）
+        const quizPayload = (await readJson('quiz-items.json')) as
+          | { favorites?: Record<string, unknown>[] }
+          | null
+        const favItems = quizPayload?.favorites ?? []
+        if (favItems.length > 0) {
+          toast.loading(`正在导入收藏题目 (0/${favItems.length})…`, { id: tid })
+          let i = 0
+          for (const q of favItems) {
+            try {
+              await postJson('/api/quiz-items', { ...q, favorite: true })
+              stats.quizFav += 1
+            } catch {
+              stats.errors += 1
+            }
+            i += 1
+            if (i % 5 === 0) {
+              toast.loading(`正在导入收藏题目 (${i}/${favItems.length})…`, { id: tid })
+            }
+          }
+        }
+
+        // 7) chat-log — 每条消息 POST（cardId 用旧值，不重建关联）
+        const chatPayload = (await readJson('chat-log.json')) as
+          | { logs?: { cardId?: string; ask?: { messages?: unknown[] }; supervise?: { messages?: unknown[] } }[] }
+          | null
+        const chatLogs = chatPayload?.logs ?? []
+        const totalMsgs = chatLogs.reduce(
+          (s, b) => s + (b.ask?.messages?.length ?? 0) + (b.supervise?.messages?.length ?? 0),
+          0,
+        )
+        if (totalMsgs > 0) {
+          let i = 0
+          for (const b of chatLogs) {
+            const cardId = b.cardId ?? ''
+            for (const mode of ['ask', 'supervise'] as const) {
+              const msgs = b[mode]?.messages
+              if (!Array.isArray(msgs)) continue
+              for (const m of msgs) {
+                const msg = m as { role?: string; content?: string; images?: string[] }
+                try {
+                  await postJson('/api/chat-log', {
+                    cardId,
+                    mode,
+                    role: msg.role === 'assistant' ? 'assistant' : 'user',
+                    content: msg.content ?? '',
+                    images: Array.isArray(msg.images) ? msg.images : [],
+                  })
+                  stats.chat += 1
+                } catch {
+                  stats.errors += 1
+                }
+                i += 1
+                if (i % 10 === 0) {
+                  toast.loading(`正在导入对话 (${i}/${totalMsgs})…`, { id: tid })
+                }
+              }
+            }
+          }
+        }
+
+        // 8) recite-logs — 每条 POST（cardId 用旧值）
+        const recitePayload = (await readJson('recite-logs.json')) as
+          | { logs?: Record<string, unknown>[] }
+          | null
+        const reciteLogs = recitePayload?.logs ?? []
+        if (reciteLogs.length > 0) {
+          toast.loading(`正在导入背诵记录 (0/${reciteLogs.length})…`, { id: tid })
+          let i = 0
+          for (const l of reciteLogs) {
+            try {
+              await postJson('/api/recite-log', l)
+              stats.recite += 1
+            } catch {
+              stats.errors += 1
+            }
+            i += 1
+            if (i % 10 === 0) {
+              toast.loading(`正在导入背诵记录 (${i}/${reciteLogs.length})…`, { id: tid })
+            }
+          }
+        }
+
+        // 9) focus-logs — 仅今日可导出，跳过
+        // 10) shares / review logs — 现有接口无 create / 直接导入能力，跳过
+
+        toast.success(
+          `导入完成：卡片 ${stats.cards} · 项目 ${stats.projects} · 计划 ${stats.plans} · ` +
+          `专注 ${stats.focus} · 收藏 ${stats.quizFav} · 对话 ${stats.chat} · ` +
+          `背诵 ${stats.recite} · 设置 ${stats.settings}` +
+          (stats.errors > 0 ? ` · 失败 ${stats.errors} 项` : ''),
+          { id: tid },
+        )
+      } catch (err) {
+        toast.error(
+          '导入失败：' + (err instanceof Error ? err.message : '未知错误'),
+          { id: tid },
+        )
+      } finally {
+        setImporting(false)
+      }
+    },
+    [importing],
+  )
+
+  const onImportFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0]
+    e.target.value = '' // 允许重复选择同一文件
+    if (f) void handleImportZip(f)
   }
 
   return (
@@ -566,11 +923,40 @@ export function SettingsSheet({
                 <Button
                   variant="outline"
                   className="h-10 rounded-full"
-                  onClick={handleExportAll}
+                  disabled={exporting || importing}
+                  onClick={() => void handleExportAll()}
                 >
-                  <Braces className="size-4" strokeWidth={1.75} />
-                  导出全部数据（JSON 下载）
+                  {exporting ? (
+                    <Loader2 className="size-4 animate-spin" strokeWidth={1.75} />
+                  ) : (
+                    <Download className="size-4" strokeWidth={1.75} />
+                  )}
+                  导出数据压缩包（ZIP）
                 </Button>
+                <Button
+                  variant="outline"
+                  className="h-10 rounded-full"
+                  disabled={exporting || importing}
+                  onClick={() => importInputRef.current?.click()}
+                >
+                  {importing ? (
+                    <Loader2 className="size-4 animate-spin" strokeWidth={1.75} />
+                  ) : (
+                    <Upload className="size-4" strokeWidth={1.75} />
+                  )}
+                  导入数据压缩包（ZIP）
+                </Button>
+                <input
+                  ref={importInputRef}
+                  type="file"
+                  accept=".zip,application/zip,application/x-zip-compressed"
+                  className="hidden"
+                  onChange={onImportFileChange}
+                />
+                <p className="px-1 text-[11px] leading-relaxed text-muted-foreground/70">
+                  导出包含全部卡片、项目、设置、计划、收藏、对话、专注、背诵记录等数据；
+                  导入时遇到同 ID 项目会新建副本。
+                </p>
                 <AlertDialog>
                   <AlertDialogTrigger asChild>
                     <Button

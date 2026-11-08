@@ -141,7 +141,7 @@ export function ToolsSheet({
           />
         )
       case 'supervise':
-        return <ChatTool mode="supervise" content={content} cardId={card.id} settings={settings} />
+        return <ChatTool mode="supervise" content={content} allowImages cardId={card.id} settings={settings} />
       case 'ask':
         return <ChatTool mode="ask" content={content} allowImages cardId={card.id} settings={settings} />
       case 'mindmap':

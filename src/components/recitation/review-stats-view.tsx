@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { ChevronLeft, Loader2, Settings2 } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Loader2, Settings2, X } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type { Mastery, ReviewStats } from '@/lib/types'
@@ -109,6 +109,7 @@ export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewPr
   const [year, setYear] = React.useState(now.getFullYear())
   const [month, setMonth] = React.useState(now.getMonth() + 1)
   const [onlyReviewed, setOnlyReviewed] = React.useState(false)
+  const [selectedDay, setSelectedDay] = React.useState<string | null>(null)
 
   const todayKey = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
   // 年份下拉完全由真实 ReviewLog 数据驱动：日历里出现过的年份 + 当前年。
@@ -158,6 +159,44 @@ export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewPr
     ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
   ]
   const dayKey = (d: number) => `${year}-${pad(month)}-${pad(d)}`
+
+  // 上/下一个月导航：跨年时自动滚转。
+  const goPrevMonth = React.useCallback(() => {
+    setMonth((m) => {
+      if (m === 1) {
+        setYear((y) => y - 1)
+        return 12
+      }
+      return m - 1
+    })
+    setSelectedDay(null)
+  }, [])
+  const goNextMonth = React.useCallback(() => {
+    setMonth((m) => {
+      if (m === 12) {
+        setYear((y) => y + 1)
+        return 1
+      }
+      return m + 1
+    })
+    setSelectedDay(null)
+  }, [])
+
+  // 选中的某天详情：根据 calendar 计数显示该日复习次数。
+  const selectedInfo = React.useMemo(() => {
+    if (!selectedDay) return null
+    const [sy, sm, sd] = selectedDay.split('-').map(Number)
+    if (!sy || !sm || !sd) return null
+    const count = calendar[selectedDay] ?? 0
+    return {
+      key: selectedDay,
+      year: sy,
+      month: sm,
+      day: sd,
+      count,
+      isToday: selectedDay === todayKey,
+    }
+  }, [selectedDay, calendar, todayKey])
 
   return (
     <div className="flex min-h-screen flex-col bg-muted/40">
@@ -242,7 +281,15 @@ export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewPr
             <h2 className="mb-3 mt-7 text-xl font-bold">复习日历</h2>
             <div className="rounded-2xl bg-card p-4 shadow-sm">
               <div className="flex items-center gap-1">
-                <Select value={String(year)} onValueChange={(v) => setYear(Number(v))}>
+                <button
+                  type="button"
+                  onClick={goPrevMonth}
+                  aria-label="上个月"
+                  className="flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <ChevronLeft className="size-5" strokeWidth={2} />
+                </button>
+                <Select value={String(year)} onValueChange={(v) => { setYear(Number(v)); setSelectedDay(null) }}>
                   <SelectTrigger
                     size="sm"
                     aria-label="选择年份"
@@ -258,7 +305,7 @@ export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewPr
                     ))}
                   </SelectContent>
                 </Select>
-                <Select value={String(month)} onValueChange={(v) => setMonth(Number(v))}>
+                <Select value={String(month)} onValueChange={(v) => { setMonth(Number(v)); setSelectedDay(null) }}>
                   <SelectTrigger
                     size="sm"
                     aria-label="选择月份"
@@ -274,6 +321,14 @@ export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewPr
                     ))}
                   </SelectContent>
                 </Select>
+                <button
+                  type="button"
+                  onClick={goNextMonth}
+                  aria-label="下个月"
+                  className="flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <ChevronRight className="size-5" strokeWidth={2} />
+                </button>
                 <label className="ml-auto flex cursor-pointer items-center gap-2 text-sm">
                   <Checkbox
                     checked={onlyReviewed}
@@ -299,21 +354,60 @@ export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewPr
                   const key = dayKey(d)
                   const count = calendar[key] ?? 0
                   const isToday = key === todayKey
+                  const isSelected = key === selectedDay
                   return (
-                    <div
+                    <button
                       key={key}
+                      type="button"
+                      onClick={() => setSelectedDay(key)}
+                      aria-pressed={isSelected}
+                      aria-label={`${year}年${month}月${d}日，复习 ${count} 次`}
                       className={cn(
-                        'flex h-9 items-center justify-center rounded-lg text-sm tabular-nums',
-                        count > 0 && 'bg-emerald-600 font-semibold text-white',
+                        'flex h-9 items-center justify-center rounded-lg text-sm tabular-nums transition-colors',
+                        count > 0
+                          ? 'bg-emerald-600 font-semibold text-white hover:bg-emerald-700'
+                          : 'text-foreground hover:bg-muted',
                         count === 0 && onlyReviewed && 'invisible',
                         isToday && 'ring-1 ring-inset ring-zinc-900',
+                        isSelected && 'outline outline-2 outline-offset-1 outline-zinc-900',
                       )}
                     >
                       {d}
-                    </div>
+                    </button>
                   )
                 })}
               </div>
+
+              {/* 选中某天的详情面板：展示该日复习次数 */}
+              {selectedInfo && (
+                <div className="mt-4 rounded-xl border border-border bg-muted/30 px-4 py-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-bold">
+                        {selectedInfo.year}年{selectedInfo.month}月{selectedInfo.day}日
+                        {selectedInfo.isToday && (
+                          <span className="ml-2 rounded-full bg-emerald-100 px-2 py-0.5 text-[11px] font-medium text-emerald-700">
+                            今天
+                          </span>
+                        )}
+                      </p>
+                      <p className="mt-1 text-sm text-muted-foreground">
+                        {selectedInfo.count > 0
+                          ? `当天复习了 ${selectedInfo.count} 次`
+                          : '当天没有复习记录'}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedDay(null)}
+                      aria-label="关闭"
+                      className="flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    >
+                      <X className="size-4" strokeWidth={2} />
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </>
         )}

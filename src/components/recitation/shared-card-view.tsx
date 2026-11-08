@@ -122,12 +122,14 @@ export function SharedCardView({ token, onExit }: SharedCardViewProps) {
     }
   }, [token])
 
-  // Tap a blank to reveal it locally (same semantics as the reader view).
+  // Toggle a blank's revealed state locally — never persisted (guests cannot
+  // modify the card). Tapping an already-revealed blank cycles it back to
+  // hidden so the share view can never get stuck orange like the reader could.
   const handleReveal = React.useCallback((idx: number) => {
     setRevealed((prev) => {
-      if (prev.has(idx)) return prev
       const next = new Set(prev)
-      next.add(idx)
+      if (next.has(idx)) next.delete(idx)
+      else next.add(idx)
       return next
     })
   }, [])

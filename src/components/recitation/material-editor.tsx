@@ -56,11 +56,13 @@ import {
   TextQuote,
   Trash2,
   Type,
+  Underline,
   Undo2,
   UnfoldVertical,
   Zap,
   Camera,
   Crop,
+  Download,
   Paintbrush,
   Palette,
   ScanLine,
@@ -132,11 +134,12 @@ const TABLE_TEMPLATE = [
   '| 单元格 | 单元格 | 单元格 |',
 ].join('\n')
 
-type FormatKind = 'bold' | 'italic' | 'strike' | 'code' | 'highlight' | 'quote'
+type FormatKind = 'bold' | 'italic' | 'underline' | 'strike' | 'code' | 'highlight' | 'quote'
 
 const FORMAT_MAP: Record<FormatKind, { before: string; after: string; ph: string }> = {
   bold: { before: '**', after: '**', ph: '文字' },
   italic: { before: '*', after: '*', ph: '文字' },
+  underline: { before: '%%u|', after: '%%', ph: '文字' },
   strike: { before: '~~', after: '~~', ph: '文字' },
   code: { before: '`', after: '`', ph: '文字' },
   highlight: { before: '==', after: '==', ph: '文字' },
@@ -158,6 +161,7 @@ const TEXT_COLORS: { value: string; label: string }[] = [
 const FORMAT_ITEMS: { kind: FormatKind; label: string; icon: LucideIcon }[] = [
   { kind: 'bold', label: '加粗', icon: Bold },
   { kind: 'italic', label: '斜体', icon: Italic },
+  { kind: 'underline', label: '下划线', icon: Underline },
   { kind: 'strike', label: '删除线', icon: Strikethrough },
   { kind: 'code', label: '行内代码', icon: Code },
   { kind: 'highlight', label: '高亮', icon: Highlighter },
@@ -293,6 +297,121 @@ function toPreviewMarkdown(text: string): string {
     })
 }
 
+// ---------- 块内图片预览条 ----------
+function extractImages(text: string): { alt: string; url: string; raw: string }[] {
+  const out: { alt: string; url: string; raw: string }[] = []
+  const re = /!\[([^\]]*)\]\(([^)\s]+)\)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    out.push({ alt: m[1], url: m[2], raw: m[0] })
+  }
+  return out
+}
+
+function BlockImageStrip({
+  content,
+  onRemove,
+}: {
+  content: string
+  onRemove: (raw: string) => void
+}) {
+  const imgs = React.useMemo(() => extractImages(content), [content])
+  if (imgs.length === 0) return null
+  return (
+    <div className="flex flex-wrap gap-2 rounded-xl bg-muted/40 p-2">
+      {imgs.map((img, idx) => (
+        <div key={idx} className="group relative">
+          <img
+            src={img.url}
+            alt={img.alt || '图片'}
+            loading="lazy"
+            className="h-20 w-20 rounded-lg border border-border object-cover"
+          />
+          <button
+            type="button"
+            aria-label="删除该图片"
+            onClick={() => onRemove(img.raw)}
+            className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full bg-destructive text-destructive-foreground opacity-0 shadow transition-opacity group-hover:opacity-100"
+          >
+            <Trash2 className="size-3" strokeWidth={2.5} aria-hidden />
+          </button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ---------- 复制 / 导出 ----------
+/** 把 blocks 拼成纯文本（图片按 includeImages 决定保留或移除）。 */
+function blocksToText(blocks: MaterialBlock[], includeImages: boolean): string {
+  return blocks
+    .map((b) => {
+      const parts: string[] = []
+      if (b.front?.trim()) parts.push(b.front.trim())
+      let back = b.back ?? ''
+      if (!includeImages) back = back.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+      if (back.trim()) parts.push(back.trim())
+      return parts.join('\n')
+    })
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+/** Markdown：直接拼接 front/back（图片是 markdown 原生语法，按需保留）。 */
+function blocksToMarkdown(blocks: MaterialBlock[], includeImages: boolean): string {
+  return blocks
+    .map((b) => {
+      const parts: string[] = []
+      let back = b.back ?? ''
+      if (!includeImages) back = back.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+      if (b.front?.trim()) parts.push(`**${b.front.trim()}**`)
+      if (back.trim()) parts.push(back.trim())
+      return parts.join('\n\n')
+    })
+    .filter(Boolean)
+    .join('\n\n---\n\n')
+}
+
+/** 简易 HTML：转义 + 换行 → <p>，图片保留 <img>。 */
+function blocksToHtml(blocks: MaterialBlock[], includeImages: boolean): string {
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const body = blocks
+    .map((b) => {
+      const parts: string[] = []
+      if (b.front?.trim()) parts.push(`<h3>${esc(b.front.trim())}</h3>`)
+      let back = b.back ?? ''
+      if (!includeImages) {
+        back = back.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+      } else {
+        back = back.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img alt="$1" src="$2" style="max-width:100%"/>')
+      }
+      if (back.trim()) {
+        parts.push(
+          back
+            .trim()
+            .split(/\n{2,}/)
+            .map((p) => `<p>${esc(p).replace(/\n/g, '<br>')}</p>`)
+            .join(''),
+        )
+      }
+      return parts.join('')
+    })
+    .filter(Boolean)
+    .join('<hr/>')
+  return `<!doctype html><html><head><meta charset="utf-8"/><title>导出</title></head><body>${body}</body></html>`
+}
+
+function downloadText(filename: string, text: string, mime: string) {
+  const blob = new Blob([text], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
 // ---------- 自适应高度输入框 ----------
 type AutoTextareaProps = Omit<React.ComponentProps<'textarea'>, 'ref' | 'value'> & {
   value: string
@@ -395,6 +514,8 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const [chunkResult, setChunkResult] = React.useState<string[] | null>(null)
   const [kbUp, setKbUp] = React.useState(false)
   const [fontSize, setFontSize] = React.useState(16)
+  // 复制/导出时是否包含图片（与思维导图/HTML 等富格式）
+  const [copyExportImages, setCopyExportImages] = React.useState(true)
   const [lineSpacing, setLineSpacing] = React.useState<number>(1.7)
   /** 处于 Markdown 预览态的块（下标集合） */
   const [previewIdx, setPreviewIdx] = React.useState<ReadonlySet<number>>(new Set())
@@ -541,9 +662,27 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const splitBlock = (index: number) => {
     const block = blocksRef.current[index]
     if (!block) return
-    const [a, b] = splitBackText(block.back)
+    // 优先按光标位置拆分：若最近聚焦的文本框正是本块的 back 字段，且存在选区/光标，
+    // 则在光标处把 back 一分为二；否则回退到句子边界对半拆分。
+    const focus = lastFocusRef.current
+    const el = focus && focus.index === index && focus.field === 'back'
+      ? taRefs.current.get(`${focus.index}-${focus.field}`)
+      : undefined
+    let a = block.back
+    let b = ''
+    if (el) {
+      const pos = el.selectionStart ?? block.back.length
+      if (pos > 0 && pos < block.back.length) {
+        a = block.back.slice(0, pos)
+        b = block.back.slice(pos)
+      }
+    }
     if (!b) {
-      toast.warning('内容太短，无法拆分')
+      // 回退：句子边界对半拆分
+      ;[a, b] = splitBackText(block.back)
+    }
+    if (!b) {
+      toast.warning('请先将光标放在要拆分的位置，或内容需更长')
       return
     }
     commit((prev) => {
@@ -555,7 +694,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
       return next
     })
     lastFocusRef.current = null
-    toast.success('已拆分为两块')
+    toast.success('已在光标处拆分为两块')
   }
 
   const mergeWithNext = (index: number) => {
@@ -580,6 +719,41 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     })
     lastFocusRef.current = null
     toast.success('已与下一块合并')
+  }
+
+  /** 合并到上一块：把当前块拼到上一块后面，删除当前块。 */
+  const mergeWithPrev = (index: number) => {
+    if (index <= 0) {
+      toast.warning('已是第一块，无法合并到上一块')
+      return
+    }
+    const list = blocksRef.current
+    const a = list[index - 1]
+    const b = list[index]
+    if (!a || !b) return
+    commit((prev) => {
+      if (index <= 0 || index >= prev.length) return prev
+      const merged: MaterialBlock = {
+        front: [prev[index - 1]?.front, prev[index]?.front].filter(Boolean).join('；'),
+        back: [prev[index - 1]?.back, prev[index]?.back].filter(Boolean).join('\n'),
+        hidden: prev[index - 1]?.hidden,
+      }
+      const next = prev.filter((_, i) => i !== index)
+      next[index - 1] = merged
+      return next
+    })
+    lastFocusRef.current = null
+    toast.success('已合并到上一块')
+  }
+
+  /** 删除本块 back 中指定的图片 markdown 片段。 */
+  const removeImageFromBlock = (index: number, raw: string) => {
+    commit((prev) =>
+      prev.map((b, bi) =>
+        bi === index ? { ...b, back: b.back.split(raw).join('') } : b,
+      ),
+    )
+    toast.success('已删除该图片')
   }
 
   const toggleHidden = (index: number) => {
@@ -981,6 +1155,36 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     if (onTitleChange && t && t !== (card.title ?? '')) onTitleChange(t)
     onSave(finalBlocks)
     toast.success('已保存')
+  }
+
+  // ---- 复制 / 导出 ----
+  const safeTitle = () => (title.trim() || card.title || '背诵内容').replace(/[\\/:*?"<>|]/g, '_')
+  const handleCopy = async (fmt: 'text' | 'md' | 'html') => {
+    const blocks = blocksRef.current
+    const text =
+      fmt === 'text'
+        ? blocksToText(blocks, copyExportImages)
+        : fmt === 'md'
+          ? blocksToMarkdown(blocks, copyExportImages)
+          : blocksToHtml(blocks, copyExportImages)
+    try {
+      await navigator.clipboard.writeText(text)
+      toast.success(`已复制${fmt === 'text' ? '纯文本' : fmt === 'md' ? 'Markdown' : 'HTML'}`)
+    } catch {
+      toast.error('复制失败，请重试')
+    }
+  }
+  const handleExport = (fmt: 'txt' | 'md' | 'html') => {
+    const blocks = blocksRef.current
+    const name = safeTitle()
+    if (fmt === 'txt') {
+      downloadText(`${name}.txt`, blocksToText(blocks, copyExportImages), 'text/plain;charset=utf-8')
+    } else if (fmt === 'md') {
+      downloadText(`${name}.md`, blocksToMarkdown(blocks, copyExportImages), 'text/markdown;charset=utf-8')
+    } else {
+      downloadText(`${name}.html`, blocksToHtml(blocks, copyExportImages), 'text/html;charset=utf-8')
+    }
+    toast.success(`已导出 ${fmt.toUpperCase()} 文件`)
   }
 
   // ================= 渲染 =================
@@ -1582,6 +1786,50 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 <span className="text-[11px] leading-none">分割分块</span>
               </button>
 
+              {/* 复制 / 导出 */}
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button type="button" aria-label="复制或导出" className={TOOLBAR_BTN}>
+                    <Download className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">复制/导出</span>
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side="bottom"
+                  align="center"
+                  onOpenAutoFocus={(e) => e.preventDefault()}
+                  className="w-60 rounded-2xl p-3"
+                >
+                  <div className="space-y-3">
+                    <label className="flex items-center justify-between gap-2 text-sm">
+                      <span>包含图片 / 富格式</span>
+                      <input
+                        type="checkbox"
+                        checked={copyExportImages}
+                        onChange={(e) => setCopyExportImages(e.target.checked)}
+                        className="size-4 accent-emerald-600"
+                      />
+                    </label>
+                    <div className="space-y-1.5">
+                      <p className="text-[11px] font-medium text-muted-foreground">复制到剪贴板</p>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        <button type="button" onClick={() => void handleCopy('text')} className="h-9 rounded-lg border border-border text-xs hover:bg-muted">纯文本</button>
+                        <button type="button" onClick={() => void handleCopy('md')} className="h-9 rounded-lg border border-border text-xs hover:bg-muted">Markdown</button>
+                        <button type="button" onClick={() => void handleCopy('html')} className="h-9 rounded-lg border border-border text-xs hover:bg-muted">HTML</button>
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-[11px] font-medium text-muted-foreground">导出为文件</p>
+                      <div className="grid grid-cols-3 gap-1.5">
+                        <button type="button" onClick={() => handleExport('txt')} className="h-9 rounded-lg border border-border text-xs hover:bg-muted">TXT</button>
+                        <button type="button" onClick={() => handleExport('md')} className="h-9 rounded-lg border border-border text-xs hover:bg-muted">MD</button>
+                        <button type="button" onClick={() => handleExport('html')} className="h-9 rounded-lg border border-border text-xs hover:bg-muted">HTML</button>
+                      </div>
+                    </div>
+                  </div>
+                </PopoverContent>
+              </Popover>
+
               {/* 操作：更多块操作菜单 */}
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -1752,8 +2000,9 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                   <article
                     key={i}
                     className={cn(
-                      'space-y-3 rounded-2xl bg-card p-4 shadow-sm',
+                      'space-y-3 rounded-2xl bg-card p-4 shadow-sm ring-1 ring-border/40',
                       batch && isSel && 'ring-2 ring-primary/50',
+                      i % 2 === 1 && 'bg-muted/30',
                     )}
                   >
                     {/* 块头：移动手柄 / 批量选择 + 序号 + 预览切换 + 拆分 */}
@@ -1827,6 +2076,16 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                             拆分
                           </button>
                         )}
+                        {!batch && i > 0 && (
+                          <button
+                            type="button"
+                            aria-label={`合并第${i + 1}块到上一块`}
+                            onClick={() => mergeWithPrev(i)}
+                            className={TEXT_BTN}
+                          >
+                            合并↑
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -1863,6 +2122,13 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
 
                     {/* 完整内容（背面）：编辑 / Markdown 预览 */}
                     <span className="block text-sm text-muted-foreground">完整内容（背面）：</span>
+                    {/* 编辑态：把 back 中的图片以缩略图条展示（避免文本框里看到 base64） */}
+                    {!isPreview && (
+                      <BlockImageStrip
+                        content={block.back}
+                        onRemove={(raw) => removeImageFromBlock(i, raw)}
+                      />
+                    )}
                     {isPreview ? (
                       <div
                         className="min-h-28 overflow-hidden rounded-xl bg-muted px-3 py-3"

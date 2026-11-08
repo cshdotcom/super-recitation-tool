@@ -9,17 +9,42 @@ import { toast } from 'sonner'
 import type { AccountData, CardData, KwEntry, Mastery, MaterialBlock, ProjectData, SettingsData } from '@/lib/types'
 import { kwText, normKeywordEntries } from '@/lib/cloze'
 import { extractClozeMarks } from '@/lib/editor-cloze'
-import { HomeView } from '@/components/recitation/home-view'
-import { ReaderView } from '@/components/recitation/reader-view'
-import { ImportSheet, type ImportPayload } from '@/components/recitation/import-sheet'
-import { SettingsSheet } from '@/components/recitation/settings-sheet'
-import { AccountSheet } from '@/components/recitation/account-sheet'
-import { ShareManagerView } from '@/components/recitation/share-manager-view'
-import { ShareDialog } from '@/components/recitation/share-dialog'
-import { FocusFloatingClock } from '@/components/recitation/focus-bus'
+import type { ImportPayload } from '@/components/recitation/import-sheet'
 import NextDynamic from 'next/dynamic'
 
-// 全部视图懒加载：拆小编译图，避免 dev 编译内存峰值触发 OOM。
+// 全部视图与重型组件懒加载：拆小编译图，避免 dev 编译内存峰值触发 OOM。
+const HomeView = NextDynamic(
+  () => import('@/components/recitation/home-view').then((m) => m.HomeView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const ReaderView = NextDynamic(
+  () => import('@/components/recitation/reader-view').then((m) => m.ReaderView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const ImportSheet = NextDynamic(
+  () => import('@/components/recitation/import-sheet').then((m) => m.ImportSheet),
+  { ssr: false },
+)
+const SettingsSheet = NextDynamic(
+  () => import('@/components/recitation/settings-sheet').then((m) => m.SettingsSheet),
+  { ssr: false },
+)
+const AccountSheet = NextDynamic(
+  () => import('@/components/recitation/account-sheet').then((m) => m.AccountSheet),
+  { ssr: false },
+)
+const ShareManagerView = NextDynamic(
+  () => import('@/components/recitation/share-manager-view').then((m) => m.ShareManagerView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
+const ShareDialog = NextDynamic(
+  () => import('@/components/recitation/share-dialog').then((m) => m.ShareDialog),
+  { ssr: false },
+)
+const FocusFloatingClock = NextDynamic(
+  () => import('@/components/recitation/focus-bus').then((m) => m.FocusFloatingClock),
+  { ssr: false },
+)
 const WrongQuestionsView = NextDynamic(
   () => import('@/components/recitation/wrong-questions-view').then((m) => m.WrongQuestionsView),
   { ssr: false, loading: () => <PageSkeleton /> },
@@ -891,18 +916,20 @@ export default function Page() {
         />
       ) : null}
 
-      <ImportSheet
-        open={importOpen}
-        onOpenChange={(open) => {
-          if (!open) handleCancelImport()
-          else setImportOpen(true)
-        }}
-        initialDraft={null}
-        editing={false}
-        onImport={handleImport}
-        onCancel={handleCancelImport}
-        onDirectEdit={handleNewCard}
-      />
+      {importOpen && (
+        <ImportSheet
+          open={importOpen}
+          onOpenChange={(open) => {
+            if (!open) handleCancelImport()
+            else setImportOpen(true)
+          }}
+          initialDraft={null}
+          editing={false}
+          onImport={handleImport}
+          onCancel={handleCancelImport}
+          onDirectEdit={handleNewCard}
+        />
+      )}
 
       {/* 卡片 ⋯ 菜单里的分享弹窗 */}
       {shareCard && settings && (
@@ -915,23 +942,27 @@ export default function Page() {
         />
       )}
 
-      <SettingsSheet
-        open={settingsOpen}
-        onOpenChange={setSettingsOpen}
-        settings={settings}
-        cards={cards}
-        onChangeSettings={handleChangeSettings}
-        onClearAll={handleClearAll}
-        onOpenPlans={() => setView('plan-manager')}
-      />
+      {settingsOpen && (
+        <SettingsSheet
+          open={settingsOpen}
+          onOpenChange={setSettingsOpen}
+          settings={settings}
+          cards={cards}
+          onChangeSettings={handleChangeSettings}
+          onClearAll={handleClearAll}
+          onOpenPlans={() => setView('plan-manager')}
+        />
+      )}
 
-      <AccountSheet
-        open={accountOpen && !!account}
-        onOpenChange={setAccountOpen}
-        account={account!}
-        onAccountChange={setAccount}
-        onLogout={handleLogout}
-      />
+      {accountOpen && account && (
+        <AccountSheet
+          open={accountOpen && !!account}
+          onOpenChange={setAccountOpen}
+          account={account}
+          onAccountChange={setAccount}
+          onLogout={handleLogout}
+        />
+      )}
 
       {/* 全局浮时钟（专注进行中右下角可见，点击查看详情） */}
       <FocusFloatingClock />

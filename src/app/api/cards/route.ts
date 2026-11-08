@@ -75,9 +75,27 @@ export async function POST(req: NextRequest) {
         title,
         content,
         keywords: JSON.stringify(keywords),
-        // 超级编辑器 blocks（分块结构）在创建时一并落库
+        // 超级编辑器 blocks（分块结构）在创建时一并落库；单字段上限 500000 字符
+        // 以容纳内嵌 base64 图片（约 375KB/张）。
         ...(Array.isArray(body?.blocks)
-          ? { blocks: JSON.stringify(body.blocks.slice(0, 200)) }
+          ? {
+              blocks: JSON.stringify(
+                (body.blocks as unknown[])
+                  .slice(0, 200)
+                  .map((raw) => {
+                    const b = (raw && typeof raw === 'object' ? raw : {}) as {
+                      front?: unknown
+                      back?: unknown
+                      hidden?: unknown
+                    }
+                    return {
+                      front: typeof b.front === 'string' ? b.front.slice(0, 500000) : '',
+                      back: typeof b.back === 'string' ? b.back.slice(0, 500000) : '',
+                      ...(b.hidden === true ? { hidden: true } : {}),
+                    }
+                  }),
+              ),
+            }
           : {}),
         ...(typeof body?.categoryId === 'string' ? { categoryId: body.categoryId } : {}),
       },
