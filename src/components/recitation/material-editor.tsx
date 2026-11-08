@@ -540,6 +540,8 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   // 在线相机（拍照插入）：不再用 <input capture>（在部分浏览器/内嵌面板里只会打开文件选择器），
   // 改为 getUserMedia 真实取景器 + 裁剪；相机不可用时组件内自带降级（相册选择 / 新标签页打开）。
   const [cameraOpen, setCameraOpen] = React.useState(false)
+  // AI 扫描在线相机（mode='ocr'）：拍多页 → 识别合并 → 插入正文
+  const [scanCameraOpen, setScanCameraOpen] = React.useState(false)
   const scanInputRef = React.useRef<HTMLInputElement | null>(null)
   const [imgEdit, setImgEdit] = React.useState<string | null>(null) // 待裁剪图片 dataURL
   const [imgZoom, setImgZoom] = React.useState(1)
@@ -1108,12 +1110,37 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   }
 
   const handleImageFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
+    const files = Array.from(e.target.files ?? [])
     e.target.value = ''
-    await prepareImage(file)
+    if (files.length === 0) return
+    const imgs = files.filter((f) => f.type.startsWith('image/'))
+    if (imgs.length === 0) {
+      toast.error('请选择图片文件')
+      return
+    }
+    if (imgs.length === 1) {
+      // 单张：进入裁剪弹窗（原有链路）
+      await prepareImage(imgs[0])
+      return
+    }
+    // 多张：压缩后全部直接插入（跳过逐张裁剪）
+    const tid = toast.loading(`正在处理 ${imgs.length} 张图片…`)
+    try {
+      const urls: string[] = []
+      for (let i = 0; i < imgs.length; i++) {
+        toast.loading(`正在处理 ${i + 1}/${imgs.length} 张…`, { id: tid })
+        const dataUrl = await compressImage(imgs[i])
+        urls.push(dataUrl)
+      }
+      const md = urls.map((d) => `![图片](${d})`).join('\n\n')
+      insertMarkdown(md, '', '')
+      toast.success(`已插入 ${urls.length} 张图片`, { id: tid })
+    } catch (err) {
+      toast.error('图片处理失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+    }
   }
 
-  // 在线相机拍好的照片 → 进入裁剪弹窗（与上传图片同一链路）
+  // 在线相机拍好的单张照片 → 进入裁剪弹窗（与上传图片同一链路）
   const handleCameraPhoto = React.useCallback((dataUrl: string) => {
     setImgZoom(1)
     setImgOffset({ x: 0, y: 0 })
@@ -1121,6 +1148,14 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     imgCropNaturalRef.current = null
     setImgEdit(dataUrl)
   }, [])
+
+  // 在线相机连拍多张 → 直接全部插入正文（每张已在相机内裁剪好）
+  const handleCameraPhotos = (dataUrls: string[]) => {
+    if (dataUrls.length === 0) return
+    const md = dataUrls.map((d) => `![图片](${d})`).join('\n\n')
+    insertMarkdown(md, '', '')
+    toast.success(`已插入 ${dataUrls.length} 张照片`)
+  }
 
   // 独立相机页（新标签页 /?cam=1）拍完后 postMessage 回传
   React.useEffect(() => {
@@ -1136,35 +1171,44 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     return () => window.removeEventListener('message', onMsg)
   }, [handleCameraPhoto])
 
-  // AI 扫描：图片 → OCR 文字 → 插入正文
+  // AI 扫描：图片 → OCR 文字 → 插入正文（支持多张，依次识别后合并）
   const handleScanFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
+    const files = Array.from(e.target.files ?? [])
     e.target.value = ''
-    if (!file) return
-    if (!file.type.startsWith('image/')) {
+    if (files.length === 0) return
+    const imgs = files.filter((f) => f.type.startsWith('image/'))
+    if (imgs.length === 0) {
       toast.error('请选择图片文件')
       return
     }
-    const tid = toast.loading('AI 正在识别图片文字…')
+    const tid = toast.loading(
+      imgs.length === 1 ? 'AI 正在识别图片文字…' : `AI 正在识别 0/${imgs.length} 张…`,
+    )
     try {
-      const dataUrl = await compressImage(file)
-      const res = await fetch('/api/ocr', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: dataUrl }),
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.error || '识别失败')
+      const parts: string[] = []
+      for (let i = 0; i < imgs.length; i++) {
+        if (imgs.length > 1) toast.loading(`AI 正在识别 ${i + 1}/${imgs.length} 张…`, { id: tid })
+        const dataUrl = await compressImage(imgs[i])
+        const res = await fetch('/api/ocr', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: dataUrl }),
+        })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          throw new Error(err.error || '识别失败')
+        }
+        const data = (await res.json()) as { text?: string }
+        const text = (data.text || '').trim()
+        if (text) parts.push(text)
       }
-      const data = (await res.json()) as { text?: string }
-      const text = (data.text || '').trim()
-      if (!text) {
+      const merged = parts.join('\n\n').trim()
+      if (!merged) {
         toast.warning('未识别到文字', { id: tid })
         return
       }
-      insertMarkdown(text, '', '')
-      toast.success(`已插入识别文字（${text.length} 字）`, { id: tid })
+      insertMarkdown(merged, '', '')
+      toast.success(`已插入识别文字（${merged.length} 字）`, { id: tid })
     } catch (err) {
       toast.error('AI 扫描失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
     }
@@ -1634,7 +1678,15 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                     className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     <ScanLine className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
-                    AI 扫描（识别文字）
+                    AI 扫描（上传图片）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setScanCameraOpen(true)}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <Camera className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    AI 扫描（在线相机）
                   </button>
                   <button
                     type="button"
@@ -1654,6 +1706,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 ref={fileInputRef}
                 type="file"
                 accept="image/*"
+                multiple
                 className="hidden"
                 aria-hidden
                 tabIndex={-1}
@@ -1663,6 +1716,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 ref={scanInputRef}
                 type="file"
                 accept="image/*"
+                multiple
                 className="hidden"
                 aria-hidden
                 tabIndex={-1}
@@ -2351,13 +2405,26 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
         </DialogContent>
       </Dialog>
 
-      {/* 在线相机（拍照插入）：真实取景器 + 裁剪 + 降级方案 */}
+      {/* 在线相机（拍照插入）：真实取景器 + 裁剪 + 连拍多张批量插入 */}
       <CameraCapture
         open={cameraOpen}
         onOpenChange={setCameraOpen}
         onText={() => {}}
         mode="photo"
         onPhoto={handleCameraPhoto}
+        onPhotos={handleCameraPhotos}
+      />
+      {/* AI 扫描在线相机：连拍多页 → OCR 识别合并 → 插入正文 */}
+      <CameraCapture
+        open={scanCameraOpen}
+        onOpenChange={setScanCameraOpen}
+        mode="ocr"
+        onText={(text) => {
+          if (text) {
+            insertMarkdown(text, '', '')
+            toast.success(`已插入识别文字（${text.length} 字）`)
+          }
+        }}
       />
       {/* 未保存返回确认 */}
       <ConfirmBackDialog

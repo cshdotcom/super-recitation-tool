@@ -238,6 +238,8 @@ export function ReaderView({
   const [reviewMode, setReviewMode] = React.useState(false)
   // TTS 全屏播放器 Sheet
   const [ttsOpen, setTtsOpen] = React.useState(false)
+  // 播放器收起态：与 Sheet 开合联动（收起时 Sheet 关闭、forceMount 保活音频）
+  const [playerCollapsed, setPlayerCollapsed] = React.useState(false)
   // 今日计划卡片折叠状态（默认折叠成一条细行；localStorage 持久化，key 随卡片）
   const [planCollapsed, setPlanCollapsed] = useLocalStorage<boolean>(
     `bb-plan-collapsed:${card.id}`,
@@ -836,6 +838,7 @@ export function ReaderView({
                   )}
                   onClick={() => {
                     toast.info(`朗读将使用：${ttsEngineLabel(settings)}`)
+                    setPlayerCollapsed(false)
                     setTtsOpen(true)
                   }}
                 >
@@ -1059,7 +1062,7 @@ export function ReaderView({
         <div
           ref={stickyBarRef}
           className={cn(
-            'sticky bottom-0 z-20 -mx-4 mt-4 border-t border-border bg-background/95 px-4 pb-2 pt-3 backdrop-blur',
+            'sticky bottom-0 z-20 -mx-4 mt-4 border-t border-border bg-background/95 px-4 pb-[calc(0.5rem+env(safe-area-inset-bottom))] pt-3 backdrop-blur',
             mode === 'doodle' && 'z-30',
           )}
         >
@@ -1464,10 +1467,14 @@ export function ReaderView({
       {/* 选区朗读临时播放器（主播放器未打开时也生效，取消即消失） */}
       <SelectionReadPlayer settings={settings} context="reader" />
 
-      {/* AI 朗读 — 全屏音乐播放器（可收起为迷你悬浮条继续播放） */}
-      <Sheet open={ttsOpen} onOpenChange={setTtsOpen}>
+      {/* AI 朗读 — 全屏音乐播放器（可收起为迷你悬浮条继续播放）
+          收起时 Sheet 关闭（forceMount 保持 TtsPlayer 挂载，音频不中断），
+          迷你条 portal 到 body 显示；展开时 Sheet 重新滑入显示完整面板。
+          这样收起后不再有「一片空白」的空 Sheet 面板。 */}
+      <Sheet open={ttsOpen && !playerCollapsed} onOpenChange={(o) => { setTtsOpen(o); if (!o) setPlayerCollapsed(false) }}>
         <SheetContent
           side="bottom"
+          forceMount
           className="flex h-[94dvh] flex-col rounded-t-3xl bg-background p-0"
         >
           <SheetHeader className="sr-only">
@@ -1480,7 +1487,9 @@ export function ReaderView({
             cardTitle={card.title}
             cardId={card.id}
             favoritesKey={card.id}
-            onClose={() => setTtsOpen(false)}
+            collapsed={playerCollapsed}
+            onCollapsedChange={setPlayerCollapsed}
+            onClose={() => { setTtsOpen(false); setPlayerCollapsed(false) }}
           />
         </SheetContent>
       </Sheet>

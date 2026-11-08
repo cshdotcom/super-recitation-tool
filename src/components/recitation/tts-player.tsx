@@ -173,6 +173,9 @@ export interface TtsPlayerProps {
   cardId?: string
   /** 关闭播放器：停止播放并清理后回调父级卸载本组件。 */
   onClose?: () => void
+  /** 受控收起态（true=迷你悬浮条，false=完整面板）。父级控制以便联动 Sheet 开合。 */
+  collapsed?: boolean
+  onCollapsedChange?: (collapsed: boolean) => void
 }
 
 /**
@@ -448,6 +451,8 @@ export function TtsPlayer({
   favoritesKey,
   cardId,
   onClose,
+  collapsed: collapsedProp,
+  onCollapsedChange,
 }: TtsPlayerProps) {
   // Voice defaults for this context, captured once on mount.
   const [seeded] = React.useState(() => settings.voicePrefs?.[context]?.tts)
@@ -578,7 +583,17 @@ export function TtsPlayer({
 
   // ---- UI 状态 ----
   const [tab, setTab] = React.useState<'full' | 'hard'>('full')
-  const [collapsed, setCollapsed] = React.useState(false)
+  // 收起态：受控（父级联动 Sheet 开合），缺省内部自管
+  const [collapsedInternal, setCollapsedInternal] = React.useState(false)
+  const collapsed = collapsedProp ?? collapsedInternal
+  const setCollapsed = React.useCallback(
+    (v: boolean | ((prev: boolean) => boolean)) => {
+      const next = typeof v === 'function' ? v(collapsed) : v
+      onCollapsedChange?.(next)
+      if (onCollapsedChange === undefined) setCollapsedInternal(next)
+    },
+    [collapsed, onCollapsedChange],
+  )
   const [tocOpen, setTocOpen] = React.useState(false)
   const [mounted, setMounted] = React.useState(false)
   const [dragIdx, setDragIdx] = React.useState<number | null>(null)
@@ -1050,7 +1065,7 @@ export function TtsPlayer({
   const miniBar =
     collapsed && mounted ? (
       createPortal(
-        <div className="fixed inset-x-3 bottom-3 z-[70]">
+        <div className="fixed inset-x-3 bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-[70]">
           <style>{`@keyframes tts-marquee { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }`}</style>
           <div className="flex items-center gap-2 rounded-full border border-border bg-background/95 py-2 pl-2 pr-2 shadow-xl backdrop-blur">
             <button
@@ -1287,8 +1302,8 @@ export function TtsPlayer({
             </div>
           )}
 
-          {/* ---------- 播放器控制区（固定底部） ---------- */}
-          <div className="sticky bottom-0 z-20 bg-background">
+          {/* ---------- 播放器控制区（固定底部，含安全区内边距） ---------- */}
+          <div className="sticky bottom-0 z-20 bg-background pb-[env(safe-area-inset-bottom)]">
             {/* 正在播放胶囊 / 朗读引擎说明 chip（点按也可查看将使用的引擎） */}
             {playing ? (
               <div className="flex justify-center pb-2">

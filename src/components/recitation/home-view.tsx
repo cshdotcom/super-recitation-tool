@@ -626,8 +626,10 @@ export function HomeView({
         )}
       </main>
 
-      {/* ================= 底部 Dock ================= */}
-      <div className="pointer-events-none fixed inset-x-0 bottom-4 z-40 flex justify-center px-4">
+      {/* ================= 底部 Dock =================
+          bottom 用 calc(+env(safe-area-inset-bottom)) 抬高到手机安全区之上，
+          避免 iOS Safari 底部工具栏 / Android Chrome 地址栏遮挡主导航。 */}
+      <div className="pointer-events-none fixed inset-x-0 bottom-[calc(1rem+env(safe-area-inset-bottom))] z-40 flex justify-center px-4">
         <nav
           aria-label="主导航"
           className="pointer-events-auto flex w-full max-w-md items-center justify-between rounded-full border border-border bg-background/95 px-3 py-2 shadow-xl backdrop-blur"

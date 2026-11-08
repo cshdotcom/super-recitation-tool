@@ -55,6 +55,8 @@ interface CameraCaptureProps {
    */
   mode?: 'ocr' | 'photo'
   onPhoto?: (dataUrl: string) => void
+  /** photo 模式多张回传：连拍多页后一次性返回全部裁剪结果（编辑器批量插图） */
+  onPhotos?: (dataUrls: string[]) => void
   /** 独立相机页（新标签页 /?cam=1）：拍完自动回传 opener 并关闭 */
   standalone?: boolean
 }
@@ -117,7 +119,7 @@ function cropToDataUrl(
   })
 }
 
-export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhoto, standalone = false }: CameraCaptureProps) {
+export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhoto, onPhotos, standalone = false }: CameraCaptureProps) {
   const videoRef = React.useRef<HTMLVideoElement>(null)
   const canvasRef = React.useRef<HTMLCanvasElement>(null)
   const streamRef = React.useRef<MediaStream | null>(null)
@@ -317,8 +319,25 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
     })
   }
 
-  // 完成裁剪：保存 cropPixels，回到取景器拍下一页
-  const finishCrop = () => setViewMode('camera')
+  // 完成裁剪：保存 cropPixels，回到取景器拍下一页。
+  // ⚠️ 必须清空 currentId —— 否则渲染分支会落到 <img>（已拍照片）而非 <video>，
+  // <video> 不挂载 → handleShutter 因 readyState<2 直接 return → 无法再拍照。
+  // 清空 currentId 后 <video> 重新挂载，下方 effect 会把流重新绑回 video。
+  const finishCrop = () => {
+    setCurrentId(null)
+    setViewMode('camera')
+  }
+
+  // <video> 在 currentId 清空后会重新挂载（渲染分支回到 video），此时 srcObject 已丢失，
+  // 需要把仍在运行的 stream 重新绑回去，取景器才能恢复实时画面。
+  React.useEffect(() => {
+    if (!open || viewMode !== 'camera' || currentId) return
+    const v = videoRef.current
+    if (v && streamRef.current && v.srcObject !== streamRef.current) {
+      v.srcObject = streamRef.current
+      void v.play().catch(() => {})
+    }
+  }, [open, viewMode, currentId])
 
   // photo 模式：导出当前裁剪结果并回调 onPhoto（独立页时回传 opener 并关闭）
   const exportCurrentPhoto = async () => {
@@ -340,6 +359,38 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
       onOpenChange(false)
     } catch (err) {
       toast.error('导出照片失败：' + (err instanceof Error ? err.message : '未知错误'))
+    }
+  }
+
+  // photo 模式多张：把已拍全部照片（按裁剪结果）批量导出，回调 onPhotos。
+  // 用于编辑器"连拍多张一次插入"——每张照片若已裁剪则按裁剪框出图，否则原图。
+  const exportAllPhotos = async () => {
+    if (photos.length === 0) return
+    const tid = toast.loading(`正在导出 ${photos.length} 张照片…`)
+    try {
+      const out: string[] = []
+      for (let i = 0; i < photos.length; i++) {
+        toast.loading(`正在导出 ${i + 1}/${photos.length} 张…`, { id: tid })
+        const p = photos[i]
+        const url = p.cropPixels ? await cropToDataUrl(p.dataUrl, p.cropPixels) : p.dataUrl
+        out.push(url)
+      }
+      if (standalone) {
+        for (const url of out) {
+          try {
+            window.opener?.postMessage({ type: 'beishuba-camera-photo', dataUrl: url }, window.location.origin)
+          } catch {
+            /* noop */
+          }
+        }
+        window.close()
+        return
+      }
+      onPhotos?.(out)
+      toast.success(`已插入 ${out.length} 张照片`, { id: tid })
+      onOpenChange(false)
+    } catch (err) {
+      toast.error('导出照片失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
     }
   }
 
@@ -655,7 +706,7 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
                 </button>
               </div>
 
-              {/* 取消 | 已选 W×H | 完成裁剪 */}
+              {/* 取消 | 已选 W×H | 完成裁剪（photo 模式也回到取景器拍下一张） */}
               <div className="flex items-center justify-between gap-2 px-4 pt-3">
                 <Button
                   variant="ghost"
@@ -668,15 +719,15 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
                 <span className="text-xs text-zinc-300">
                   {current.cropPixels
                     ? `已选 ${Math.round(current.cropPixels.width)}×${Math.round(current.cropPixels.height)}`
-                    : '拖动把手自由选择识别区域'}
+                    : '拖动把手自由选择区域'}
                 </span>
                 <Button
                   size="sm"
                   className="h-9 rounded-full bg-emerald-600 px-4 text-white hover:bg-emerald-700"
-                  onClick={mode === 'photo' ? () => void exportCurrentPhoto() : finishCrop}
+                  onClick={finishCrop}
                 >
                   <Scissors className="size-3.5" strokeWidth={1.75} />
-                  {mode === 'photo' ? '使用这张' : '完成裁剪'}
+                  {mode === 'photo' ? '完成·拍下一张' : '完成裁剪'}
                 </Button>
               </div>
             </>
@@ -701,16 +752,16 @@ export function CameraCapture({ open, onOpenChange, onText, mode = 'ocr', onPhot
                 </div>
               )}
 
-              {/* 识别全部并合并（ocr）/ 使用当前照片（photo） */}
+              {/* 识别全部并合并（ocr）/ 完成并插入全部（photo 多张） */}
               {photos.length > 0 && (
                 <div className="px-4 pt-3">
                   {mode === 'photo' ? (
                     <Button
                       className="h-11 w-full rounded-full bg-emerald-600 text-sm font-semibold text-white hover:bg-emerald-700"
-                      onClick={() => void exportCurrentPhoto()}
+                      onClick={() => void exportAllPhotos()}
                     >
                       <Images className="size-4" strokeWidth={1.75} />
-                      使用当前照片
+                      完成并插入全部（{photos.length} 张）
                     </Button>
                   ) : (
                     <Button

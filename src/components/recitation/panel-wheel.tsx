@@ -664,7 +664,7 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
         </div>
 
         {/* 底部吸底：已选 N 项 / 完成 */}
-        <div className="sticky bottom-0 z-10 -mx-4 mt-4 flex items-center justify-between gap-3 border-t border-border bg-background/95 px-4 py-3 backdrop-blur">
+        <div className="sticky bottom-0 z-10 -mx-4 mt-4 flex items-center justify-between gap-3 border-t border-border bg-background/95 px-4 py-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] backdrop-blur">
           <span className="text-sm text-muted-foreground">已选 {draftEnabledCount} 项</span>
           <Button
             className="h-11 min-w-32 rounded-full bg-zinc-900 font-semibold text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white"

@@ -1244,6 +1244,10 @@ export function ClozeText({
 
   // 挖空刷按下：开始收集（不再逐字立即挖空）。
   // 只有按在「字」上才启动刷（空白处按下 = 页面滚动意图，不进刷模式）。
+  // setPointerCapture：把后续 pointermove 全部锁定到根容器，避免手指滑过
+  // 行间空白时事件丢失（这是"经常识别不出来"的主因）。
+  // 另：移动时对上一位置→当前位置做线段插值采样，快划也能采到中间漏掉的字。
+  const lastBrushPosRef = React.useRef<{ x: number; y: number } | null>(null)
   const handleBrushPointerDown = (e: React.PointerEvent) => {
     if (!brushMode) return
     const target = e.target as HTMLElement
@@ -1252,12 +1256,36 @@ export function ClozeText({
     draggingRef.current = true
     brushAccRef.current = new Map()
     brushAddEl(wordEl)
+    lastBrushPosRef.current = { x: e.clientX, y: e.clientY }
+    try {
+      ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    } catch {
+      /* noop */
+    }
   }
   const handleBrushPointerMove = (e: React.PointerEvent) => {
     if (!brushMode || !draggingRef.current) return
-    const el = document.elementFromPoint(e.clientX, e.clientY)
-    const wordEl = el?.closest('[data-char][data-pos]') as HTMLElement | null
-    if (wordEl) brushAddEl(wordEl)
+    const last = lastBrushPosRef.current
+    const cur = { x: e.clientX, y: e.clientY }
+    if (last) {
+      // 插值采样：按每 6px 一个点在 last→cur 线段上取点，elementFromPoint 找字。
+      // 快速滑动时 pointermove 事件稀疏，不插值会漏掉中间的字 → "识别不出来"。
+      const dx = cur.x - last.x
+      const dy = cur.y - last.y
+      const dist = Math.hypot(dx, dy)
+      const n = Math.max(1, Math.ceil(dist / 6))
+      for (let i = 1; i <= n; i++) {
+        const t = i / n
+        const el = document.elementFromPoint(last.x + dx * t, last.y + dy * t)
+        const wordEl = el?.closest('[data-char][data-pos]') as HTMLElement | null
+        if (wordEl) brushAddEl(wordEl)
+      }
+    } else {
+      const el = document.elementFromPoint(cur.x, cur.y)
+      const wordEl = el?.closest('[data-char][data-pos]') as HTMLElement | null
+      if (wordEl) brushAddEl(wordEl)
+    }
+    lastBrushPosRef.current = cur
   }
 
   const scrollToPage = (idx: number) => {
@@ -1730,18 +1758,30 @@ export function ClozeText({
         // 挖空刷：松手提交（根容器的 pointerup 先于 window 监听触发，必须在这里提交）
         if (brushMode && draggingRef.current) {
           draggingRef.current = false
+          lastBrushPosRef.current = null
           commitBrush()
         } else {
           draggingRef.current = false
+        }
+        try {
+          ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+        } catch {
+          /* noop */
         }
         handleRootPointerEnd(e)
       }}
       onPointerCancel={(e) => {
         if (brushMode && draggingRef.current) {
           draggingRef.current = false
+          lastBrushPosRef.current = null
           commitBrush()
         } else {
           draggingRef.current = false
+        }
+        try {
+          ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+        } catch {
+          /* noop */
         }
         handleRootPointerEnd(e)
       }}
