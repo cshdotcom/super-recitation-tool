@@ -1,9 +1,21 @@
 'use client'
 
 // 文字编辑工具 — 全屏材料编辑器（背书吧）
-// 顶栏：返回 / 样式色板 / 撤销重做 / 批量 / 完成
-// 内容：块列表（核心论点·正面 + 完整内容·背面），支持插入/上下移动/拆分/合并/隐藏/删除
-// 底部工具栏：分割分块 / 样式 / 格式 / 图片 / 公式 / 表格 / 键盘
+//
+// 顶栏（两行，吸顶）：
+//   第 1 行：返回 / ⚡AI快速分块（emerald 胶囊）/ 撤销 / 重做 / 完成（黑字胶囊）
+//   第 2 行：横向可滚动工具条（icon+小字标签）：
+//     样式(Aa) / 格式 / 挖空 / 批量操作 / 图片 / 公式 / 表格 / 新建分块 / 分割分块 / 操作 / 键盘
+//     「操作」= 更多操作菜单：新建分块 / 合并到下一块 / 隐藏 / 删除 / 全部展开（编辑）/ 全部收起（预览）
+//
+// 内容：块列表（核心论点·正面 + 完整内容·背面）。
+//   • 每块左上 ✥ 移动手柄（点开上移/下移菜单），右上「拆分」按钮 + 预览切换（Markdown 渲染）。
+//   • 隐藏块折叠为细条，保存时原样保留（不丢弃）。
+//
+// 保存链路（修复「编辑后不生效」）：
+//   • 所有编辑都经过 commit() 同步写入 blocksRef（始终最新），「完成」从 blocksRef 读取，
+//     杜绝任何 stale closure 丢编辑；隐藏块、顺序原样交出。
+//   • AI生成核心论点改为函数式更新，请求返回时不再用旧快照覆盖用户在等待期间的输入。
 //
 // API：
 //   POST /api/chat  { mode:'ask', content, messages } -> { reply }   （AI生成核心论点）
@@ -13,6 +25,7 @@ import * as React from 'react'
 import {
   ALargeSmall,
   Bold,
+  Braces,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -21,12 +34,18 @@ import {
   Columns3,
   Eye,
   EyeOff,
+  FoldVertical,
+  GripVertical,
   Highlighter,
-  Image as ImageIcon,
+  ImagePlus,
   Italic,
   Keyboard,
+  Link as LinkIcon,
+  ListChecks,
   Loader2,
-  Pencil,
+  Merge,
+  MoreHorizontal,
+  PenLine,
   Plus,
   Redo2,
   Sigma,
@@ -37,11 +56,14 @@ import {
   Trash2,
   Type,
   Undo2,
+  UnfoldVertical,
+  Zap,
 } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type { CardData, MaterialBlock } from '@/lib/types'
+import { extractClozeMarks, wrapClozeMark } from '@/lib/editor-cloze'
 import { cn } from '@/lib/utils'
 import {
   AlertDialog,
@@ -55,22 +77,24 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
-import { Input } from '@/components/ui/input'
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Slider } from '@/components/ui/slider'
 import { Textarea } from '@/components/ui/textarea'
+import { RichContent } from '@/components/recitation/rich-content'
 
 // ---------- props 契约 ----------
 export interface MaterialEditorProps {
   card: CardData
   onBack: () => void
-  /** 完成：交出最新块列表（父组件负责持久化并关闭本视图） */
+  /** 完成：交出最新块列表（父组件负责持久化并关闭本视图）。包含隐藏块，顺序不变。 */
   onSave: (blocks: MaterialBlock[]) => void
+  /** 可选：卡片标题变更回调（父组件负责持久化；不传则标题仅编辑器内生效） */
+  onTitleChange?: (title: string) => void
 }
 
 // ---------- 常量 ----------
@@ -111,17 +135,18 @@ const FORMAT_ITEMS: { kind: FormatKind; label: string; icon: LucideIcon }[] = [
 ]
 
 // ---------- 共用样式 ----------
-const ICON_BTN =
-  'flex size-9 shrink-0 items-center justify-center rounded-lg border border-border text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40'
+const HEADER_ICON_BTN =
+  'flex size-9 shrink-0 items-center justify-center rounded-full text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40'
+
+/** 顶部工具条图标按钮（icon + 小字标签，横向滚动行内等宽） */
+const TOOLBAR_BTN =
+  'flex w-14 shrink-0 flex-col items-center justify-center gap-1 rounded-lg py-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40'
 
 const TEXT_BTN =
-  'h-9 shrink-0 whitespace-nowrap rounded-lg border border-border px-3 text-sm text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40'
+  'h-8 shrink-0 whitespace-nowrap rounded-lg border border-border px-2.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40'
 
-const HEADER_ICON_BTN =
-  'flex size-9 shrink-0 items-center justify-center rounded-full text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-30'
-
-const TOOLBAR_BTN =
-  'flex min-w-0 flex-1 flex-col items-center justify-center gap-1 rounded-lg py-2.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50'
+const SMALL_ICON_BTN =
+  'flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40'
 
 const CHECK_BTN =
   'flex size-5 shrink-0 items-center justify-center rounded-full border-2 transition-colors hover:border-muted-foreground/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring'
@@ -153,7 +178,7 @@ function splitBackText(text: string): [string, string] {
   return [a, b]
 }
 
-/** 压缩图片：最长边 ≤720px，JPEG 质量 0.8，返回 dataURL */
+/** 压缩图片：宽 ≤800px，JPEG 质量 0.8，返回 dataURL（避免 base64 过大拖慢保存） */
 function compressImage(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -162,7 +187,7 @@ function compressImage(file: File): Promise<string> {
       const img = new Image()
       img.onerror = () => reject(new Error('图片解码失败'))
       img.onload = () => {
-        const scale = Math.min(1, 720 / Math.max(img.width, img.height))
+        const scale = Math.min(1, 800 / Math.max(1, img.width))
         const w = Math.max(1, Math.round(img.width * scale))
         const h = Math.max(1, Math.round(img.height * scale))
         const canvas = document.createElement('canvas')
@@ -179,6 +204,14 @@ function compressImage(file: File): Promise<string> {
       img.src = String(reader.result)
     }
     reader.readAsDataURL(file)
+  })
+}
+
+/** 预览用：把 {{挖空}} 显示为加粗（关键词提取用 extractClozeMarks） */
+function toPreviewMarkdown(text: string): string {
+  return String(text ?? '').replace(/\{\{([^{}]*)\}\}/g, (_m, inner: string) => {
+    const kw = inner.trim()
+    return kw ? `**${kw}**` : inner
   })
 }
 
@@ -218,7 +251,7 @@ interface FocusTarget {
 }
 
 export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
-  const { card, onBack, onSave } = props
+  const { card, onBack, onSave, onTitleChange } = props
 
   // ---- 块数据 + 撤销/重做 ----
   const [blocks, setBlocks] = React.useState<MaterialBlock[]>(() => {
@@ -237,10 +270,13 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const [future, setFuture] = React.useState<MaterialBlock[][]>([])
   const lastEditRef = React.useRef<{ key: string; time: number } | null>(null)
 
+  // blocks/history/future 的镜像 ref：同步更新，保证异步回调与「完成」读到的永远是最新值
+  const blocksRef = React.useRef<MaterialBlock[]>(blocks)
+  const historyRef = React.useRef<MaterialBlock[][]>(history)
+  const futureRef = React.useRef<MaterialBlock[][]>(future)
+
   // ---- UI 状态 ----
-  const [title, setTitle] = React.useState('新材料')
-  const [renameOpen, setRenameOpen] = React.useState(false)
-  const [renameValue, setRenameValue] = React.useState('')
+  const [title, setTitle] = React.useState(() => card.title?.trim() || '新材料')
   const [batch, setBatch] = React.useState(false)
   const [selected, setSelected] = React.useState<ReadonlySet<number>>(new Set())
   const [aiIdx, setAiIdx] = React.useState<number | null>(null)
@@ -249,45 +285,67 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const [kbUp, setKbUp] = React.useState(false)
   const [fontSize, setFontSize] = React.useState(16)
   const [lineSpacing, setLineSpacing] = React.useState<number>(1.7)
+  /** 处于 Markdown 预览态的块（下标集合） */
+  const [previewIdx, setPreviewIdx] = React.useState<ReadonlySet<number>>(new Set())
 
   // ---- refs ----
   const taRefs = React.useRef(new Map<string, HTMLTextAreaElement>())
   const lastFocusRef = React.useRef<FocusTarget | null>(null)
   const fileInputRef = React.useRef<HTMLInputElement | null>(null)
 
+  // ---- state + ref 同步写入 ----
+  const applyBlocks = (next: MaterialBlock[]) => {
+    blocksRef.current = next
+    setBlocks(next)
+  }
+  const applyHistory = (next: MaterialBlock[][]) => {
+    historyRef.current = next
+    setHistory(next)
+  }
+  const applyFuture = (next: MaterialBlock[][]) => {
+    futureRef.current = next
+    setFuture(next)
+  }
+
   // ---- 变更 + 历史（快照上限 50；文本输入在时间窗内合并为一条） ----
-  const mutate = (next: MaterialBlock[], editKey?: string) => {
+  // 所有编辑统一走 commit(updater)：updater 基于最新 blocksRef 计算，杜绝并发覆盖。
+  const commit = (updater: (prev: MaterialBlock[]) => MaterialBlock[], editKey?: string) => {
+    const prev = blocksRef.current
+    const next = updater(prev)
+    if (next === prev) return
+    applyBlocks(next)
     const now = Date.now()
     const last = lastEditRef.current
     const coalesce =
       !!editKey && !!last && last.key === editKey && now - last.time < COALESCE_MS
     if (coalesce) {
-      lastEditRef.current = { key: editKey, time: now }
+      lastEditRef.current = { key: editKey as string, time: now }
     } else {
-      setHistory((h) => [...h, blocks].slice(-MAX_HISTORY))
-      setFuture([])
+      applyHistory([...historyRef.current, prev].slice(-MAX_HISTORY))
+      applyFuture([])
       lastEditRef.current = editKey ? { key: editKey, time: now } : null
     }
-    setBlocks(next)
   }
 
   const undo = () => {
-    if (history.length === 0) return
-    const prev = history[history.length - 1]
-    setHistory(history.slice(0, -1))
-    setFuture([blocks, ...future].slice(0, MAX_HISTORY))
-    setBlocks(prev)
+    const h = historyRef.current
+    if (h.length === 0) return
+    const prev = h[h.length - 1]
+    applyHistory(h.slice(0, -1))
+    applyFuture([blocksRef.current, ...futureRef.current].slice(0, MAX_HISTORY))
+    applyBlocks(prev)
     setSelected(new Set())
     lastFocusRef.current = null
     lastEditRef.current = null
   }
 
   const redo = () => {
-    if (future.length === 0) return
-    const next = future[0]
-    setFuture(future.slice(1))
-    setHistory([...history, blocks].slice(-MAX_HISTORY))
-    setBlocks(next)
+    const f = futureRef.current
+    if (f.length === 0) return
+    const next = f[0]
+    applyFuture(f.slice(1))
+    applyHistory([...historyRef.current, blocksRef.current].slice(-MAX_HISTORY))
+    applyBlocks(next)
     setSelected(new Set())
     lastFocusRef.current = null
     lastEditRef.current = null
@@ -295,11 +353,12 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
 
   // ---- 文本编辑 ----
   const updateField = (index: number, field: FocusField, value: string) => {
-    mutate(
-      blocks.map((b, i) => {
-        if (i !== index) return b
-        return field === 'front' ? { ...b, front: value } : { ...b, back: value }
-      }),
+    commit(
+      (prev) =>
+        prev.map((b, i) => {
+          if (i !== index) return b
+          return field === 'front' ? { ...b, front: value } : { ...b, back: value }
+        }),
       `${index}:${field}`,
     )
   }
@@ -315,66 +374,114 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     setKbUp(true)
   }
 
+  /** 取「最近点击的文本框」目标，不存在则 toast 提示 */
+  const requireFocusTarget = (): FocusTarget | null => {
+    const t = lastFocusRef.current
+    if (!t || t.index >= blocksRef.current.length) {
+      toast.info('请先点击要编辑的文本框')
+      return null
+    }
+    return t
+  }
+
   // ---- 块操作 ----
   const addBlockAfter = (index: number) => {
-    const next = [...blocks]
-    next.splice(index + 1, 0, { front: '', back: '' })
-    mutate(next)
+    commit((prev) => {
+      const next = [...prev]
+      next.splice(index + 1, 0, { front: '', back: '' })
+      return next
+    })
     lastFocusRef.current = null
+  }
+
+  /** 新建分块：插到最近编辑的块后面；没有焦点则追加到末尾 */
+  const addBlockSmart = () => {
+    const t = lastFocusRef.current
+    const base =
+      t && t.index < blocksRef.current.length ? t.index : blocksRef.current.length - 1
+    addBlockAfter(base)
   }
 
   const moveBlock = (index: number, dir: -1 | 1) => {
     const j = index + dir
-    if (j < 0 || j >= blocks.length) return
-    const next = [...blocks]
-    const [b] = next.splice(index, 1)
-    next.splice(j, 0, b)
-    mutate(next)
+    if (j < 0 || j >= blocksRef.current.length) return
+    commit((prev) => {
+      const next = [...prev]
+      const [b] = next.splice(index, 1)
+      next.splice(j, 0, b)
+      return next
+    })
     lastFocusRef.current = null
   }
 
   const splitBlock = (index: number) => {
-    const block = blocks[index]
+    const block = blocksRef.current[index]
     if (!block) return
     const [a, b] = splitBackText(block.back)
     if (!b) {
       toast.warning('内容太短，无法拆分')
       return
     }
-    const next = [...blocks]
-    next[index] = { ...block, back: a }
-    next.splice(index + 1, 0, { front: '', back: b })
-    mutate(next)
+    commit((prev) => {
+      const next = [...prev]
+      const cur = next[index]
+      if (!cur) return prev
+      next[index] = { ...cur, back: a }
+      next.splice(index + 1, 0, { front: '', back: b })
+      return next
+    })
     lastFocusRef.current = null
     toast.success('已拆分为两块')
   }
 
   const mergeWithNext = (index: number) => {
-    if (index >= blocks.length - 1) return
-    const a = blocks[index]
-    const b = blocks[index + 1]
-    if (!a || !b) return
-    const merged: MaterialBlock = {
-      front: [a.front, b.front].filter(Boolean).join('；'),
-      back: [a.back, b.back].filter(Boolean).join('\n'),
-      hidden: a.hidden,
+    const list = blocksRef.current
+    if (index >= list.length - 1) {
+      toast.warning('已是最后一块，无法合并')
+      return
     }
-    const next = blocks.filter((_, i) => i !== index + 1)
-    next[index] = merged
-    mutate(next)
+    const a = list[index]
+    const b = list[index + 1]
+    if (!a || !b) return
+    commit((prev) => {
+      if (index >= prev.length - 1) return prev
+      const merged: MaterialBlock = {
+        front: [prev[index]?.front, prev[index + 1]?.front].filter(Boolean).join('；'),
+        back: [prev[index]?.back, prev[index + 1]?.back].filter(Boolean).join('\n'),
+        hidden: prev[index]?.hidden,
+      }
+      const next = prev.filter((_, i) => i !== index + 1)
+      next[index] = merged
+      return next
+    })
     lastFocusRef.current = null
     toast.success('已与下一块合并')
   }
 
   const toggleHidden = (index: number) => {
-    mutate(blocks.map((b, i) => (i === index ? { ...b, hidden: !b.hidden } : b)))
+    commit((prev) =>
+      prev.map((b, i) => (i === index ? { ...b, hidden: !b.hidden } : b)),
+    )
     lastFocusRef.current = null
   }
 
   const removeBlock = (index: number) => {
-    mutate(blocks.filter((_, i) => i !== index))
+    commit((prev) => prev.filter((_, i) => i !== index))
     lastFocusRef.current = null
   }
+
+  // ---- 预览态 ----
+  const togglePreview = (i: number) => {
+    setPreviewIdx((prev) => {
+      const next = new Set(prev)
+      if (next.has(i)) next.delete(i)
+      else next.add(i)
+      return next
+    })
+  }
+
+  const expandAll = () => setPreviewIdx(new Set())
+  const collapseAll = () => setPreviewIdx(new Set(blocksRef.current.map((_, i) => i)))
 
   // ---- 批量模式 ----
   const enterBatch = () => {
@@ -403,21 +510,23 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
 
   const mergeSelected = () => {
     const idxs = [...selected]
-      .filter((i) => i >= 0 && i < blocks.length)
+      .filter((i) => i >= 0 && i < blocksRef.current.length)
       .sort((a, b) => a - b)
     if (idxs.length < 2) return
     const first = idxs[0]
-    const merged: MaterialBlock = {
-      front: idxs.map((i) => blocks[i]?.front ?? '').filter(Boolean).join('；'),
-      back: idxs.map((i) => blocks[i]?.back ?? '').filter(Boolean).join('\n'),
-      hidden: blocks[first]?.hidden,
-    }
-    const next: MaterialBlock[] = []
-    blocks.forEach((b, i) => {
-      if (i === first) next.push(merged)
-      else if (!selected.has(i)) next.push(b)
+    commit((prev) => {
+      const merged: MaterialBlock = {
+        front: idxs.map((i) => prev[i]?.front ?? '').filter(Boolean).join('；'),
+        back: idxs.map((i) => prev[i]?.back ?? '').filter(Boolean).join('\n'),
+        hidden: prev[first]?.hidden,
+      }
+      const next: MaterialBlock[] = []
+      prev.forEach((b, i) => {
+        if (i === first) next.push(merged)
+        else if (!selected.has(i)) next.push(b)
+      })
+      return next
     })
-    mutate(next)
     setSelected(new Set())
     lastFocusRef.current = null
     toast.success(`已合并 ${idxs.length} 块`)
@@ -426,7 +535,9 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const hideSelected = () => {
     if (selected.size === 0) return
     const n = selected.size
-    mutate(blocks.map((b, i) => (selected.has(i) ? { ...b, hidden: true } : b)))
+    commit((prev) =>
+      prev.map((b, i) => (selected.has(i) ? { ...b, hidden: true } : b)),
+    )
     setSelected(new Set())
     lastFocusRef.current = null
     toast.success(`已隐藏 ${n} 块`)
@@ -435,15 +546,17 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const deleteSelected = () => {
     if (selected.size === 0) return
     const n = selected.size
-    mutate(blocks.filter((_, i) => !selected.has(i)))
+    commit((prev) => prev.filter((_, i) => !selected.has(i)))
     setSelected(new Set())
     lastFocusRef.current = null
     toast.success(`已删除 ${n} 块`)
   }
 
   // ---- AI生成核心论点（POST /api/chat）----
+  // 修复：旧实现请求返回后用「调用时的 blocks 快照」整表覆写，会吞掉等待期间
+  // 用户继续输入的内容（编辑丢失/不生效）。改为 commit 函数式更新。
   const generateFront = async (index: number) => {
-    const back = (blocks[index]?.back ?? '').trim()
+    const back = (blocksRef.current[index]?.back ?? '').trim()
     if (!back) {
       toast.warning('请先填写「完整内容（背面）」')
       return
@@ -477,7 +590,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
         toast.warning('AI 未返回结果，请手动填写')
         return
       }
-      mutate(blocks.map((b, bi) => (bi === index ? { ...b, front: reply } : b)))
+      commit((prev) => prev.map((b, bi) => (bi === index ? { ...b, front: reply } : b)))
       toast.success('已生成核心论点')
     } catch (err) {
       toast.error('AI生成失败：' + (err instanceof Error ? err.message : '未知错误'))
@@ -488,7 +601,11 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
 
   // ---- 分割分块（POST /api/chunk → 确认 → 替换全部块）----
   const runChunk = async () => {
-    const content = blocks.map((b) => b.back).filter(Boolean).join('\n').trim()
+    const content = blocksRef.current
+      .map((b) => b.back)
+      .filter(Boolean)
+      .join('\n')
+      .trim()
     if (!content) {
       toast.warning('内容为空，无法分割')
       return
@@ -527,17 +644,18 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const applyChunks = () => {
     if (!chunkResult) return
     const n = chunkResult.length
-    mutate(chunkResult.map((c) => ({ front: '', back: c })))
+    commit(() => chunkResult.map((c) => ({ front: '', back: c })))
     lastFocusRef.current = null
+    setPreviewIdx(new Set())
     setChunkResult(null)
     toast.success(`已分割为 ${n} 块`)
   }
 
-  // ---- 光标插入（格式 / 公式 / 表格 / 图片）----
+  // ---- 光标插入（格式 / 公式 / 表格 / 图片 / 挖空）----
   const insertMarkdown = (before: string, after: string, ph: string, multiline = false) => {
     const target = lastFocusRef.current
     const el = target ? taRefs.current.get(`${target.index}-${target.field}`) : undefined
-    if (!target || !el || target.index >= blocks.length) {
+    if (!target || !el || target.index >= blocksRef.current.length) {
       toast.info('请先点击要编辑的文本框')
       return
     }
@@ -551,8 +669,8 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     const nextValue = value.slice(0, start) + inserted + value.slice(end)
     const idx = target.index
     const field = target.field
-    mutate(
-      blocks.map((b, bi) => {
+    commit((prev) =>
+      prev.map((b, bi) => {
         if (bi !== idx) return b
         return field === 'front' ? { ...b, front: nextValue } : { ...b, back: nextValue }
       }),
@@ -574,6 +692,37 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const applyFormat = (kind: FormatKind) => {
     const op = FORMAT_MAP[kind]
     insertMarkdown(op.before, op.after, op.ph)
+  }
+
+  /** 挖空：把最近聚焦文本框的选区文字包上 {{ }}（src/lib/editor-cloze.ts） */
+  const applyCloze = () => {
+    const target = lastFocusRef.current
+    const el = target ? taRefs.current.get(`${target.index}-${target.field}`) : undefined
+    if (!target || !el || target.index >= blocksRef.current.length) {
+      toast.info('请先点击要编辑的文本框')
+      return
+    }
+    const value = el.value
+    const start = el.selectionStart ?? value.length
+    const end = el.selectionEnd ?? start
+    const sel = value.slice(start, end)
+    if (!sel.trim()) {
+      toast.warning('请先选中文字')
+      return
+    }
+    const idx = target.index
+    const field = target.field
+    const nextValue = value.slice(0, start) + wrapClozeMark(sel) + value.slice(end)
+    commit((prev) =>
+      prev.map((b, bi) => {
+        if (bi !== idx) return b
+        return field === 'front' ? { ...b, front: nextValue } : { ...b, back: nextValue }
+      }),
+    )
+    requestAnimationFrame(() => {
+      el.focus()
+      el.setSelectionRange(start + 2, start + 2 + sel.length)
+    })
   }
 
   // ---- 插入图片 ----
@@ -614,143 +763,443 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     setKbUp(true)
   }
 
-  // ---- 重命名 ----
-  const openRename = () => {
-    setRenameValue(title)
-    setRenameOpen(true)
-  }
-
-  const confirmRename = () => {
-    const t = renameValue.trim()
-    if (!t) {
-      toast.error('标题不能为空')
-      return
-    }
-    setTitle(t)
-    setRenameOpen(false)
-    toast.success('标题已更新')
-  }
-
-  // ---- 完成 ----
+  // ---- 完成：从 blocksRef 读取最新块列表，保证包含全部编辑（含隐藏块） ----
   const handleDone = () => {
-    onSave(blocks)
+    const finalBlocks: MaterialBlock[] = blocksRef.current.map((b) => ({
+      front: b.front ?? '',
+      back: b.back ?? '',
+      ...(b.hidden === true ? { hidden: true } : {}),
+    }))
+    const t = title.trim()
+    if (onTitleChange && t && t !== (card.title ?? '')) onTitleChange(t)
+    onSave(finalBlocks)
     toast.success('已保存')
   }
 
   // ================= 渲染 =================
   return (
     <>
-      {/* 顶栏 */}
-      <header className="sticky top-0 z-40 border-b border-border bg-background/85 backdrop-blur">
-        <div className="mx-auto flex h-14 w-full max-w-2xl items-center gap-2 px-4">
-          {batch ? (
-            <>
-              <button
-                type="button"
-                onClick={exitBatch}
-                aria-label="取消批量操作"
-                className="shrink-0 whitespace-nowrap rounded-full px-2 py-1.5 text-[15px] font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                取消
-              </button>
-              <div className="ml-auto flex items-center gap-0.5">
-                <span className="mr-1 whitespace-nowrap text-sm font-semibold tabular-nums">
-                  已选 {selected.size} 块
-                </span>
-                {(
-                  [
-                    { label: '全选', onClick: toggleSelectAll, disabled: blocks.length === 0 },
-                    { label: '合并', onClick: () => mergeSelected(), disabled: selected.size < 2 },
-                    { label: '隐藏', onClick: () => hideSelected(), disabled: selected.size === 0 },
-                    { label: '删除', onClick: () => deleteSelected(), disabled: selected.size === 0 },
-                  ] as const
-                ).map((b) => (
+      {/* 顶栏：第 1 行主操作 + 第 2 行工具条（吸顶） */}
+      <header className="sticky top-0 z-40 border-b border-border bg-background/95 backdrop-blur">
+        <div className="mx-auto w-full max-w-2xl">
+          <div className="flex h-14 items-center gap-2 px-3">
+            {batch ? (
+              <>
+                <button
+                  type="button"
+                  onClick={exitBatch}
+                  aria-label="取消批量操作"
+                  className="shrink-0 whitespace-nowrap rounded-full px-2 py-1.5 text-[15px] font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  取消
+                </button>
+                <div className="ml-auto flex items-center gap-0.5">
+                  <span className="mr-1 whitespace-nowrap text-sm font-semibold tabular-nums">
+                    已选 {selected.size} 块
+                  </span>
+                  {(
+                    [
+                      { label: '全选', onClick: toggleSelectAll, disabled: blocks.length === 0 },
+                      { label: '合并', onClick: () => mergeSelected(), disabled: selected.size < 2 },
+                      { label: '隐藏', onClick: () => hideSelected(), disabled: selected.size === 0 },
+                      { label: '删除', onClick: () => deleteSelected(), disabled: selected.size === 0 },
+                    ] as const
+                  ).map((b) => (
+                    <button
+                      key={b.label}
+                      type="button"
+                      onClick={b.onClick}
+                      disabled={b.disabled}
+                      className="shrink-0 whitespace-nowrap rounded-full px-2 py-1.5 text-sm font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40"
+                    >
+                      {b.label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={onBack}
+                  aria-label="返回"
+                  className={HEADER_ICON_BTN}
+                >
+                  <ChevronLeft className="size-6" strokeWidth={1.75} aria-hidden />
+                </button>
+                {/* ⚡ AI快速分块（AI 色 emerald 胶囊） */}
+                <button
+                  type="button"
+                  aria-label="AI 快速分块"
+                  disabled={chunkLoading}
+                  onClick={() => void runChunk()}
+                  className="flex h-9 shrink-0 items-center gap-1.5 rounded-full bg-emerald-500/10 px-3 text-[13px] font-semibold text-emerald-600 transition-colors hover:bg-emerald-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-60 dark:text-emerald-400"
+                >
+                  {chunkLoading ? (
+                    <Loader2 className="size-4 animate-spin" strokeWidth={2} aria-hidden />
+                  ) : (
+                    <Zap className="size-4" strokeWidth={2} aria-hidden />
+                  )}
+                  AI快速分块
+                </button>
+                <div className="ml-auto flex items-center gap-0.5">
                   <button
-                    key={b.label}
                     type="button"
-                    onClick={b.onClick}
-                    disabled={b.disabled}
-                    className="shrink-0 whitespace-nowrap rounded-full px-2 py-1.5 text-sm font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-40"
+                    aria-label="撤销"
+                    disabled={history.length === 0}
+                    onClick={undo}
+                    className={HEADER_ICON_BTN}
                   >
-                    {b.label}
+                    <Undo2 className="size-5" strokeWidth={1.75} aria-hidden />
                   </button>
-                ))}
-              </div>
-            </>
-          ) : (
-            <>
+                  <button
+                    type="button"
+                    aria-label="重做"
+                    disabled={future.length === 0}
+                    onClick={redo}
+                    className={HEADER_ICON_BTN}
+                  >
+                    <Redo2 className="size-5" strokeWidth={1.75} aria-hidden />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDone}
+                    className="shrink-0 whitespace-nowrap rounded-full px-3 py-1.5 text-[15px] font-bold text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    完成
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* 第 2 行：横向可滚动工具条 */}
+          {!batch && (
+            <div
+              role="toolbar"
+              aria-label="编辑工具"
+              className="flex items-stretch gap-0.5 overflow-x-auto px-2 pb-1.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            >
+              {/* 样式（Aa） */}
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="样式"
+                    onMouseDown={(e) => e.preventDefault()}
+                    className={TOOLBAR_BTN}
+                  >
+                    <ALargeSmall className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">样式</span>
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side="bottom"
+                  align="start"
+                  onOpenAutoFocus={(e) => e.preventDefault()}
+                  className="w-64 rounded-2xl p-4"
+                >
+                  <div className="space-y-4">
+                    <div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium">全局正文字号</span>
+                        <span className="text-xs tabular-nums text-muted-foreground">{fontSize}px</span>
+                      </div>
+                      <Slider
+                        className="mt-3"
+                        min={12}
+                        max={24}
+                        step={1}
+                        value={[fontSize]}
+                        onValueChange={(v) => setFontSize(v[0] ?? 16)}
+                        aria-label="全局正文字号"
+                      />
+                    </div>
+                    <div>
+                      <span className="text-sm font-medium">行距</span>
+                      <div className="mt-2 grid grid-cols-3 gap-1 rounded-lg bg-muted p-1">
+                        {LINE_OPTIONS.map((o) => (
+                          <button
+                            key={o.label}
+                            type="button"
+                            onClick={() => setLineSpacing(o.value)}
+                            aria-pressed={lineSpacing === o.value}
+                            className={cn(
+                              'h-8 rounded-md text-xs font-medium transition-colors',
+                              lineSpacing === o.value
+                                ? 'bg-background shadow-sm'
+                                : 'text-muted-foreground hover:text-foreground',
+                            )}
+                          >
+                            {o.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </PopoverContent>
+              </Popover>
+
+              {/* 格式（Markdown 语法） */}
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="格式"
+                    onMouseDown={(e) => e.preventDefault()}
+                    className={TOOLBAR_BTN}
+                  >
+                    <Type className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">格式</span>
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side="bottom"
+                  align="start"
+                  onOpenAutoFocus={(e) => e.preventDefault()}
+                  className="w-64 rounded-2xl"
+                >
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {FORMAT_ITEMS.map((f) => (
+                      <button
+                        key={f.kind}
+                        type="button"
+                        onClick={() => applyFormat(f.kind)}
+                        onMouseDown={(e) => e.preventDefault()}
+                        className="flex h-16 flex-col items-center justify-center gap-1 rounded-lg border border-border text-xs text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <f.icon className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-3 text-center text-[11px] text-muted-foreground">
+                    插入到最近点击的文本框
+                  </p>
+                </PopoverContent>
+              </Popover>
+
+              {/* 挖空：选中文字包上 {{ }} */}
               <button
                 type="button"
-                onClick={onBack}
-                aria-label="返回"
-                className="flex size-9 shrink-0 items-center justify-center rounded-full transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                aria-label="挖空选中文字"
+                onClick={applyCloze}
+                onMouseDown={(e) => e.preventDefault()}
+                className={TOOLBAR_BTN}
               >
-                <ChevronLeft className="size-6" strokeWidth={1.75} aria-hidden />
+                <Braces className="size-5" strokeWidth={1.75} aria-hidden />
+                <span className="text-[11px] leading-none">挖空</span>
               </button>
-              {/* 样式色板（装饰） */}
-              <div className="ml-1 flex items-center gap-1.5" aria-hidden>
-                <span className="block size-5 rounded-[7px] bg-orange-400 ring-2 ring-orange-200" />
-                <span className="flex items-center gap-[3px] rounded-md border border-border bg-background px-1.5 py-1 shadow-sm">
-                  <span className="block size-3 rounded-[3px] bg-zinc-900" />
-                  <span className="block size-3 rounded-[3px] bg-zinc-500" />
-                </span>
-              </div>
-              <div className="ml-auto flex items-center gap-1">
-                <button
-                  type="button"
-                  aria-label="撤销"
-                  disabled={history.length === 0}
-                  onClick={undo}
-                  className={HEADER_ICON_BTN}
+
+              {/* 批量操作 */}
+              <button
+                type="button"
+                aria-label={batch ? '退出批量操作' : '批量操作'}
+                aria-pressed={batch}
+                onClick={batch ? exitBatch : enterBatch}
+                className={cn(TOOLBAR_BTN, batch && 'bg-muted text-foreground')}
+              >
+                <ListChecks className="size-5" strokeWidth={1.75} aria-hidden />
+                <span className="text-[11px] leading-none">批量操作</span>
+              </button>
+
+              {/* 图片：本地上传（压缩≤800px 转 dataURL）/ 插入图片链接 */}
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="插入图片"
+                    onMouseDown={(e) => e.preventDefault()}
+                    className={TOOLBAR_BTN}
+                  >
+                    <ImagePlus className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">图片</span>
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side="bottom"
+                  align="start"
+                  onOpenAutoFocus={(e) => e.preventDefault()}
+                  className="w-48 rounded-2xl p-1.5"
                 >
-                  <Undo2 className="size-5" strokeWidth={1.75} aria-hidden />
-                </button>
-                <button
-                  type="button"
-                  aria-label="重做"
-                  disabled={future.length === 0}
-                  onClick={redo}
-                  className={HEADER_ICON_BTN}
-                >
-                  <Redo2 className="size-5" strokeWidth={1.75} aria-hidden />
-                </button>
-                <button
-                  type="button"
-                  onClick={enterBatch}
-                  className="shrink-0 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[15px] font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  批量
-                </button>
-                <button
-                  type="button"
-                  onClick={handleDone}
-                  className="shrink-0 whitespace-nowrap rounded-full px-2.5 py-1.5 text-[15px] font-bold transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  完成
-                </button>
-              </div>
-            </>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <ImagePlus className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    上传图片
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => insertMarkdown('![](', ')', 'url')}
+                    onMouseDown={(e) => e.preventDefault()}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <LinkIcon className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    插入图片链接
+                  </button>
+                  <p className="px-2.5 pb-1.5 pt-1 text-[11px] text-muted-foreground">
+                    上传图片压缩到 800px 宽后内嵌
+                  </p>
+                </PopoverContent>
+              </Popover>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                aria-hidden
+                tabIndex={-1}
+                onChange={(e) => void handleImageFile(e)}
+              />
+
+              {/* 公式：$$E=mc^2$$ 模板 */}
+              <button
+                type="button"
+                aria-label="插入公式"
+                onClick={() => insertMarkdown('$$', '$$', 'E=mc^2')}
+                onMouseDown={(e) => e.preventDefault()}
+                className={TOOLBAR_BTN}
+              >
+                <Sigma className="size-5" strokeWidth={1.75} aria-hidden />
+                <span className="text-[11px] leading-none">公式</span>
+              </button>
+
+              {/* 表格 */}
+              <button
+                type="button"
+                aria-label="插入表格"
+                onClick={() => insertMarkdown(TABLE_TEMPLATE, '', '', true)}
+                onMouseDown={(e) => e.preventDefault()}
+                className={TOOLBAR_BTN}
+              >
+                <TableIcon className="size-5" strokeWidth={1.75} aria-hidden />
+                <span className="text-[11px] leading-none">表格</span>
+              </button>
+
+              {/* 新建分块 */}
+              <button
+                type="button"
+                aria-label="新建分块"
+                onClick={addBlockSmart}
+                onMouseDown={(e) => e.preventDefault()}
+                className={TOOLBAR_BTN}
+              >
+                <Plus className="size-5" strokeWidth={1.75} aria-hidden />
+                <span className="text-[11px] leading-none">新建分块</span>
+              </button>
+
+              {/* 分割分块（AI） */}
+              <button
+                type="button"
+                aria-label="AI 分割分块"
+                disabled={chunkLoading}
+                onClick={() => void runChunk()}
+                onMouseDown={(e) => e.preventDefault()}
+                className={TOOLBAR_BTN}
+              >
+                <Columns3 className="size-5" strokeWidth={1.75} aria-hidden />
+                <span className="text-[11px] leading-none">分割分块</span>
+              </button>
+
+              {/* 操作：更多块操作菜单 */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button type="button" aria-label="更多操作" className={TOOLBAR_BTN}>
+                    <MoreHorizontal className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">操作</span>
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="bottom" align="end" className="w-56 rounded-xl">
+                  <p className="px-2 py-1.5 text-[11px] text-muted-foreground">
+                    作用于最近点击的块
+                  </p>
+                  <DropdownMenuItem
+                    onClick={() => {
+                      const t = requireFocusTarget()
+                      if (t) addBlockAfter(t.index)
+                    }}
+                  >
+                    <Plus className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    在此块后新建
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => {
+                      const t = requireFocusTarget()
+                      if (t) mergeWithNext(t.index)
+                    }}
+                  >
+                    <Merge className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    合并到下一块
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => {
+                      const t = requireFocusTarget()
+                      if (t) toggleHidden(t.index)
+                    }}
+                  >
+                    <EyeOff className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    隐藏此块
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => {
+                      const t = requireFocusTarget()
+                      if (t) removeBlock(t.index)
+                    }}
+                    className="text-destructive focus:text-destructive"
+                  >
+                    <Trash2 className="size-4" strokeWidth={1.75} aria-hidden />
+                    删除此块
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={expandAll}>
+                    <UnfoldVertical className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    全部展开（编辑）
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={collapseAll}>
+                    <FoldVertical className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    全部收起（预览）
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              {/* 键盘 */}
+              <button
+                type="button"
+                aria-label={kbUp ? '收起键盘' : '弹出键盘'}
+                aria-pressed={kbUp}
+                onClick={toggleKeyboard}
+                onMouseDown={(e) => e.preventDefault()}
+                className={cn(TOOLBAR_BTN, kbUp && 'bg-muted text-foreground')}
+              >
+                <Keyboard className="size-5" strokeWidth={1.75} aria-hidden />
+                <span className="text-[11px] leading-none">键盘</span>
+              </button>
+            </div>
           )}
         </div>
       </header>
 
       {/* 主体 */}
-      <main className="min-w-0 flex-1 bg-muted/40 pb-28">
-        <div className="mx-auto w-full max-w-2xl px-4 pt-5">
-          {/* 标题 */}
-          <div className="flex items-center gap-1.5">
-            <h1 className="text-2xl font-bold tracking-tight">{title}</h1>
-            <button
-              type="button"
-              aria-label="重命名材料"
-              onClick={openRename}
-              className="rounded-full p-1.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <Pencil className="size-4" strokeWidth={1.75} aria-hidden />
-            </button>
-          </div>
+      <main className="min-w-0 flex-1 bg-muted/40 pb-16">
+        <div className="mx-auto w-full max-w-2xl px-4 pt-4">
+          {/* 标题（第一行：卡标题输入） */}
+          <input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            onBlur={() => {
+              const t = title.trim()
+              if (onTitleChange && t && t !== (card.title ?? '')) onTitleChange(t)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.currentTarget.blur()
+            }}
+            placeholder="输入材料标题"
+            aria-label="材料标题"
+            className="w-full bg-transparent text-2xl font-bold tracking-tight outline-none placeholder:text-muted-foreground/40 focus-visible:outline-none"
+          />
           <p className="mt-1 text-xs text-muted-foreground/80">
-            点击文本可直接编辑，点击按钮调整顺序
+            点击文本直接编辑；选中文字后点「挖空」生成挖空标记
           </p>
 
           {/* 块列表 */}
@@ -758,7 +1207,11 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
             {blocks.length === 0 ? (
               <div className="flex flex-col items-center gap-4 rounded-2xl border border-dashed border-border bg-card py-16">
                 <p className="text-sm text-muted-foreground">暂无内容块</p>
-                <Button variant="outline" size="sm" onClick={() => mutate([{ front: '', back: '' }])}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => commit(() => [{ front: '', back: '' }])}
+                >
                   <Plus className="size-4" strokeWidth={1.75} aria-hidden />
                   添加内容块
                 </Button>
@@ -767,9 +1220,11 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
               blocks.map((block, i) => {
                 const isSel = selected.has(i)
                 const isHidden = block.hidden === true
+                const isPreview = !isHidden && previewIdx.has(i)
+                const previewData = isPreview ? extractClozeMarks(block.back) : null
 
                 // 已隐藏的块 → 折叠为细条
-                if (block.hidden) {
+                if (isHidden) {
                   return (
                     <div
                       key={i}
@@ -814,8 +1269,88 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                   )
                 }
 
-                const fields = (
-                  <>
+                return (
+                  <article
+                    key={i}
+                    className={cn(
+                      'space-y-3 rounded-2xl bg-card p-4 shadow-sm',
+                      batch && isSel && 'ring-2 ring-primary/50',
+                    )}
+                  >
+                    {/* 块头：移动手柄 / 批量选择 + 序号 + 预览切换 + 拆分 */}
+                    <div className="flex items-center gap-1.5">
+                      {batch ? (
+                        <button
+                          type="button"
+                          aria-label={isSel ? `取消选择第${i + 1}块` : `选择第${i + 1}块`}
+                          aria-pressed={isSel}
+                          onClick={() => toggleSelect(i)}
+                          className={cn(
+                            CHECK_BTN,
+                            isSel
+                              ? 'border-primary bg-primary text-primary-foreground'
+                              : 'border-muted-foreground/35 text-transparent',
+                          )}
+                        >
+                          <Check className="size-3" strokeWidth={3} aria-hidden />
+                        </button>
+                      ) : (
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={`移动第${i + 1}块`}
+                              className={SMALL_ICON_BTN}
+                            >
+                              <GripVertical className="size-4" strokeWidth={1.75} aria-hidden />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="start" className="w-36 rounded-xl">
+                            <DropdownMenuItem disabled={i === 0} onClick={() => moveBlock(i, -1)}>
+                              <ChevronUp className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                              上移
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              disabled={i === blocks.length - 1}
+                              onClick={() => moveBlock(i, 1)}
+                            >
+                              <ChevronDown className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                              下移
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      )}
+                      <span className="text-xs font-medium text-muted-foreground">第{i + 1}块</span>
+
+                      <div className="ml-auto flex items-center gap-1">
+                        {!batch && (
+                          <button
+                            type="button"
+                            aria-label={isPreview ? `编辑第${i + 1}块` : `预览第${i + 1}块`}
+                            aria-pressed={isPreview}
+                            onClick={() => togglePreview(i)}
+                            className={SMALL_ICON_BTN}
+                          >
+                            {isPreview ? (
+                              <PenLine className="size-4" strokeWidth={1.75} aria-hidden />
+                            ) : (
+                              <Eye className="size-4" strokeWidth={1.75} aria-hidden />
+                            )}
+                          </button>
+                        )}
+                        {!batch && (
+                          <button
+                            type="button"
+                            aria-label={`拆分第${i + 1}块`}
+                            onClick={() => splitBlock(i)}
+                            className={TEXT_BTN}
+                          >
+                            拆分
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
                     {/* 核心论点（正面） */}
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-sm text-muted-foreground">核心论点（正面）：</span>
@@ -824,7 +1359,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                         onClick={() => void generateFront(i)}
                         disabled={aiIdx !== null}
                         aria-label="AI 生成核心论点"
-                        className="flex shrink-0 items-center gap-1 rounded-md px-1 py-0.5 text-xs font-medium text-indigo-500 transition-colors hover:bg-indigo-50 hover:text-indigo-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60"
+                        className="flex shrink-0 items-center gap-1 rounded-md px-1 py-0.5 text-xs font-medium text-emerald-600 transition-colors hover:bg-emerald-500/10 hover:text-emerald-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-60 dark:text-emerald-400"
                       >
                         {aiIdx === i ? (
                           <Loader2 className="size-3.5 animate-spin" strokeWidth={1.75} aria-hidden />
@@ -845,127 +1380,44 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                       className="min-h-11 resize-none rounded-xl border-0 bg-muted px-3 py-2.5 shadow-none focus-visible:ring-1"
                     />
 
-                    {/* 完整内容（背面） */}
+                    {/* 完整内容（背面）：编辑 / Markdown 预览 */}
                     <span className="block text-sm text-muted-foreground">完整内容（背面）：</span>
-                    <AutoTextarea
-                      value={block.back}
-                      register={(el) => registerTA(i, 'back', el)}
-                      onChange={(e) => updateField(i, 'back', e.target.value)}
-                      onFocus={() => handleTAFocus(i, 'back')}
-                      onBlur={() => setKbUp(false)}
-                      placeholder="新段落内容..."
-                      aria-label={`第${i + 1}块完整内容（背面）`}
-                      resizeKey={`${fontSize}-${lineSpacing}`}
-                      style={{ fontSize, lineHeight: lineSpacing }}
-                      className="min-h-28 resize-none rounded-xl border-0 bg-muted px-3 py-3 shadow-none focus-visible:ring-1"
-                    />
-                  </>
-                )
-
-                return (
-                  <article
-                    key={i}
-                    className={cn(
-                      'space-y-3 rounded-2xl bg-card p-4 shadow-sm',
-                      batch && isSel && 'ring-2 ring-primary/50',
-                    )}
-                  >
-                    {batch ? (
-                      <div className="flex items-start gap-2.5">
-                        <button
-                          type="button"
-                          aria-label={isSel ? `取消选择第${i + 1}块` : `选择第${i + 1}块`}
-                          aria-pressed={isSel}
-                          onClick={() => toggleSelect(i)}
-                          className={cn(
-                            CHECK_BTN,
-                            'mt-1',
-                            isSel
-                              ? 'border-primary bg-primary text-primary-foreground'
-                              : 'border-muted-foreground/35 text-transparent',
-                          )}
-                        >
-                          <Check className="size-3" strokeWidth={3} aria-hidden />
-                        </button>
-                        <div className="min-w-0 flex-1 space-y-3">{fields}</div>
+                    {isPreview ? (
+                      <div
+                        className="min-h-28 overflow-hidden rounded-xl bg-muted px-3 py-3"
+                        style={{ fontSize, lineHeight: lineSpacing }}
+                      >
+                        <RichContent
+                          content={toPreviewMarkdown(block.back)}
+                          className="text-[length:inherit] leading-[inherit]"
+                        />
+                        {previewData && previewData.keywords.length > 0 && (
+                          <div className="mt-2 flex flex-wrap items-center gap-1 border-t border-border/60 pt-2">
+                            <span className="text-[11px] text-muted-foreground">挖空词：</span>
+                            {previewData.keywords.map((k) => (
+                              <span
+                                key={k}
+                                className="rounded-md bg-background px-1.5 py-0.5 text-[11px] text-foreground ring-1 ring-border"
+                              >
+                                {k}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     ) : (
-                      <div className="space-y-3">{fields}</div>
-                    )}
-
-                    {/* 操作行 */}
-                    {!batch && (
-                      <div className="flex flex-wrap items-center gap-2 border-t border-border pt-2">
-                        <button
-                          type="button"
-                          aria-label={`在第${i + 1}块后插入新块`}
-                          onClick={() => addBlockAfter(i)}
-                          className={ICON_BTN}
-                        >
-                          <Plus className="size-4" strokeWidth={1.75} aria-hidden />
-                        </button>
-                        <div className="flex h-9 shrink-0 overflow-hidden rounded-lg border border-border">
-                          <button
-                            type="button"
-                            aria-label={`上移第${i + 1}块`}
-                            disabled={i === 0}
-                            onClick={() => moveBlock(i, -1)}
-                            className="flex w-9 items-center justify-center text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset disabled:pointer-events-none disabled:opacity-40"
-                          >
-                            <ChevronUp className="size-4" strokeWidth={1.75} aria-hidden />
-                          </button>
-                          <span aria-hidden className="w-px bg-border" />
-                          <button
-                            type="button"
-                            aria-label={`下移第${i + 1}块`}
-                            disabled={i === blocks.length - 1}
-                            onClick={() => moveBlock(i, 1)}
-                            className="flex w-9 items-center justify-center text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset disabled:pointer-events-none disabled:opacity-40"
-                          >
-                            <ChevronDown className="size-4" strokeWidth={1.75} aria-hidden />
-                          </button>
-                        </div>
-                        <button
-                          type="button"
-                          aria-label={`拆分第${i + 1}块`}
-                          onClick={() => splitBlock(i)}
-                          className={TEXT_BTN}
-                        >
-                          拆分
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`合并第${i + 1}块与下一块`}
-                          disabled={i === blocks.length - 1}
-                          onClick={() => mergeWithNext(i)}
-                          className={TEXT_BTN}
-                        >
-                          合并
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`隐藏第${i + 1}块`}
-                          aria-pressed={isHidden}
-                          onClick={() => toggleHidden(i)}
-                          className={cn(
-                            ICON_BTN,
-                            isHidden && 'border-indigo-200 bg-indigo-50 text-indigo-500',
-                          )}
-                        >
-                          <EyeOff className="size-4" strokeWidth={1.75} aria-hidden />
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`删除第${i + 1}块`}
-                          onClick={() => removeBlock(i)}
-                          className={cn(
-                            ICON_BTN,
-                            'hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive',
-                          )}
-                        >
-                          <Trash2 className="size-4" strokeWidth={1.75} aria-hidden />
-                        </button>
-                      </div>
+                      <AutoTextarea
+                        value={block.back}
+                        register={(el) => registerTA(i, 'back', el)}
+                        onChange={(e) => updateField(i, 'back', e.target.value)}
+                        onFocus={() => handleTAFocus(i, 'back')}
+                        onBlur={() => setKbUp(false)}
+                        placeholder="新段落内容..."
+                        aria-label={`第${i + 1}块完整内容（背面）`}
+                        resizeKey={`${fontSize}-${lineSpacing}`}
+                        style={{ fontSize, lineHeight: lineSpacing }}
+                        className="min-h-28 resize-none rounded-xl border-0 bg-muted px-3 py-3 shadow-none focus-visible:ring-1"
+                      />
                     )}
                   </article>
                 )
@@ -974,203 +1426,6 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
           </div>
         </div>
       </main>
-
-      {/* 底部工具栏 */}
-      <nav
-        aria-label="编辑工具栏"
-        className="fixed inset-x-0 bottom-0 z-40 border-t border-border bg-background pb-[env(safe-area-inset-bottom)]"
-      >
-        <div className="mx-auto flex w-full max-w-2xl items-stretch px-1">
-          {/* 分割分块 */}
-          <button
-            type="button"
-            aria-label="AI 分割分块"
-            disabled={chunkLoading}
-            onClick={() => void runChunk()}
-            onMouseDown={(e) => e.preventDefault()}
-            className={TOOLBAR_BTN}
-          >
-            <Columns3 className="size-5" strokeWidth={1.75} aria-hidden />
-            <span className="text-[11px] leading-none">分割分块</span>
-          </button>
-
-          {/* 样式 */}
-          <Popover>
-            <PopoverTrigger asChild>
-              <button
-                type="button"
-                aria-label="样式"
-                onMouseDown={(e) => e.preventDefault()}
-                className={TOOLBAR_BTN}
-              >
-                <Type className="size-5" strokeWidth={1.75} aria-hidden />
-                <span className="text-[11px] leading-none">样式</span>
-              </button>
-            </PopoverTrigger>
-            <PopoverContent side="top" align="start" className="w-64 rounded-2xl p-4">
-              <div className="space-y-4">
-                <div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-medium">全局正文字号</span>
-                    <span className="text-xs tabular-nums text-muted-foreground">{fontSize}px</span>
-                  </div>
-                  <Slider
-                    className="mt-3"
-                    min={12}
-                    max={24}
-                    step={1}
-                    value={[fontSize]}
-                    onValueChange={(v) => setFontSize(v[0] ?? 16)}
-                    aria-label="全局正文字号"
-                  />
-                </div>
-                <div>
-                  <span className="text-sm font-medium">行距</span>
-                  <div className="mt-2 grid grid-cols-3 gap-1 rounded-lg bg-muted p-1">
-                    {LINE_OPTIONS.map((o) => (
-                      <button
-                        key={o.label}
-                        type="button"
-                        onClick={() => setLineSpacing(o.value)}
-                        aria-pressed={lineSpacing === o.value}
-                        className={cn(
-                          'h-8 rounded-md text-xs font-medium transition-colors',
-                          lineSpacing === o.value
-                            ? 'bg-background shadow-sm'
-                            : 'text-muted-foreground hover:text-foreground',
-                        )}
-                      >
-                        {o.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </PopoverContent>
-          </Popover>
-
-          {/* 格式 */}
-          <Popover>
-            <PopoverTrigger asChild>
-              <button
-                type="button"
-                aria-label="格式"
-                onMouseDown={(e) => e.preventDefault()}
-                className={TOOLBAR_BTN}
-              >
-                <ALargeSmall className="size-5" strokeWidth={1.75} aria-hidden />
-                <span className="text-[11px] leading-none">格式</span>
-              </button>
-            </PopoverTrigger>
-            <PopoverContent side="top" align="start" className="w-64 rounded-2xl">
-              <div className="grid grid-cols-3 gap-1.5">
-                {FORMAT_ITEMS.map((f) => (
-                  <button
-                    key={f.kind}
-                    type="button"
-                    onClick={() => applyFormat(f.kind)}
-                    className="flex h-16 flex-col items-center justify-center gap-1 rounded-lg border border-border text-xs text-foreground transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  >
-                    <f.icon className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
-                    {f.label}
-                  </button>
-                ))}
-              </div>
-              <p className="mt-3 text-center text-[11px] text-muted-foreground">
-                插入到最近点击的文本框
-              </p>
-            </PopoverContent>
-          </Popover>
-
-          {/* 图片 */}
-          <button
-            type="button"
-            aria-label="插入图片"
-            onClick={() => fileInputRef.current?.click()}
-            onMouseDown={(e) => e.preventDefault()}
-            className={TOOLBAR_BTN}
-          >
-            <ImageIcon className="size-5" strokeWidth={1.75} aria-hidden />
-            <span className="text-[11px] leading-none">图片</span>
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*"
-            className="hidden"
-            aria-hidden
-            tabIndex={-1}
-            onChange={(e) => void handleImageFile(e)}
-          />
-
-          {/* 公式 */}
-          <button
-            type="button"
-            aria-label="插入公式"
-            onClick={() => insertMarkdown('$', '$', 'LaTeX公式')}
-            onMouseDown={(e) => e.preventDefault()}
-            className={TOOLBAR_BTN}
-          >
-            <Sigma className="size-5" strokeWidth={1.75} aria-hidden />
-            <span className="text-[11px] leading-none">公式</span>
-          </button>
-
-          {/* 表格 */}
-          <button
-            type="button"
-            aria-label="插入表格"
-            onClick={() => insertMarkdown(TABLE_TEMPLATE, '', '', true)}
-            onMouseDown={(e) => e.preventDefault()}
-            className={TOOLBAR_BTN}
-          >
-            <TableIcon className="size-5" strokeWidth={1.75} aria-hidden />
-            <span className="text-[11px] leading-none">表格</span>
-          </button>
-
-          {/* 键盘 */}
-          <button
-            type="button"
-            aria-label={kbUp ? '收起键盘' : '弹出键盘'}
-            aria-pressed={kbUp}
-            onClick={toggleKeyboard}
-            onMouseDown={(e) => e.preventDefault()}
-            className={cn(TOOLBAR_BTN, kbUp && 'bg-muted text-foreground')}
-          >
-            <Keyboard className="size-5" strokeWidth={1.75} aria-hidden />
-            <span className="text-[11px] leading-none">键盘</span>
-          </button>
-        </div>
-      </nav>
-
-      {/* 重命名弹窗 */}
-      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent className="rounded-2xl sm:max-w-sm" showCloseButton={false}>
-          <DialogHeader>
-            <DialogTitle>重命名材料</DialogTitle>
-          </DialogHeader>
-          <Input
-            value={renameValue}
-            onChange={(e) => setRenameValue(e.target.value)}
-            placeholder="输入材料标题"
-            aria-label="材料标题"
-            autoFocus
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                confirmRename()
-              }
-            }}
-          />
-          <div className="flex justify-end gap-2">
-            <Button variant="outline" size="sm" onClick={() => setRenameOpen(false)}>
-              取消
-            </Button>
-            <Button size="sm" onClick={confirmRename}>
-              确定
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
 
       {/* 分割分块确认 */}
       <AlertDialog

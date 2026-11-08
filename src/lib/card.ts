@@ -61,6 +61,9 @@ export function serializeCard(c: {
   plan: string
   mindmaps?: string | null
   blocks?: string | null
+  categoryId?: string
+  pinned?: boolean
+  ord?: number
   deletedAt?: Date | null
   createdAt: Date
   updatedAt: Date
@@ -119,6 +122,9 @@ export function serializeCard(c: {
     plan,
     mindmaps: mindmaps as CardData['mindmaps'],
     blocks,
+    categoryId: c.categoryId ?? '',
+    pinned: c.pinned ?? false,
+    ord: c.ord ?? 0,
     deletedAt: c.deletedAt ? c.deletedAt.toISOString() : null,
     createdAt: c.createdAt.toISOString(),
     updatedAt: c.updatedAt.toISOString(),

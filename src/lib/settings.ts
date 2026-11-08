@@ -35,6 +35,7 @@ export function parseSettings(row: {
   asrApiKey?: string | null
   asrModel?: string | null
   quizAutoRemove?: number | null
+  aiAutoCloze?: boolean | null
 } | null): SettingsData {
   let tools: ToolToggles = { ...DEFAULT_TOOLS }
   try {
@@ -91,6 +92,7 @@ export function parseSettings(row: {
       typeof row?.quizAutoRemove === 'number' && [1, 2, 3, 5].includes(row.quizAutoRemove)
         ? (row.quizAutoRemove as 1 | 2 | 3 | 5)
         : 2,
+    aiAutoCloze: !!row?.aiAutoCloze,
   }
 }
 

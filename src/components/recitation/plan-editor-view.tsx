@@ -114,7 +114,7 @@ export function PlanEditorView({
               <span aria-hidden className="size-2 rounded-full border border-zinc-400" />
               已学 <span className="font-semibold tabular-nums">{learned}</span>
             </span>
-            <span className="flex items-center justify-end gap-1 font-medium text-indigo-600">
+            <span className="flex items-center justify-end gap-1 font-medium text-emerald-600">
               <ArrowLeftRight className="size-3.5" strokeWidth={2} />
               <span className="tabular-nums">{due}章</span>
             </span>

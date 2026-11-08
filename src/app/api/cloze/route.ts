@@ -26,7 +26,11 @@ export async function POST(req: NextRequest) {
       {
         role: 'system' as const,
         content:
-          '你是语文背书助手。挖空单位是「字」不是词语：请从下面这段文字中挑选出最适合用于"挖空背诵"的关键字，每个元素只放一个汉字（连续的英文单词/数字可作为一个整体元素）。优先挑名词、动词、形容词、成语中的关键字、专有名词、数字、人名地名里的字。数量约为总字数的10%-20%，最少4个最多60个，不要重复。只返回一个JSON数组（元素为字符串），不要任何解释或前后缀。',
+          '你是语文背书助手的挖空专家。请从下面的文字中挑选出最适合"挖空背诵"的关键片段。要求：\n' +
+          '1. 每个片段必须是原文中【连续且逐字存在】的子串（2-10个字），优先：名词短语、动词短语、成语、专有名词、人名、地名、书名、数字、核心论点词组。\n' +
+          '2. 不要挑虚词（的/了/是/在/和/我们）、不要挑标点、不要挑重复出现的普通单字。\n' +
+          '3. 片段数量约为全文总字数的 10%-18%，最少 4 个，最多 50 个，按在原文中出现的顺序排列，去重。\n' +
+          '4. 只返回一个 JSON 字符串数组，不要任何解释、不要 markdown 代码块。',
       },
       { role: 'user' as const, content: truncated },
     ]
@@ -35,22 +39,29 @@ export async function POST(req: NextRequest) {
     try {
       const config = await getAIConfig()
       const raw = await chatComplete(messages, config)
-      keywords = extractJSON<string[]>(raw)
-      if (!Array.isArray(keywords)) keywords = []
-      // 挖空单位是字 — split any multi-char CJK keyword the model returned
-      // into individual characters so every blank is exactly one 字.
-      const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf]/
-      const flat: string[] = []
-      for (const k of keywords) {
-        if (typeof k !== 'string' || !k.trim()) continue
-        const t = k.trim()
-        if (CJK_RE.test(t) && t.length > 1) {
-          for (const ch of t) flat.push(ch)
-        } else {
-          flat.push(t)
-        }
+      const parsed = extractJSON<string[]>(raw)
+      keywords = Array.isArray(parsed) ? parsed : []
+      // 严格校验：必须是原文的精确子串、长度合理、非纯标点 —— 保证挖空一定命中。
+      const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf]/g
+      keywords = Array.from(
+        new Set(
+          keywords
+            .filter((k): k is string => typeof k === 'string')
+            .map((k) => k.trim())
+            .filter((k) => k.length >= 1 && k.length <= 12)
+            .filter((k) => content.includes(k))
+            .filter((k) => (k.match(CJK_RE) || []).length >= 1 || /[a-zA-Z0-9]/.test(k)),
+        ),
+      ).slice(0, 50)
+      // 去掉互为子串的冗余项（保留更长的片段）。
+      const sorted = [...keywords].sort((a, b) => b.length - a.length)
+      const kept: string[] = []
+      for (const k of sorted) {
+        if (!kept.some((x) => x.includes(k))) kept.push(k)
       }
-      keywords = Array.from(new Set(flat)).slice(0, 60)
+      keywords = kept
+        .sort((a, b) => content.indexOf(a) - content.indexOf(b))
+        .slice(0, 50)
     } catch (err: unknown) {
       console.warn('[POST /api/cloze] AI parse failed, fallback to ruleCloze:', err)
       keywords = ruleCloze(content, 4)

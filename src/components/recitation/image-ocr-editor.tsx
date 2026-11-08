@@ -1,17 +1,19 @@
 'use client'
 
-// Multi-image OCR editor: add several photos (cross-page / 多张合并), zoom &
-// crop each one (放大缩小 + 裁剪工具), then recognize them in order and merge
-// the recognized text into a single draft.
+// Multi-image OCR editor: add several photos (cross-page / 多张合并), freely
+// crop each one with the handwritten FreeCropBox (8-handle 自由拉升裁剪框),
+// zoom / pan (滑块 + 双指), then recognize them in order and merge the
+// recognized text into a single draft.
 //
 // Backend contract:
 //   POST /api/ocr  (application/json)
 //   { image: dataURI, crop?: { x, y, width, height } }
 // → { text: string }
-// When `crop` is omitted the full image is recognized.
+// When `crop` is omitted the full image is recognized. The crop sent to the
+// API is in natural image pixels — converted from the display-coords crop box
+// by FreeCropBox (考虑缩放/位移).
 
 import * as React from 'react'
-import Cropper, { type Area } from 'react-easy-crop'
 import {
   Crop as CropIcon,
   ImagePlus,
@@ -32,6 +34,12 @@ import {
   DialogContent,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  FreeCropBox,
+  MAX_CROP_ZOOM,
+  type CropBox,
+  type CropOffset,
+} from '@/components/recitation/free-crop-box'
 
 interface ImageOcrEditorProps {
   open: boolean
@@ -40,21 +48,16 @@ interface ImageOcrEditorProps {
   onText: (text: string) => void
 }
 
-interface CropBox {
-  x: number
-  y: number
-  width: number
-  height: number
-}
-
 interface ImageItem {
   id: string
   dataUrl: string
   name: string
-  // react-easy-crop controlled state (pan position + zoom).
-  crop: { x: number; y: number }
+  // FreeCropBox controlled state: zoom (1–4) + pan offset (display coords).
   zoom: number
-  // Pixel crop region on the natural image, captured on cropComplete.
+  offset: CropOffset
+  // Crop region in display coords (frame rendering) + natural image pixels
+  // (submitted to /api/ocr as `crop`).
+  crop: CropBox | null
   cropPixels: CropBox | null
 }
 
@@ -120,8 +123,9 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
           id: nextId(),
           dataUrl,
           name: file.name || '图片',
-          crop: { x: 0, y: 0 },
           zoom: 1,
+          offset: { x: 0, y: 0 },
+          crop: null,
           cropPixels: null,
         })
       } catch {
@@ -144,18 +148,10 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
     )
   }
 
-  const handleCropChange = (crop: { x: number; y: number }) => updateActive({ crop })
+  const handleCropChange = (crop: CropBox) => updateActive({ crop })
+  const handleCropNatural = (cropPixels: CropBox) => updateActive({ cropPixels })
   const handleZoomChange = (zoom: number) => updateActive({ zoom })
-  const handleCropComplete = (_area: Area, areaPixels: Area) => {
-    updateActive({
-      cropPixels: {
-        x: areaPixels.x,
-        y: areaPixels.y,
-        width: areaPixels.width,
-        height: areaPixels.height,
-      },
-    })
-  }
+  const handleOffsetChange = (offset: CropOffset) => updateActive({ offset })
 
   const removeActive = () => {
     if (!activeId) return
@@ -181,7 +177,8 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
     })
   }
 
-  const resetCrop = () => updateActive({ crop: { x: 0, y: 0 }, zoom: 1, cropPixels: null })
+  const resetCrop = () =>
+    updateActive({ crop: null, cropPixels: null, zoom: 1, offset: { x: 0, y: 0 } })
 
   const recognizeAll = async () => {
     if (!images.length) {
@@ -327,27 +324,31 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
             </div>
 
             {/* ---------- crop / preview area ---------- */}
-            <div className="relative flex h-[44vh] min-h-[260px] items-center justify-center overflow-hidden bg-black">
-              {active && mode === 'crop' ? (
-                <Cropper
-                  image={active.dataUrl}
-                  crop={active.crop}
-                  zoom={active.zoom}
-                  aspect={aspect}
-                  onCropChange={handleCropChange}
-                  onZoomChange={handleZoomChange}
-                  onCropComplete={handleCropComplete}
-                  restrictPosition={false}
-                  showGrid
-                />
-              ) : active ? (
+            {active && mode === 'crop' ? (
+              <FreeCropBox
+                key={active.id}
+                src={active.dataUrl}
+                zoom={active.zoom}
+                onZoomChange={handleZoomChange}
+                offset={active.offset}
+                onOffsetChange={handleOffsetChange}
+                crop={active.crop}
+                onCropChange={handleCropChange}
+                onCropNatural={handleCropNatural}
+                aspect={aspect}
+                grid
+                disabled={recognizing}
+                className="h-[44vh] min-h-[260px] w-full border-b"
+              />
+            ) : active ? (
+              <div className="flex h-[44vh] min-h-[260px] items-center justify-center overflow-hidden border-b bg-black">
                 <img
                   src={active.dataUrl}
                   alt={active.name}
                   className="max-h-full max-w-full object-contain"
                 />
-              ) : null}
-            </div>
+              </div>
+            ) : null}
 
             {/* ---------- mode + aspect + zoom controls ---------- */}
             <div className="flex flex-col gap-2 border-b px-4 py-3">
@@ -391,7 +392,7 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
                         className={cn(
                           'rounded-full px-2.5 py-1 text-xs font-medium transition-colors',
                           aspect === p.value
-                            ? 'bg-emerald-600/10 text-emerald-700'
+                            ? 'bg-emerald-600 text-white'
                             : 'text-muted-foreground hover:bg-muted',
                         )}
                       >
@@ -408,7 +409,7 @@ export function ImageOcrEditor({ open, onOpenChange, onText }: ImageOcrEditorPro
                   <ZoomIn className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} />
                   <Slider
                     min={1}
-                    max={3}
+                    max={MAX_CROP_ZOOM}
                     step={0.05}
                     value={[active.zoom]}
                     onValueChange={(v) => handleZoomChange(v[0] ?? 1)}

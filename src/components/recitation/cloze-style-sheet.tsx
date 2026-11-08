@@ -43,7 +43,7 @@ function StyleIcon({ kind }: { kind: ClozeStyle }) {
       return <span className="block size-6 rounded-md bg-amber-300" />
     case 'circle':
       return (
-        <span className="flex h-7 w-10 items-center justify-center rounded-[50%] border-2 border-indigo-600 text-sm font-semibold">
+        <span className="flex h-7 w-10 items-center justify-center rounded-[50%] border-2 border-emerald-600 text-sm font-semibold">
           A
         </span>
       )
@@ -70,7 +70,7 @@ export function ClozeStyleSheet({ open, onOpenChange, value, onChange }: ClozeSt
               onClick={() => onChange(opt.value)}
               className={cn(
                 'flex flex-col items-center gap-2 rounded-xl border border-border/60 bg-card p-4 text-center shadow-sm transition-colors',
-                active ? 'text-indigo-600' : 'text-muted-foreground',
+                active ? 'text-emerald-600' : 'text-muted-foreground',
               )}
             >
               <span className="flex h-10 items-center justify-center">

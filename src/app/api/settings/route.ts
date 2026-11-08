@@ -137,6 +137,10 @@ export async function PATCH(req: NextRequest) {
     if (typeof body?.quizAutoRemove === 'number' && [1, 2, 3, 5].includes(body.quizAutoRemove)) {
       data.quizAutoRemove = body.quizAutoRemove
     }
+    // 导入时 AI 自动挖空
+    if (typeof body?.aiAutoCloze === 'boolean') {
+      data.aiAutoCloze = body.aiAutoCloze
+    }
 
     if (Object.keys(data).length === 0) {
       return NextResponse.json(await getSettings())

@@ -2,25 +2,21 @@
 
 // 浏览器相机 — 完整版拍照识别:
 //   • 连拍多页 (已拍 N 徽标 + 缩略图条，跨页按顺序合并识别)
-//   • 拍照放大缩小 (数字变焦 1x-3x，预览与成片同步裁心)
-//   • 每张照片可裁剪 (自由拉升裁剪框 / 预设比例) 后再识别
-//   • 相册导入 · 前后摄像头翻转 · 重拍 · 识别文字 / 识别全部并合并
+//   • 拍照后自动进入裁剪模式：8 把手自由拉升裁剪框 (FreeCropBox)
+//     + 九宫格参考线 + 预设比例 (自由/1:1/4:3/3:4/16:9)
+//   • 拍照与裁剪均支持滑块 1x–4x 缩放 + 双指捏合
+//   • 相册导入 · 前后摄像头翻转 · 重拍(删除当前重进) · 识别全部并合并
 //
 // Backend contract: POST /api/ocr (multipart file | JSON {image, crop?}).
 
 import * as React from 'react'
-import Cropper, { type Area } from 'react-easy-crop'
 import {
   Camera,
   Crop as CropIcon,
   Images,
   Loader2,
-  Maximize2,
-  Minus,
-  Plus,
-  RefreshCcw,
   ScanText,
-  SquareStack,
+  Scissors,
   SwitchCamera,
   Trash2,
   X,
@@ -36,6 +32,12 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
+import {
+  FreeCropBox,
+  MAX_CROP_ZOOM,
+  type CropBox,
+  type CropOffset,
+} from '@/components/recitation/free-crop-box'
 
 interface CameraCaptureProps {
   open: boolean
@@ -44,21 +46,16 @@ interface CameraCaptureProps {
   onText: (text: string) => void
 }
 
-interface CropBox {
-  x: number
-  y: number
-  width: number
-  height: number
-}
-
 interface PhotoItem {
   id: string
   dataUrl: string
   // Digital zoom used when this photo was shot (already baked into dataUrl).
   zoom: number
-  // Cropper state (live editing).
-  crop: { x: number; y: number }
-  zoomCrop: number
+  // Crop editor state (FreeCropBox controlled).
+  cropZoom: number
+  cropOffset: CropOffset
+  // Crop region: display coords (frame) + natural pixels (submitted to OCR).
+  crop: CropBox | null
   cropPixels: CropBox | null
 }
 
@@ -72,9 +69,11 @@ const ASPECT_PRESETS = [
   { label: '16:9', value: 16 / 9 },
 ] as const
 
-const MAX_ZOOM = 3
+const MAX_ZOOM = 4
 let _idCounter = 0
 const nextId = () => `ph-${Date.now().toString(36)}-${(_idCounter++).toString(36)}`
+
+const clampZoom = (z: number) => Math.min(MAX_ZOOM, Math.max(1, z))
 
 export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps) {
   const videoRef = React.useRef<HTMLVideoElement>(null)
@@ -88,7 +87,7 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
   const [ocrLoading, setOcrLoading] = React.useState(false)
   const [ocrTotal, setOcrTotal] = React.useState(0)
 
-  // camera digital zoom (preview + capture)
+  // camera digital zoom (preview + capture), slider 1x–4x + 双指
   const [zoom, setZoom] = React.useState(1)
   // crop mode / aspect for the crop editor
   const [viewMode, setViewMode] = React.useState<ViewMode>('camera')
@@ -159,6 +158,42 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
     void startStream(next)
   }
 
+  // 双指捏合：仅取景器（实时画面）中生效
+  const camPointersRef = React.useRef(new Map<number, { x: number; y: number }>())
+  const camPinchRef = React.useRef<null | { dist: number; zoom: number }>(null)
+
+  const camPointerDown = (e: React.PointerEvent) => {
+    if (viewMode !== 'camera' || current || permissionError) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    camPointersRef.current.set(e.pointerId, { x: e.clientX - rect.left, y: e.clientY - rect.top })
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {
+      // 指针可能已释放，忽略
+    }
+    if (camPointersRef.current.size === 2) {
+      const [a, b] = [...camPointersRef.current.values()]
+      camPinchRef.current = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, zoom }
+    }
+  }
+
+  const camPointerMove = (e: React.PointerEvent) => {
+    if (!camPointersRef.current.has(e.pointerId)) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    camPointersRef.current.set(e.pointerId, { x: e.clientX - rect.left, y: e.clientY - rect.top })
+    const pinch = camPinchRef.current
+    if (pinch && camPointersRef.current.size >= 2) {
+      const [a, b] = [...camPointersRef.current.values()]
+      const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1
+      setZoom(clampZoom(pinch.zoom * (dist / pinch.dist)))
+    }
+  }
+
+  const camPointerEnd = (e: React.PointerEvent) => {
+    camPointersRef.current.delete(e.pointerId)
+    if (camPointersRef.current.size < 2) camPinchRef.current = null
+  }
+
   // Capture the current frame; apply digital zoom by cropping the center
   // region (1/zoom of each dimension) so the saved photo matches the preview.
   const handleShutter = () => {
@@ -196,13 +231,15 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
       id: nextId(),
       dataUrl,
       zoom: z,
-      crop: { x: 0, y: 0 },
-      zoomCrop: 1,
+      cropZoom: 1,
+      cropOffset: { x: 0, y: 0 },
+      crop: null,
       cropPixels: null,
     }
     setPhotos((prev) => [...prev, item])
     setCurrentId(item.id)
-    setViewMode('camera')
+    // 拍照后进入裁剪模式
+    setViewMode('crop')
   }
 
   const handlePickFile = (file: File) => {
@@ -212,13 +249,14 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
         id: nextId(),
         dataUrl: String(reader.result),
         zoom: 1,
-        crop: { x: 0, y: 0 },
-        zoomCrop: 1,
+        cropZoom: 1,
+        cropOffset: { x: 0, y: 0 },
+        crop: null,
         cropPixels: null,
       }
       setPhotos((prev) => [...prev, item])
       setCurrentId(item.id)
-      setViewMode('camera')
+      setViewMode('crop')
     }
     reader.readAsDataURL(file)
   }
@@ -234,17 +272,32 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
     })
   }
 
-  const retake = () => {
+  // 完成裁剪：保存 cropPixels，回到取景器拍下一页
+  const finishCrop = () => setViewMode('camera')
+
+  // 取消裁剪：丢弃当前照片的裁剪状态
+  const cancelCrop = () => {
     if (current) {
-      removePhoto(current.id)
+      updatePhoto(current.id, {
+        crop: null,
+        cropPixels: null,
+        cropZoom: 1,
+        cropOffset: { x: 0, y: 0 },
+      })
     }
+    setViewMode('camera')
+  }
+
+  // 重拍：删除当前照片，回到取景器
+  const retake = () => {
+    if (current) removePhoto(current.id)
     setViewMode('camera')
   }
 
   // ---------- OCR ----------
   const recognizeOne = async (photo: PhotoItem): Promise<string> => {
     const body: { image: string; crop?: CropBox } = { image: photo.dataUrl }
-    if (viewMode === 'camera' && photo.cropPixels) body.crop = photo.cropPixels
+    if (photo.cropPixels) body.crop = photo.cropPixels
     const res = await fetch('/api/ocr', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -256,28 +309,6 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
     }
     const data = (await res.json()) as { text?: string }
     return (data.text || '').trim()
-  }
-
-  const handleRecognizeCurrent = async () => {
-    if (!current) return
-    setOcrLoading(true)
-    setOcrTotal(1)
-    const tid = toast.loading('正在识别图片文字…')
-    try {
-      const text = await recognizeOne(current)
-      if (!text) {
-        toast.warning('未识别到文字，请换一张更清晰的照片或调整裁剪', { id: tid })
-        return
-      }
-      toast.success(`识别到 ${text.length} 字`, { id: tid })
-      onOpenChange(false)
-      onText(text)
-    } catch (err) {
-      toast.error('识别失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
-    } finally {
-      setOcrLoading(false)
-      setOcrTotal(0)
-    }
   }
 
   const handleRecognizeAll = async () => {
@@ -346,59 +377,28 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
           </div>
 
           {/* preview / crop area */}
-          <div className="relative mx-4 flex h-[46vh] min-h-[300px] flex-1 items-center justify-center overflow-hidden rounded-2xl bg-zinc-900">
+          <div
+            className="relative mx-4 flex h-[46vh] min-h-[300px] flex-1 items-center justify-center overflow-hidden rounded-2xl bg-zinc-900"
+            onPointerDown={camPointerDown}
+            onPointerMove={camPointerMove}
+            onPointerUp={camPointerEnd}
+            onPointerCancel={camPointerEnd}
+          >
             {inCropMode && current ? (
-              <>
-                <Cropper
-                  image={current.dataUrl}
-                  crop={current.crop}
-                  zoom={current.zoomCrop}
-                  aspect={aspect}
-                  restrictPosition={false}
-                  showGrid
-                  onCropChange={(c) => updatePhoto(current.id, { crop: c })}
-                  onZoomChange={(z) => updatePhoto(current.id, { zoomCrop: z })}
-                  onCropComplete={(_a, px) =>
-                    updatePhoto(current.id, {
-                      cropPixels: px
-                        ? { x: px.x, y: px.y, width: px.width, height: px.height }
-                        : null,
-                    })
-                  }
-                />
-                {/* aspect presets overlay */}
-                <div className="absolute inset-x-0 top-0 z-10 flex items-center gap-1 bg-gradient-to-b from-black/60 to-transparent px-3 py-2">
-                  {ASPECT_PRESETS.map((p) => (
-                    <button
-                      key={p.label}
-                      type="button"
-                      onClick={() => setAspect(p.value)}
-                      className={cn(
-                        'rounded-full px-2.5 py-1 text-xs font-medium transition-colors',
-                        aspect === p.value
-                          ? 'bg-emerald-600 text-white'
-                          : 'bg-white/10 text-zinc-200 hover:bg-white/20',
-                      )}
-                    >
-                      {p.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="absolute inset-x-0 bottom-0 z-10 flex items-center gap-2 bg-gradient-to-t from-black/60 to-transparent px-4 py-2">
-                  <ZoomIn className="size-4 shrink-0 text-zinc-300" strokeWidth={1.75} />
-                  <Slider
-                    min={1}
-                    max={3}
-                    step={0.05}
-                    value={[current.zoomCrop]}
-                    onValueChange={(v) => updatePhoto(current.id, { zoomCrop: v[0] ?? 1 })}
-                    className="flex-1"
-                  />
-                  <span className="w-9 text-right text-xs tabular-nums text-zinc-300">
-                    {current.zoomCrop.toFixed(1)}x
-                  </span>
-                </div>
-              </>
+              <FreeCropBox
+                key={current.id}
+                src={current.dataUrl}
+                zoom={current.cropZoom}
+                onZoomChange={(z) => updatePhoto(current.id, { cropZoom: z })}
+                offset={current.cropOffset}
+                onOffsetChange={(o) => updatePhoto(current.id, { cropOffset: o })}
+                crop={current.crop}
+                onCropChange={(c) => updatePhoto(current.id, { crop: c })}
+                onCropNatural={(px) => updatePhoto(current.id, { cropPixels: px })}
+                aspect={aspect}
+                grid
+                className="absolute inset-0"
+              />
             ) : current ? (
               <img
                 src={current.dataUrl}
@@ -421,66 +421,123 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
                 相机不可用，请从相册选择图片识别
               </div>
             )}
+          </div>
 
-            {/* camera zoom controls */}
-            {!current && !inCropMode && !permissionError && (
-              <div className="absolute right-3 top-3 z-10 flex flex-col items-center gap-1.5">
+          {/* ---------- crop mode controls ---------- */}
+          {inCropMode && current ? (
+            <>
+              {/* aspect chips + delete */}
+              <div className="flex items-center gap-1 px-4 pt-3">
+                <div className="flex flex-1 items-center gap-1 overflow-x-auto">
+                  {ASPECT_PRESETS.map((p) => (
+                    <button
+                      key={p.label}
+                      type="button"
+                      onClick={() => setAspect(p.value)}
+                      className={cn(
+                        'shrink-0 rounded-full px-2.5 py-1 text-xs font-medium transition-colors',
+                        aspect === p.value
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-white/10 text-zinc-200 hover:bg-white/20',
+                      )}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
                 <button
                   type="button"
-                  aria-label="放大"
-                  onClick={() => setZoom((z) => Math.min(MAX_ZOOM, Math.round((z + 0.5) * 2) / 2))}
-                  className="flex size-9 items-center justify-center rounded-full bg-black/50 text-white backdrop-blur transition-colors hover:bg-black/70 disabled:opacity-30"
-                  disabled={zoom >= MAX_ZOOM}
+                  aria-label="删除此照片并重拍"
+                  onClick={retake}
+                  className="flex size-7 shrink-0 items-center justify-center rounded-full bg-white/10 text-zinc-300 transition-colors hover:bg-red-500/20 hover:text-red-400"
                 >
-                  <Plus className="size-4" strokeWidth={2} />
-                </button>
-                <span className="rounded-full bg-black/50 px-2 py-0.5 text-[11px] font-semibold tabular-nums backdrop-blur">
-                  {zoom.toFixed(1)}x
-                </span>
-                <button
-                  type="button"
-                  aria-label="缩小"
-                  onClick={() => setZoom((z) => Math.max(1, Math.round((z - 0.5) * 2) / 2))}
-                  className="flex size-9 items-center justify-center rounded-full bg-black/50 text-white backdrop-blur transition-colors hover:bg-black/70 disabled:opacity-30"
-                  disabled={zoom <= 1}
-                >
-                  <Minus className="size-4" strokeWidth={2} />
+                  <Trash2 className="size-3.5" strokeWidth={1.75} />
                 </button>
               </div>
-            )}
 
-            {/* crop confirm bar over photo */}
-            {inCropMode && current && (
-              <div className="absolute inset-x-0 bottom-0 z-20 flex items-center justify-between bg-gradient-to-t from-black/70 to-transparent px-4 pb-3 pt-8">
+              {/* crop zoom slider (1x–4x + 双指) */}
+              <div className="flex items-center gap-2 px-4 pt-2">
+                <ZoomIn className="size-4 shrink-0 text-zinc-300" strokeWidth={1.75} />
+                <Slider
+                  min={1}
+                  max={MAX_CROP_ZOOM}
+                  step={0.05}
+                  value={[current.cropZoom]}
+                  onValueChange={(v) => updatePhoto(current.id, { cropZoom: clampZoom(v[0] ?? 1) })}
+                  className="flex-1"
+                />
+                <span className="w-10 shrink-0 text-right text-xs tabular-nums text-zinc-300">
+                  {current.cropZoom.toFixed(1)}x
+                </span>
+              </div>
+
+              {/* 取消 | 已选 W×H | 完成裁剪 */}
+              <div className="flex items-center justify-between gap-2 px-4 pt-3">
                 <Button
                   variant="ghost"
                   size="sm"
                   className="rounded-full bg-white/10 text-white hover:bg-white/20 hover:text-white"
-                  onClick={() => {
-                    updatePhoto(current.id, { cropPixels: null, crop: { x: 0, y: 0 }, zoomCrop: 1 })
-                    setViewMode('camera')
-                  }}
+                  onClick={cancelCrop}
                 >
                   取消
                 </Button>
                 <span className="text-xs text-zinc-300">
                   {current.cropPixels
                     ? `已选 ${Math.round(current.cropPixels.width)}×${Math.round(current.cropPixels.height)}`
-                    : '拖动/拉伸选框选择识别区域'}
+                    : '拖动把手自由选择识别区域'}
                 </span>
                 <Button
                   size="sm"
                   className="h-9 rounded-full bg-emerald-600 px-4 text-white hover:bg-emerald-700"
-                  onClick={() => setViewMode('camera')}
+                  onClick={finishCrop}
                 >
-                  <CropIcon className="size-3.5" strokeWidth={1.75} />
+                  <Scissors className="size-3.5" strokeWidth={1.75} />
                   完成裁剪
                 </Button>
               </div>
-            )}
-          </div>
+            </>
+          ) : (
+            /* ---------- camera mode controls ---------- */
+            <>
+              {/* camera zoom slider (1x–4x + 双指) */}
+              {!permissionError && !current && (
+                <div className="flex items-center gap-2 px-4 pt-3">
+                  <ZoomIn className="size-4 shrink-0 text-zinc-300" strokeWidth={1.75} />
+                  <Slider
+                    min={1}
+                    max={MAX_ZOOM}
+                    step={0.05}
+                    value={[zoom]}
+                    onValueChange={(v) => setZoom(clampZoom(v[0] ?? 1))}
+                    className="flex-1"
+                  />
+                  <span className="w-10 shrink-0 text-right text-xs tabular-nums text-zinc-300">
+                    {zoom.toFixed(1)}x
+                  </span>
+                </div>
+              )}
 
-          {/* thumbnail strip (多页跨页) */}
+              {/* 识别全部并合并 */}
+              {photos.length > 0 && (
+                <div className="px-4 pt-3">
+                  <Button
+                    className="h-11 w-full rounded-full bg-emerald-600 text-sm font-semibold text-white hover:bg-emerald-700"
+                    onClick={() => void handleRecognizeAll()}
+                    disabled={ocrLoading}
+                  >
+                    {ocrLoading ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <ScanText className="size-4" strokeWidth={1.75} />
+                    )}
+                    识别全部并合并{ocrTotal > 0 ? `（${ocrTotal} 页）` : ''}
+                  </Button>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* thumbnail strip (多页跨页，点击重新进入裁剪) */}
           {photos.length > 0 && (
             <div className="flex items-center gap-2 overflow-x-auto px-4 py-2">
               {photos.map((p, i) => (
@@ -489,13 +546,13 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
                   type="button"
                   onClick={() => {
                     setCurrentId(p.id)
-                    setViewMode('camera')
+                    setViewMode('crop')
                   }}
                   className={cn(
                     'relative size-14 shrink-0 overflow-hidden rounded-xl border-2 transition-colors',
                     p.id === currentId ? 'border-emerald-500' : 'border-white/10 hover:border-white/30',
                   )}
-                  aria-label={`第 ${i + 1} 页`}
+                  aria-label={`第 ${i + 1} 页，点按重新裁剪`}
                 >
                   <img src={p.dataUrl} alt={`第 ${i + 1} 页`} className="size-full object-cover" />
                   <span className="absolute left-0.5 top-0.5 flex size-4 items-center justify-center rounded-full bg-black/70 text-[10px] font-bold">
@@ -511,9 +568,8 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
             </div>
           )}
 
-          {/* controls */}
+          {/* bottom action bar: 相册 | 快门/裁剪模式 | 翻转相机 */}
           <div className="flex items-center justify-between px-6 py-4">
-            {/* gallery picker */}
             <label
               className={cn(
                 'flex size-11 cursor-pointer items-center justify-center rounded-full bg-white/10 transition-colors hover:bg-white/20',
@@ -536,75 +592,6 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
 
             {inCropMode ? (
               <span className="text-xs text-zinc-400">裁剪模式</span>
-            ) : current ? (
-              <div className="flex flex-col items-center gap-2">
-                <div className="flex items-center gap-2">
-                  {photos.length > 1 && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="rounded-full bg-white/10 text-white hover:bg-white/20 hover:text-white"
-                      onClick={() => void handleRecognizeAll()}
-                      disabled={ocrLoading}
-                    >
-                      {ocrLoading && ocrTotal > 1 ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <SquareStack className="size-4" strokeWidth={1.75} />
-                      )}
-                      识别全部
-                    </Button>
-                  )}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="rounded-full bg-white/10 text-white hover:bg-white/20 hover:text-white"
-                    onClick={retake}
-                    disabled={ocrLoading}
-                  >
-                    <RefreshCcw className="size-4" strokeWidth={1.75} />
-                    重拍
-                  </Button>
-                  <Button
-                    size="sm"
-                    className="h-11 rounded-full bg-emerald-600 px-5 text-white hover:bg-emerald-700"
-                    onClick={() => void handleRecognizeCurrent()}
-                    disabled={ocrLoading}
-                  >
-                    {ocrLoading && ocrTotal <= 1 ? (
-                      <Loader2 className="size-4 animate-spin" />
-                    ) : (
-                      <ScanText className="size-4" strokeWidth={1.75} />
-                    )}
-                    识别文字
-                  </Button>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    aria-label="裁剪此照片"
-                    onClick={() => {
-                      setViewMode('crop')
-                      setAspect(current.cropPixels ? aspect : undefined)
-                    }}
-                    className="flex items-center gap-1 rounded-full bg-white/10 px-3 py-1 text-[11px] text-zinc-200 transition-colors hover:bg-white/20"
-                  >
-                    <CropIcon className="size-3" strokeWidth={1.75} />
-                    裁剪
-                  </button>
-                  {current.cropPixels && (
-                    <span className="text-[11px] text-emerald-400">已裁剪 · 识别时生效</span>
-                  )}
-                  <button
-                    type="button"
-                    aria-label="删除此照片"
-                    onClick={() => removePhoto(current.id)}
-                    className="flex size-6 items-center justify-center rounded-full bg-white/10 text-zinc-300 transition-colors hover:bg-red-500/20 hover:text-red-400"
-                  >
-                    <Trash2 className="size-3" strokeWidth={1.75} />
-                  </button>
-                </div>
-              </div>
             ) : (
               <button
                 type="button"
@@ -620,15 +607,14 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
               </button>
             )}
 
-            {/* flip camera */}
             <button
               type="button"
               aria-label="切换前后摄像头"
               onClick={toggleCamera}
-              disabled={inCropMode || (!!current && viewMode === 'camera') || permissionError}
+              disabled={inCropMode || permissionError}
               className={cn(
                 'flex size-11 items-center justify-center rounded-full bg-white/10 transition-colors hover:bg-white/20',
-                (inCropMode || (!!current && viewMode === 'camera') || permissionError) && 'opacity-30',
+                (inCropMode || permissionError) && 'pointer-events-none opacity-30',
               )}
             >
               <SwitchCamera className="size-5" strokeWidth={1.75} />
@@ -636,9 +622,9 @@ export function CameraCapture({ open, onOpenChange, onText }: CameraCaptureProps
           </div>
 
           <div className="px-4 pb-3 text-center text-[11px] text-zinc-500">
-            {current
-              ? '可裁剪、缩放、重拍；多页将按顺序合并识别'
-              : '拍照后可裁剪/缩放；支持多页跨页连续拍摄'}
+            {inCropMode
+              ? '拖动把手自由拉升裁剪框 · 滑块或双指缩放'
+              : '可裁剪、缩放、重拍；多页将按顺序合并识别'}
           </div>
         </div>
 

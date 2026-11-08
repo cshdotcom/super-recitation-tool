@@ -2,24 +2,82 @@
 
 // RichContent — reusable renderer for markdown-ish card/chat content.
 // Features:
-//   • GFM markdown (react-markdown + remark-gfm) with nice spacing
+//   • GFM markdown (react-markdown + remark-gfm) with nice spacing — tables,
+//     task lists, strikethrough, images
 //   • syntax-highlighted fenced code blocks (rehype-highlight + github theme,
 //     dark-mode token colors overridden in globals.css)
+//   • LaTeX math: $inline$ and $$display$$ (remark-math + rehype-katex).
+//     Currency-style $ signs are protected: a $…$ pair only becomes math when
+//     the span looks like LaTeX (has letters/backslash/^_{}), so "价格$5" and
+//     "$5，总共$10" stay literal text. Unmatched single $ is always literal.
 //   • copy button on top-right of every code block
 //   • ```mermaid blocks rendered as SVG (mermaid lazy-loaded, re-rendered on
 //     theme change, error fallback falls back to a plain code block)
 //   • raw <svg>…</svg> segments in the content render natively (sanitized)
 //   • bordered tables with horizontal scroll on mobile
+//   • optional maxHeight → the whole container scrolls vertically
 // Never crashes on plain text — plain paragraphs just render as paragraphs.
 import * as React from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
 import rehypeHighlight from 'rehype-highlight'
+import rehypeKatex from 'rehype-katex'
+import 'katex/dist/katex.min.css'
 import { useTheme } from 'next-themes'
 import { Check, Copy } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import 'highlight.js/styles/github.css'
+
+// ---------- $ currency guard (math false-positive protection) ----------
+
+/** A $…$ span only counts as math when it contains a LaTeX-ish hint:
+ *  ASCII letters, a backslash command or ^ _ { }. Pure numbers/CJK like
+ *  "5，总共" or "100" are treated as currency and left as literal text. */
+const MATH_HINT_RE = /[A-Za-z\\^_{}]/
+
+/** Escape both dollars of a non-math $…$ pair (\$ renders a literal $). */
+function guardCurrencyDollars(md: string): string {
+  let out = ''
+  let i = 0
+  while (i < md.length) {
+    const ch = md[i]
+    if (ch === '\\' && i + 1 < md.length) {
+      // already-escaped char — copy verbatim
+      out += md.slice(i, i + 2)
+      i += 2
+      continue
+    }
+    if (ch === '$' && md[i + 1] !== '$') {
+      // find a closing $ on the same line (inline math never spans lines)
+      let j = i + 1
+      while (j < md.length && md[j] !== '$' && md[j] !== '\n') j += 1
+      if (j < md.length && md[j] === '$') {
+        const inner = md.slice(i + 1, j)
+        if (MATH_HINT_RE.test(inner)) {
+          out += md.slice(i, j + 1) // looks like math — keep delimiters
+        } else {
+          out += `\\$${inner}\\$` // currency — escape so remark-math skips it
+        }
+        i = j + 1
+        continue
+      }
+    }
+    out += ch
+    i += 1
+  }
+  return out
+}
+
+/** Apply the currency guard everywhere except fenced/inline code, where
+ *  characters must stay untouched. $$…$$ display math is always kept. */
+function guardDollarsOutsideCode(md: string): string {
+  const parts = md.split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g)
+  return parts
+    .map((p) => (/^(```|~~~|`)/.test(p) ? p : guardCurrencyDollars(p)))
+    .join('')
+}
 
 // ---------- raw SVG handling ----------
 
@@ -289,24 +347,39 @@ const MARKDOWN_COMPONENTS: Components = {
 export const RichContent = React.memo(function RichContent({
   content,
   className,
+  maxHeight,
 }: {
   content: string
   className?: string
+  /** Optional pixel/px-unit cap; content longer than this scrolls vertically. */
+  maxHeight?: number | string
 }) {
   const segments = React.useMemo(() => splitSvgSegments(content || ''), [content])
+  const scrollStyle = React.useMemo<React.CSSProperties>(
+    () => (maxHeight == null ? {} : { maxHeight, overflowY: 'auto', overscrollBehavior: 'contain' }),
+    [maxHeight],
+  )
   return (
-    <div className={cn('text-sm leading-relaxed', className)}>
+    <div
+      className={cn(
+        'text-sm leading-relaxed',
+        // KaTeX display blocks: breathing room + horizontal scroll on mobile
+        '[&_.katex-display]:my-3 [&_.katex-display]:overflow-x-auto [&_.katex-display]:py-1 [&_.katex-error]:text-red-600 dark:[&_.katex-error]:text-red-400',
+        className,
+      )}
+      style={scrollStyle}
+    >
       {segments.map((seg, i) =>
         seg.type === 'svg' ? (
           <SvgSegment key={i} html={sanitizeSvg(seg.value)} />
         ) : (
           <ReactMarkdown
             key={i}
-            remarkPlugins={[remarkGfm]}
-            rehypePlugins={[rehypeHighlight]}
+            remarkPlugins={[remarkGfm, remarkMath]}
+            rehypePlugins={[rehypeHighlight, rehypeKatex]}
             components={MARKDOWN_COMPONENTS}
           >
-            {seg.value}
+            {guardDollarsOutsideCode(seg.value)}
           </ReactMarkdown>
         ),
       )}

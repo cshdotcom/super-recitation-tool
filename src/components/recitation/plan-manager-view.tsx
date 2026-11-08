@@ -481,7 +481,7 @@ function EditScreen({
                     type="button"
                     onClick={() => setDayDialogRow(i)}
                     aria-label={`设置第${i + 1}次复习时间，当前${dayLabel(d)}`}
-                    className="ml-auto flex h-10 shrink-0 items-center rounded-lg bg-muted px-4 text-base font-medium text-blue-600 transition-colors hover:bg-muted/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className="ml-auto flex h-10 shrink-0 items-center rounded-lg bg-muted px-4 text-base font-medium text-emerald-600 transition-colors hover:bg-muted/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     {dayLabel(d)}
                   </button>

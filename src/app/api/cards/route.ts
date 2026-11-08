@@ -76,6 +76,7 @@ export async function POST(req: NextRequest) {
         title,
         content,
         keywords: JSON.stringify(keywords),
+        ...(typeof body?.categoryId === 'string' ? { categoryId: body.categoryId } : {}),
       },
     })
     return NextResponse.json(serializeCard(card), { status: 201 })

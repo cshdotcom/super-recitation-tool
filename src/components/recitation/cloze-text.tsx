@@ -180,9 +180,10 @@ export function ClozeText({
   const keywordSet = React.useMemo(() => new Set(keywords), [keywords])
 
   // ===========================================================================
-  // 自定义选择菜单 (character-level): captures long-press (touch) + right-click
-  // (desktop), highlights selected 字 spans and shows a floating menu with a
-  // 挖空选中 button — replaces the native selection callout.
+  // 自定义选择菜单 (character-level, 自由选择框): long-press (touch) or
+  // right-click (desktop) starts a selection; two draggable teardrop handles
+  // let the user freely stretch/shrink the selected range (like native mobile
+  // text selection) — the floating menu carries a 挖空选中 button.
   // ===========================================================================
   const menuEnabled = (selectionMode || selectMenuEnabled) && !brushMode
   // 触屏设备才禁用原生选择（用自定义长按选字）；桌面保留原生拖选，
@@ -201,6 +202,13 @@ export function ClozeText({
     text: string
     isKeyword: boolean
   } | null>(null)
+  // 手柄尖端坐标（拖拽时实时更新）；menuOpen=false 时只显示手柄不显示菜单。
+  const [selTips, setSelTips] = React.useState<{
+    start: { x: number; y: number }
+    end: { x: number; y: number }
+  } | null>(null)
+  const [handleDrag, setHandleDrag] = React.useState<'start' | 'end' | null>(null)
+  const handleDragRef = React.useRef<'start' | 'end' | null>(null)
   const selectingRef = React.useRef(false)
   const pressTimerRef = React.useRef<number | null>(null)
   const pressStartRef = React.useRef<{ x: number; y: number } | null>(null)
@@ -220,7 +228,32 @@ export function ClozeText({
     anchorRef.current = -1
     focusRef.current = -1
     setSelHL(new Set())
+    setSelTips(null)
+    setSelMenu(null)
   }, [])
+
+  // 计算选择范围两端的手柄尖端坐标 + 菜单锚点。
+  const computeSelLayout = React.useCallback(
+    (a: number, f: number) => {
+      const els = getCharEls()
+      if (!els.length) return null
+      const lo = Math.max(0, Math.min(a, f))
+      const hi = Math.min(els.length - 1, Math.max(a, f))
+      const r1 = els[lo].getBoundingClientRect()
+      const r2 = els[hi].getBoundingClientRect()
+      const top = Math.min(r1.top, r2.top)
+      const bottom = Math.max(r1.bottom, r2.bottom)
+      const left = Math.min(r1.left, r2.left)
+      const right = Math.max(r1.right, r2.right)
+      return {
+        startTip: { x: left, y: top },
+        endTip: { x: right, y: bottom },
+        bbox: { top, bottom, left, right },
+        above: top > 150,
+      }
+    },
+    [getCharEls],
+  )
 
   const highlightRange = React.useCallback(
     (a: number, f: number) => {
@@ -233,19 +266,39 @@ export function ClozeText({
       anchorRef.current = a
       focusRef.current = f
       setSelHL(s)
+      const layout = computeSelLayout(a, f)
+      if (layout) setSelTips({ start: layout.startTip, end: layout.endTip })
     },
-    [getCharEls],
+    [getCharEls, computeSelLayout],
   )
 
   const extractSelText = React.useCallback(
     (a: number, f: number): string => {
       const els = getCharEls()
+      const root = rootRef.current
+      if (!els.length || !root) return ''
       const lo = Math.max(0, Math.min(a, f))
       const hi = Math.min(els.length - 1, Math.max(a, f))
+      const first = els[lo]
+      const last = els[hi]
+      // 用 TreeWalker 走文本节点：包含选中范围内的标点/空白（data-char 只覆盖字，
+      // 直接拼接会漏掉中间的标点，导致关键词不再是原文连续子串）。
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
       let out = ''
-      for (let i = lo; i <= hi; i++) {
-        const el = els[i]
-        out += el.getAttribute('data-word') ?? el.textContent ?? ''
+      let inRange = false
+      while (walker.nextNode()) {
+        const node = walker.currentNode
+        const parentEl = node.parentElement
+        if (!parentEl) continue
+        if (!inRange) {
+          if (parentEl === first || first.contains(parentEl) || parentEl.contains(first)) {
+            inRange = true
+          } else {
+            continue
+          }
+        }
+        out += node.textContent ?? ''
+        if (parentEl === last || last.contains(parentEl) || parentEl.contains(last)) break
       }
       return out.trim()
     },
@@ -264,13 +317,34 @@ export function ClozeText({
     clearSelHighlight()
   }, [clearSelHighlight])
 
-  const charIdxFromEvent = (e: { clientX: number; clientY: number }): number => {
-    const el = document.elementFromPoint(e.clientX, e.clientY)
+  const charIdxFromPoint = (x: number, y: number): number => {
+    const el = document.elementFromPoint(x, y)
     const charEl = el?.closest('[data-char]') as HTMLElement | null
-    if (!charEl) return -1
+    if (!charEl) {
+      // 命中不到字时，退化为找最近的字（垂直距离优先）——手柄拖出文本区时仍可用。
+      const els = getCharEls()
+      if (!els.length) return -1
+      let best = -1
+      let bestDist = Infinity
+      for (let i = 0; i < els.length; i++) {
+        const r = els[i].getBoundingClientRect()
+        const cx = Math.min(Math.max(x, r.left), r.right)
+        const cy = Math.min(Math.max(y, r.top), r.bottom)
+        const d = Math.hypot(x - cx, y - cy)
+        if (d < bestDist) {
+          bestDist = d
+          best = i
+        }
+      }
+      return bestDist <= 120 ? best : -1
+    }
     const els = getCharEls()
     return els.indexOf(charEl)
   }
+
+  // 兼容旧调用（pointer/右键事件直接取坐标）。
+  const charIdxFromEvent = (e: { clientX: number; clientY: number }): number =>
+    charIdxFromPoint(e.clientX, e.clientY)
 
   const openMenuForRange = React.useCallback(
     (a: number, f: number, at?: { x: number; y: number }) => {
@@ -280,32 +354,35 @@ export function ClozeText({
       if (hi < lo) return
       const text = extractSelText(a, f)
       if (!text) return
-      const r1 = els[lo].getBoundingClientRect()
-      const r2 = els[hi].getBoundingClientRect()
-      const top = Math.min(r1.top, r2.top)
-      const bottom = Math.max(r1.bottom, r2.bottom)
-      const left = Math.min(r1.left, r2.left)
-      const right = Math.max(r1.right, r2.right)
-      const above = top > 96
+      const layout = computeSelLayout(a, f)
+      if (!layout) return
+      const { bbox, above } = layout
+      const SEL_MENU_W = 208
       const x = Math.min(
-        Math.max((left + right) / 2, SEL_MENU_WIDTH / 2 + VIEWPORT_INSET),
-        window.innerWidth - SEL_MENU_WIDTH / 2 - VIEWPORT_INSET,
+        Math.max((bbox.left + bbox.right) / 2, SEL_MENU_W / 2 + VIEWPORT_INSET),
+        window.innerWidth - SEL_MENU_W / 2 - VIEWPORT_INSET,
       )
-      const y = above ? top - 8 : bottom + 8
+      const y = above ? bbox.top - 10 : bbox.bottom + 10
       if (at) {
-        setSelMenu({ x: at.x, y: at.y, above: at.y > window.innerHeight / 2, text, isKeyword: keywordSet.has(text) })
+        setSelMenu({
+          x: at.x,
+          y: at.y,
+          above: at.y > window.innerHeight / 2,
+          text,
+          isKeyword: keywordSet.has(text),
+        })
       } else {
         setSelMenu({ x, y, above, text, isKeyword: keywordSet.has(text) })
       }
     },
-    [extractSelText, getCharEls, keywordSet],
+    [extractSelText, getCharEls, keywordSet, computeSelLayout],
   )
 
-  // ---- pointer flow (touch long-press drag selection) ----
+  // ---- pointer flow (touch long-press → drag selection with handles) ----
   const handleRootPointerDown = (e: React.PointerEvent) => {
     if (!menuEnabled) return
     if (e.pointerType === 'mouse') return // mouse uses right-click
-    if (selMenu) return // menu open: backdrop handles closing
+    if (selMenu || selTips) return // selection active: backdrop handles closing
     const target = e.target as HTMLElement
     // Blanks wrapped by LongPressMenu handle their own long-press menu.
     const inBlank = !!target.closest('[data-word]')
@@ -325,6 +402,7 @@ export function ClozeText({
       }
       selectingRef.current = true
       highlightRange(idx, idx)
+      openMenuForRange(idx, idx)
     }, LONG_PRESS_MS)
   }
 
@@ -360,6 +438,59 @@ export function ClozeText({
     clearPressTimer()
     pressStartRef.current = null
     void e
+  }
+
+  // ---- 自由选择手柄（teardrop）：拖动任意手柄自由拉升/收缩选择范围 ----
+  const HANDLE_BODY_OFFSET = 34 // 手柄身体离尖端的距离
+  const beginHandleDrag = (which: 'start' | 'end') => (e: React.PointerEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    try {
+      ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    } catch {
+      /* noop */
+    }
+    handleDragRef.current = which
+    setHandleDrag(which)
+    setSelMenu(null) // 拖拽期间隐藏菜单，松手再出现
+  }
+  const moveHandleDrag = (which: 'start' | 'end') => (e: React.PointerEvent) => {
+    if (handleDragRef.current !== which) return
+    e.preventDefault()
+    // 手柄身体相对尖端有偏移：start 身体在尖端下方，end 在上方。
+    // 反推尖端坐标 → 用尖端定位字。
+    const tip =
+      which === 'start'
+        ? { x: e.clientX + 6, y: e.clientY - HANDLE_BODY_OFFSET + 4 }
+        : { x: e.clientX - 6, y: e.clientY + HANDLE_BODY_OFFSET - 4 }
+    const idx = charIdxFromPoint(tip.x, tip.y)
+    if (idx < 0) return
+    if (which === 'start' && idx !== anchorRef.current) {
+      highlightRange(idx, focusRef.current)
+    } else if (which === 'end' && idx !== focusRef.current) {
+      highlightRange(anchorRef.current, idx)
+    }
+  }
+  const endHandleDrag = (which: 'start' | 'end') => (e: React.PointerEvent) => {
+    if (handleDragRef.current !== which) return
+    e.preventDefault()
+    handleDragRef.current = null
+    setHandleDrag(null)
+    try {
+      ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+    } catch {
+      /* noop */
+    }
+    const a = anchorRef.current
+    const f = focusRef.current
+    if (a >= 0 && f >= 0) {
+      try {
+        navigator.vibrate?.(15)
+      } catch {
+        /* noop */
+      }
+      openMenuForRange(a, f)
+    }
   }
 
   // ---- right-click (desktop): native selection OR char under cursor ----
@@ -445,11 +576,13 @@ export function ClozeText({
 
   // Global close listeners while the selection menu is open.
   React.useEffect(() => {
-    if (!selMenu) return
+    if (!selMenu && !selTips) return
     const onKey = (ev: KeyboardEvent) => {
       if (ev.key === 'Escape') closeSelMenu()
     }
-    const onScroll = () => closeSelMenu()
+    const onScroll = () => {
+      if (!handleDragRef.current) closeSelMenu()
+    }
     const onResize = () => closeSelMenu()
     window.addEventListener('keydown', onKey)
     window.addEventListener('scroll', onScroll, true)
@@ -459,11 +592,12 @@ export function ClozeText({
       window.removeEventListener('scroll', onScroll, true)
       window.removeEventListener('resize', onResize)
     }
-  }, [selMenu, closeSelMenu])
+  }, [selMenu, selTips, handleDrag, closeSelMenu])
 
   React.useEffect(() => clearPressTimer, [])
 
   const selMenuH = 3 * SEL_ROW_HEIGHT + SEL_MENU_PAD
+  void selMenuH
   const selOriginX = selMenu
     ? selMenu.x > window.innerWidth / 2
       ? 'right'
@@ -474,6 +608,62 @@ export function ClozeText({
       ? 'bottom'
       : 'top'
     : 'top'
+
+  // ---- 自由选择框 portal：手柄 + 浮动菜单 ----
+  const teardropCls =
+    'pointer-events-auto absolute size-6 rounded-full bg-white shadow-[0_2px_10px_rgba(0,0,0,0.35)] ring-1 ring-black/10'
+  const selOverlay = selTips ? (
+    <div
+      className="fixed inset-0 z-[9998]"
+      style={{ pointerEvents: 'none' }}
+      onPointerDown={(e) => {
+        // 点击空白关闭选择（菜单打开时）。
+        if (selMenu && !handleDrag) {
+          e.stopPropagation()
+          closeSelMenu()
+        }
+      }}
+    >
+      {/* start handle — 身体在尖端左下方 */}
+      <div
+        role="button"
+        aria-label="拖动调整选择起点"
+        style={{
+          position: 'fixed',
+          left: selTips.start.x,
+          top: selTips.start.y,
+          transform: `translate(-10px, ${HANDLE_BODY_OFFSET - 10}px)`,
+          touchAction: 'none',
+        }}
+        className={teardropCls}
+        onPointerDown={beginHandleDrag('start')}
+        onPointerMove={moveHandleDrag('start')}
+        onPointerUp={endHandleDrag('start')}
+        onPointerCancel={endHandleDrag('start')}
+      >
+        <span className="absolute left-1/2 top-1/2 size-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-zinc-500" />
+      </div>
+      {/* end handle — 身体在尖端右上方 */}
+      <div
+        role="button"
+        aria-label="拖动调整选择终点"
+        style={{
+          position: 'fixed',
+          left: selTips.end.x,
+          top: selTips.end.y,
+          transform: `translate(-14px, ${-(HANDLE_BODY_OFFSET + 14)}px)`,
+          touchAction: 'none',
+        }}
+        className={teardropCls}
+        onPointerDown={beginHandleDrag('end')}
+        onPointerMove={moveHandleDrag('end')}
+        onPointerUp={endHandleDrag('end')}
+        onPointerCancel={endHandleDrag('end')}
+      >
+        <span className="absolute left-1/2 top-1/2 size-1 -translate-x-1/2 -translate-y-1/2 rounded-full bg-zinc-500" />
+      </div>
+    </div>
+  ) : null
 
   const selMenuPanel = selMenu ? (
     <div
@@ -570,13 +760,13 @@ export function ClozeText({
     if (!brushMode) return
     draggingRef.current = true
     touchedRef.current.clear()
-    // If the drag starts on a 字, blank it immediately.
+    // 挖空刷 = 只刷入不擦除：起点字未挖空则立即挖空（擦除用挖空菜单的取消挖空）。
     const target = e.target as HTMLElement
     const wordEl = target.closest?.('[data-word]') as HTMLElement | null
     if (wordEl?.dataset.word) {
       const w = wordEl.dataset.word
       touchedRef.current.add(w)
-      onToggleKeyword(w)
+      if (!keywordSet.has(w)) onToggleKeyword(w)
     }
   }
 
@@ -586,7 +776,7 @@ export function ClozeText({
     const wordEl = el?.closest('[data-word]') as HTMLElement | null
     if (!wordEl?.dataset.word) return
     const w = wordEl.dataset.word
-    if (touchedRef.current.has(w)) return
+    if (touchedRef.current.has(w) || keywordSet.has(w)) return
     touchedRef.current.add(w)
     onToggleKeyword(w)
   }
@@ -977,6 +1167,7 @@ export function ClozeText({
       onContextMenu={handleRootContextMenu}
     >
       {buildContent()}
+      {selMounted && selOverlay ? createPortal(selOverlay, document.body) : null}
       {selMounted && selMenuPanel ? createPortal(selMenuPanel, document.body) : null}
     </div>
   )

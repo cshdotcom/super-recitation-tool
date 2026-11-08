@@ -13,6 +13,7 @@ import {
   GitBranchPlus,
   Image as ImageIcon,
   List,
+  ListChecks,
   Loader2,
   Network,
   Pencil,
@@ -23,6 +24,7 @@ import {
   Undo2,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { useTheme } from 'next-themes'
 
 import { cn } from '@/lib/utils'
 import { splitParagraphs } from '@/lib/cloze'
@@ -30,6 +32,15 @@ import type { MindNode, MindmapDoc } from '@/lib/types'
 import { LongPressMenu, type MenuAction } from '@/components/recitation/long-press-menu'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -65,6 +76,12 @@ export interface MindmapViewProps {
   cardTitle?: string
   initialDocs?: MindmapDoc[]
   onSaved?: (docs: MindmapDoc[]) => void
+  /** Optional paged text (分页). When present, scopes become 第N页 and
+   *  “按页生成” can create one map per page. Falls back to chunks, then to
+   *  paragraph splitting of content. */
+  pages?: string[]
+  /** Optional chunked text (分块). Used like pages with 第N块 labels. */
+  chunks?: string[]
   /** Full override of the node context menu actions. */
   menuActions?: MenuAction[]
   /** Fallback for custom keys when menuActions is overridden. */
@@ -73,13 +90,19 @@ export interface MindmapViewProps {
 
 // ---------- constants ----------
 
-const COL_W = 176 // node pill width
+const PAD = 20 // canvas padding
 const GAP = 44 // horizontal gap between depth columns
-const ROW_H = 48 // vertical stride per leaf row
-const NODE_H = 36
-const PAD = 20
+const V_GAP = 12 // vertical gap between sibling subtrees
+const NODE_H = 36 // single-line node height
+const NODE_LINE_H = 19 // line height for wrapped node text
+const NODE_PAD_X = 24 // horizontal padding inside a node
+const MAX_NODE_W = 240 // wrap width cap — longer titles wrap instead of ellipsis
+const MIN_NODE_W = 88 // minimum node pill width
 
 const INK_COLORS = ['#18181b', '#6b7280', '#059669', '#dc2626', '#d97706', '#9333ea']
+
+/** Safeguard for auto-per-unit generation (AI cost control). */
+const MAX_AUTO_UNITS = 20
 
 const EDIT_TOOLS: { key: string; label: string; icon: React.ComponentType<{ className?: string; strokeWidth?: number }> }[] = [
   { key: 'sibling', label: '添加同级', icon: Plus },
@@ -114,11 +137,6 @@ function fmtTime(iso?: string): string {
   return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`
 }
 
-function truncateTitle(s: string, max = 12): string {
-  const chars = Array.from(s)
-  return chars.length > max ? chars.slice(0, max - 1).join('') + '…' : s
-}
-
 function escapeXml(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -126,6 +144,79 @@ function escapeXml(s: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&apos;')
+}
+
+// ---------- node text measurement (adaptive width + wrapping) ----------
+
+/** Approximate glyph advance: CJK/fullwidth ≈ 1em, everything else ≈ 0.62em. */
+function charW(ch: string, fontSize: number): number {
+  const code = ch.codePointAt(0) ?? 0
+  return code > 0x2e7f ? fontSize : fontSize * 0.62
+}
+
+function textWidth(s: string, fontSize: number): number {
+  let w = 0
+  for (const ch of s) w += charW(ch, fontSize)
+  return w
+}
+
+/** Greedy character wrap (CJK text has no spaces) into lines fitting inner px. */
+function wrapText(title: string, fontSize: number, inner: number): string[] {
+  const lines: string[] = []
+  let cur = ''
+  let curW = 0
+  for (const ch of title) {
+    const w = charW(ch, fontSize)
+    if (cur && curW + w > inner) {
+      lines.push(cur)
+      cur = ch
+      curW = w
+    } else {
+      cur += ch
+      curW += w
+    }
+  }
+  lines.push(cur)
+  return lines
+}
+
+function nodeFontSize(isRoot: boolean, st?: NodeStyle): number {
+  if (isRoot) return 14
+  if (st?.size === 'sm') return 12
+  if (st?.size === 'lg') return 15
+  return 13
+}
+
+interface MeasuredNode {
+  w: number
+  h: number
+  lines: string[]
+  fs: number
+}
+
+/** Node box size: width fits the longest wrapped line (up to MAX_NODE_W),
+ *  height grows with the number of lines. Full text always visible. */
+function measureNode(title: string, isRoot: boolean, st?: NodeStyle): MeasuredNode {
+  const fs = nodeFontSize(isRoot, st)
+  const lines = wrapText(title, fs, MAX_NODE_W - NODE_PAD_X)
+  const widest = Math.max(
+    ...lines.map((l) => textWidth(l, fs)),
+    MIN_NODE_W - NODE_PAD_X,
+  )
+  return {
+    w: Math.min(MAX_NODE_W, Math.ceil(widest) + NODE_PAD_X),
+    h: Math.max(NODE_H, lines.length * NODE_LINE_H + (NODE_H - NODE_LINE_H)),
+    lines,
+    fs,
+  }
+}
+
+/** Dark ink (#18181b) is unreadable on dark-mode cards — fall back to the
+ *  theme's default text color there. Sepia/green themes keep it. */
+function effectiveInk(color?: string, isDark?: boolean): string | undefined {
+  if (!color) return undefined
+  if (isDark && color.toLowerCase() === '#18181b') return undefined
+  return color
 }
 
 function downloadBlob(blob: Blob, filename: string) {
@@ -219,6 +310,10 @@ interface LayoutNode {
   depth: number
   x: number
   y: number // vertical center
+  w: number
+  h: number
+  lines: string[]
+  fs: number
   isRoot: boolean
 }
 
@@ -237,44 +332,94 @@ interface TreeLayout {
   height: number
 }
 
-function computeLayout(root: MindNode): TreeLayout {
-  const nodes: LayoutNode[] = []
-  const centers = new Map<string, { x: number; y: number }>()
+/** Tidy horizontal tree layout with adaptive node sizes.
+ *  • Every node is measured (wrapped lines → width up to MAX_NODE_W, height
+ *    grows with line count) so long titles wrap instead of being truncated.
+ *  • Columns are as wide as the widest node at that depth.
+ *  • Each subtree gets a disjoint vertical band (≥ its own height), so nodes
+ *    never overlap; parent centers sit in the middle of their band.
+ *  • Links connect the parent's right edge to the child's left edge, so
+ *    endpoints follow the real node sizes. */
+function computeLayout(root: MindNode, styles?: Record<string, NodeStyle>): TreeLayout {
+  const sizes = new Map<string, MeasuredNode>()
   const parentOf = new Map<string, string>()
-  let row = 0
-  let maxDepth = 0
-  const xOf = (depth: number) => PAD + depth * (COL_W + GAP)
 
-  const walk = (n: MindNode, depth: number): number => {
-    maxDepth = Math.max(maxDepth, depth)
-    const kids = n.children ?? []
-    let cy: number
-    if (kids.length === 0) {
-      cy = PAD + row * ROW_H + ROW_H / 2
-      row += 1
-    } else {
-      const cs = kids.map((k) => walk(k, depth + 1))
-      cy = (cs[0] + cs[cs.length - 1]) / 2
+  const preWalk = (n: MindNode, depth: number) => {
+    sizes.set(n.id, measureNode(n.title, depth === 0, styles?.[n.id]))
+    for (const k of n.children ?? []) {
+      parentOf.set(k.id, n.id)
+      preWalk(k, depth + 1)
     }
-    for (const k of kids) parentOf.set(k.id, n.id)
-    centers.set(n.id, { x: xOf(depth), y: cy })
-    nodes.push({ id: n.id, title: n.title, depth, x: xOf(depth), y: cy, isRoot: depth === 0 })
-    return cy
   }
-  walk(root, 0)
+  preWalk(root, 0)
 
+  // widest node per depth column
+  const colW = new Map<number, number>()
+  const walkW = (n: MindNode, depth: number) => {
+    colW.set(depth, Math.max(colW.get(depth) ?? 0, sizes.get(n.id)!.w))
+    for (const k of n.children ?? []) walkW(k, depth + 1)
+  }
+  walkW(root, 0)
+
+  const xOf = (depth: number): number => {
+    let x = PAD
+    for (let d = 0; d < depth; d += 1) x += (colW.get(d) ?? 0) + GAP
+    return x
+  }
+
+  // subtree height: own height or the children's stacked height, whichever larger
+  const subH = (n: MindNode): number => {
+    const s = sizes.get(n.id)!
+    if (!n.children || n.children.length === 0) return s.h
+    const kidsSum =
+      n.children.reduce((acc, k) => acc + subH(k), 0) + V_GAP * (n.children.length - 1)
+    return Math.max(s.h, kidsSum)
+  }
+
+  const nodes: LayoutNode[] = []
+  const place = (n: MindNode, depth: number, top: number) => {
+    const s = sizes.get(n.id)!
+    const total = subH(n)
+    const cy = top + total / 2
+    nodes.push({
+      id: n.id,
+      title: n.title,
+      depth,
+      x: xOf(depth),
+      y: cy,
+      w: s.w,
+      h: s.h,
+      lines: s.lines,
+      fs: s.fs,
+      isRoot: depth === 0,
+    })
+    if (n.children && n.children.length > 0) {
+      const kidsSum =
+        n.children.reduce((acc, k) => acc + subH(k), 0) + V_GAP * (n.children.length - 1)
+      let kt = top + (total - kidsSum) / 2
+      for (const k of n.children) {
+        place(k, depth + 1, kt)
+        kt += subH(k) + V_GAP
+      }
+    }
+  }
+  place(root, 0, PAD)
+
+  const centerOf = new Map(nodes.map((n) => [n.id, n] as const))
   const links: LayoutLink[] = []
   for (const n of nodes) {
     const pid = parentOf.get(n.id)
     if (!pid) continue
-    const pc = centers.get(pid)!
-    links.push({ x1: pc.x + COL_W, y1: pc.y, x2: n.x, y2: n.y, depth: n.depth })
+    const p = centerOf.get(pid)!
+    links.push({ x1: p.x + p.w, y1: p.y, x2: n.x, y2: n.y, depth: n.depth })
   }
+
+  const contentW = nodes.reduce((acc, n) => Math.max(acc, n.x + n.w), 0)
   return {
     nodes,
     links,
-    width: PAD * 2 + maxDepth * (COL_W + GAP) + COL_W,
-    height: Math.max(PAD * 2 + row * ROW_H, ROW_H + PAD * 2),
+    width: Math.max(contentW + PAD, PAD * 2 + MIN_NODE_W),
+    height: Math.max(PAD * 2 + subH(root), NODE_H + PAD * 2),
   }
 }
 
@@ -294,14 +439,21 @@ function buildMapSvg(doc: StyledMindmapDoc, layout: TreeLayout): string {
     const fill = n.isRoot ? '#18181b' : '#ffffff'
     const stroke = n.isRoot ? '#18181b' : '#d4d4d8'
     const color = n.isRoot ? '#ffffff' : st?.color || '#18181b'
-    const fs = st?.size === 'sm' ? 11 : st?.size === 'lg' ? 15 : 13
+    const fs = n.fs
     const fw = st?.bold || n.isRoot ? 600 : 400
     const rx = n.isRoot ? 18 : 12
     parts.push(
-      `<rect x="${n.x}" y="${n.y - NODE_H / 2}" width="${COL_W}" height="${NODE_H}" rx="${rx}" fill="${fill}" stroke="${stroke}" stroke-width="1.5"/>`,
+      `<rect x="${n.x}" y="${n.y - n.h / 2}" width="${n.w}" height="${n.h}" rx="${rx}" fill="${fill}" stroke="${stroke}" stroke-width="1.5"/>`,
     )
+    // wrapped full text — one tspan per line, vertically centered
+    const tspans = n.lines
+      .map(
+        (ln, i) =>
+          `<tspan x="${n.x + n.w / 2}" y="${(n.y + (i - (n.lines.length - 1) / 2) * NODE_LINE_H).toFixed(1)}" dominant-baseline="central">${escapeXml(ln)}</tspan>`,
+      )
+      .join('')
     parts.push(
-      `<text x="${n.x + COL_W / 2}" y="${n.y}" text-anchor="middle" dominant-baseline="central" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="${fs}" font-weight="${fw}" fill="${color}">${escapeXml(truncateTitle(n.title))}</text>`,
+      `<text text-anchor="middle" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" font-size="${fs}" font-weight="${fw}" fill="${color}">${tspans}</text>`,
     )
   }
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${layout.width}" height="${layout.height}" viewBox="0 0 ${layout.width} ${layout.height}">${parts.join('')}</svg>`
@@ -345,9 +497,13 @@ export function MindmapView({
   cardTitle,
   initialDocs,
   onSaved,
+  pages,
+  chunks,
   menuActions,
   onMenuAction,
 }: MindmapViewProps) {
+  const { resolvedTheme } = useTheme()
+  const isDark = resolvedTheme === 'dark'
   const [docs, setDocs] = React.useState<StyledMindmapDoc[]>(() => (initialDocs ?? []).map(normalizeDoc))
   const [view, setView] = React.useState<'home' | 'map'>('home')
   const [docId, setDocId] = React.useState<string | null>(null)
@@ -363,6 +519,10 @@ export function MindmapView({
   const [newOpen, setNewOpen] = React.useState(false)
   const [newScope, setNewScope] = React.useState('全文')
   const [newLevels, setNewLevels] = React.useState<2 | 3>(2)
+  /** single = one map for the chosen scope; each = one map per page/chunk;
+   *  merge = per-page/chunk branches merged under one 全文 root. */
+  const [newSplit, setNewSplit] = React.useState<'single' | 'each' | 'merge'>('single')
+  const [generating, setGenerating] = React.useState(false)
   const [extendOpen, setExtendOpen] = React.useState(false)
   const [extendSel, setExtendSel] = React.useState<Set<string>>(new Set())
   const [extending, setExtending] = React.useState(false)
@@ -370,6 +530,12 @@ export function MindmapView({
   const [exportOpen, setExportOpen] = React.useState(false)
   const [exporting, setExporting] = React.useState<string | null>(null)
   const [confirmDeleteId, setConfirmDeleteId] = React.useState<string | null>(null)
+  // rename + batch-delete (list sheet)
+  const [renameId, setRenameId] = React.useState<string | null>(null)
+  const [renameTitle, setRenameTitle] = React.useState('')
+  const [batchMode, setBatchMode] = React.useState(false)
+  const [batchSel, setBatchSel] = React.useState<Set<string>>(new Set())
+  const [confirmBatch, setConfirmBatch] = React.useState(false)
 
   const cancelEditRef = React.useRef(false)
   const saveTimerRef = React.useRef<number | null>(null)
@@ -720,20 +886,76 @@ export function MindmapView({
     toast.success('已删除导图')
   }
 
+  /** Rename a saved map (list sheet → pencil icon → Dialog). */
+  const renameDoc = (id: string, title: string) => {
+    const t = title.trim()
+    if (!t) {
+      toast.error('名称不能为空')
+      return
+    }
+    const next = docsRef.current.map((d) =>
+      d.id === id ? { ...d, title: t, updatedAt: new Date().toISOString() } : d,
+    )
+    setDocsAndSave(next)
+    setRenameId(null)
+    toast.success('已重命名')
+  }
+
+  const openRenameDialog = (doc: StyledMindmapDoc) => {
+    setRenameTitle(doc.title)
+    setRenameId(doc.id)
+  }
+
+  const toggleBatchDoc = (id: string) => {
+    setBatchSel((prev) => {
+      const n = new Set(prev)
+      if (n.has(id)) n.delete(id)
+      else n.add(id)
+      return n
+    })
+  }
+
+  const deleteDocsBatch = () => {
+    const ids = batchSel
+    if (ids.size === 0) return
+    const next = docsRef.current.filter((d) => !ids.has(d.id))
+    setDocsAndSave(next)
+    if (docIdRef.current && ids.has(docIdRef.current)) closeDoc()
+    setBatchSel(new Set())
+    setBatchMode(false)
+    setConfirmBatch(false)
+    toast.success(`已删除 ${ids.size} 张导图`)
+  }
+
   // ---------- scope options / 新建 / 扩展 ----------
 
-  const chunks = React.useMemo(() => splitParagraphs(content), [content])
+  const paragraphs = React.useMemo(() => splitParagraphs(content), [content])
   const hasContent = content.trim().length > 0
+
+  /** Per-unit generation source: pages (第N页) when provided, else chunks
+   *  (第N块), else paragraph splits (第N段) as before. */
+  const unitWord: '页' | '块' | '段' =
+    pages && pages.length > 0 ? '页' : chunks && chunks.length > 0 ? '块' : '段'
+
+  const unitOptions = React.useMemo(() => {
+    const src =
+      pages && pages.length > 0
+        ? pages
+        : chunks && chunks.length > 0
+          ? chunks
+          : paragraphs
+    return src
+      .map((t, i) => ({ label: `第${i + 1}${unitWord}`, text: (t ?? '').trim(), preview: (t ?? '').trim().slice(0, 40) }))
+      .filter((o) => o.text.length > 0)
+  }, [pages, chunks, paragraphs, unitWord])
 
   const scopeOptions = React.useMemo(() => {
     const opts: { label: string; text: string; preview: string }[] = [
       { label: '全文', text: content.trim(), preview: content.trim().slice(0, 40) },
     ]
-    chunks.forEach((c, i) => {
-      opts.push({ label: `第${i + 1}段`, text: c, preview: c.slice(0, 40) })
-    })
+    unitOptions.forEach((o) => opts.push(o))
     return opts
-  }, [content, chunks])
+  }, [content, unitOptions])
 
   const genMindmap = async (text: string): Promise<MindNode> => {
     const res = await fetch('/api/mindmap', {
@@ -751,11 +973,83 @@ export function MindmapView({
   }
 
   const createNewMap = async () => {
+    if (newSplit !== 'single') {
+      // ---- 按页/块分别生成：each = 每个单元一张图；merge = 合并为一张全览图 ----
+      if (unitOptions.length === 0) {
+        toast.error('没有可用的分页/分块内容')
+        return
+      }
+      const list = unitOptions.slice(0, MAX_AUTO_UNITS)
+      if (unitOptions.length > MAX_AUTO_UNITS) {
+        toast.warning(`单元过多，仅生成前 ${MAX_AUTO_UNITS} 个`)
+      }
+      setGenerating(true)
+      const tid = toast.loading(`正在生成 0/${list.length} …`)
+      try {
+        const now = new Date().toISOString()
+        if (newSplit === 'each') {
+          const created: StyledMindmapDoc[] = []
+          for (let i = 0; i < list.length; i += 1) {
+            toast.loading(`正在生成 ${i + 1}/${list.length}：${list[i].label} …`, { id: tid })
+            const root = await genMindmap(list[i].text)
+            created.push({
+              id: uid(),
+              title: cardTitle
+                ? `${cardTitle}${mmdd()}·${list[i].label}`
+                : `${root.title || '导图'}${mmdd()}·${list[i].label}`,
+              scope: list[i].label,
+              levels: newLevels,
+              root,
+              createdAt: now,
+              updatedAt: now,
+              styles: {},
+              scopes: [list[i].label],
+            })
+          }
+          setDocsAndSave([...created, ...docsRef.current])
+          toast.success(`已生成 ${created.length} 张导图`, { id: tid })
+          setNewOpen(false)
+        } else {
+          const children: MindNode[] = []
+          for (let i = 0; i < list.length; i += 1) {
+            toast.loading(`正在生成 ${i + 1}/${list.length}：${list[i].label} …`, { id: tid })
+            children.push(await genMindmap(list[i].text))
+          }
+          const root: MindNode = {
+            id: uid(),
+            title: cardTitle || '全文',
+            children,
+          }
+          const doc: StyledMindmapDoc = {
+            id: uid(),
+            title: cardTitle ? `${cardTitle}${mmdd()}·全览` : `全览${mmdd()}`,
+            scope: '全文',
+            levels: newLevels + 1,
+            root,
+            createdAt: now,
+            updatedAt: now,
+            styles: {},
+            scopes: ['全文', ...list.map((u) => u.label)],
+          }
+          setDocsAndSave([doc, ...docsRef.current])
+          toast.success('全览导图已生成', { id: tid })
+          setNewOpen(false)
+          openDoc(doc.id, true)
+        }
+      } catch (err) {
+        toast.error('生成思维导图失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+      } finally {
+        setGenerating(false)
+      }
+      return
+    }
+    // ---- 单张导图（原有流程）----
     const opt = scopeOptions.find((o) => o.label === newScope)
     if (!opt || !opt.text) {
       toast.error('所选范围内容为空')
       return
     }
+    setGenerating(true)
     const tid = toast.loading('AI 正在梳理知识结构…')
     try {
       const root = await genMindmap(opt.text)
@@ -778,6 +1072,8 @@ export function MindmapView({
       openDoc(doc.id, true)
     } catch (err) {
       toast.error('生成思维导图失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+    } finally {
+      setGenerating(false)
     }
   }
 
@@ -828,7 +1124,10 @@ export function MindmapView({
 
   // ---------- export ----------
 
-  const layout = React.useMemo(() => (currentDoc ? computeLayout(currentDoc.root) : null), [currentDoc])
+  const layout = React.useMemo(
+    () => (currentDoc ? computeLayout(currentDoc.root, currentDoc.styles) : null),
+    [currentDoc],
+  )
 
   const runExport = async (kind: 'png' | 'pdf' | 'xmind') => {
     const doc = getDoc()
@@ -1023,37 +1322,70 @@ export function MindmapView({
         {/* 新建导图 sheet */}
         <BottomSheet open={newOpen} onOpenChange={setNewOpen} title="选择范围">
           <div className="space-y-4 pt-2">
-            <div className="max-h-64 space-y-2 overflow-y-auto">
-              {scopeOptions.map((o) => {
-                const sel = newScope === o.label
-                return (
+            <div>
+              <div className="mb-2 text-sm font-medium">生成方式</div>
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  { key: 'single' as const, label: '单张导图' },
+                  { key: 'each' as const, label: `按${unitWord}逐张` },
+                  { key: 'merge' as const, label: `按${unitWord}合并` },
+                ]).map((m) => (
                   <button
-                    key={o.label}
+                    key={m.key}
                     type="button"
-                    onClick={() => setNewScope(o.label)}
+                    onClick={() => setNewSplit(m.key)}
                     className={cn(
-                      'flex w-full items-center gap-3 rounded-2xl border p-3 text-left transition-colors',
-                      sel ? 'border-emerald-600 bg-emerald-50 dark:bg-emerald-500/10' : 'border-border bg-card hover:bg-accent/60',
+                      'h-10 rounded-2xl border px-1 text-xs font-medium leading-tight transition-colors',
+                      newSplit === m.key
+                        ? 'border-emerald-600 bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-400'
+                        : 'border-border bg-card text-muted-foreground hover:bg-accent',
                     )}
                   >
-                    <span
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+              {newSplit !== 'single' && (
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  {newSplit === 'each'
+                    ? `每个${unitWord}各生成一张独立导图（共 ${unitOptions.length} 个${unitWord}）`
+                    : `每个${unitWord}生成一棵子树，合并为一张全览导图（共 ${unitOptions.length} 个${unitWord}）`}
+                </p>
+              )}
+            </div>
+            {newSplit === 'single' && (
+              <div className="max-h-64 space-y-2 overflow-y-auto">
+                {scopeOptions.map((o) => {
+                  const sel = newScope === o.label
+                  return (
+                    <button
+                      key={o.label}
+                      type="button"
+                      onClick={() => setNewScope(o.label)}
                       className={cn(
-                        'flex size-5 shrink-0 items-center justify-center rounded-full border',
-                        sel ? 'border-emerald-600 bg-emerald-600 text-white' : 'border-muted-foreground/40',
+                        'flex w-full items-center gap-3 rounded-2xl border p-3 text-left transition-colors',
+                        sel ? 'border-emerald-600 bg-emerald-50 dark:bg-emerald-500/10' : 'border-border bg-card hover:bg-accent/60',
                       )}
                     >
-                      {sel && <Check className="size-3" strokeWidth={3} />}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-sm font-medium">{o.label}</span>
-                      <span className="block truncate text-xs text-muted-foreground">
-                        {o.preview || '（空）'}
+                      <span
+                        className={cn(
+                          'flex size-5 shrink-0 items-center justify-center rounded-full border',
+                          sel ? 'border-emerald-600 bg-emerald-600 text-white' : 'border-muted-foreground/40',
+                        )}
+                      >
+                        {sel && <Check className="size-3" strokeWidth={3} />}
                       </span>
-                    </span>
-                  </button>
-                )
-              })}
-            </div>
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-sm font-medium">{o.label}</span>
+                        <span className="block truncate text-xs text-muted-foreground">
+                          {o.preview || '（空）'}
+                        </span>
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+            )}
             <div>
               <div className="mb-2 text-sm font-medium">层级</div>
               <div className="grid grid-cols-2 gap-2">
@@ -1077,54 +1409,190 @@ export function MindmapView({
             <button
               type="button"
               onClick={createNewMap}
-              disabled={!hasContent || !newScope}
-              className="h-11 w-full rounded-full bg-emerald-600 text-sm font-semibold text-white shadow-lg transition-all hover:bg-emerald-700 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40"
+              disabled={!hasContent || generating || (newSplit === 'single' && !newScope)}
+              className="flex h-11 w-full items-center justify-center gap-2 rounded-full bg-emerald-600 text-sm font-semibold text-white shadow-lg transition-all hover:bg-emerald-700 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40"
             >
-              下一步
+              {generating && <Loader2 className="size-4 animate-spin" />}
+              {generating ? '生成中…' : '下一步'}
             </button>
           </div>
         </BottomSheet>
 
         {/* 导图列表 sheet */}
-        <BottomSheet open={listOpen} onOpenChange={setListOpen} title="导图列表">
+        <BottomSheet
+          open={listOpen}
+          onOpenChange={(o) => {
+            setListOpen(o)
+            if (!o) {
+              // leaving the list resets batch state
+              setBatchMode(false)
+              setBatchSel(new Set())
+            }
+          }}
+          title="导图列表"
+        >
+          {/* list toolbar: batch management / select-all / batch delete */}
+          {sortedDocs.length > 0 && (
+            <div className="flex items-center justify-between border-b border-border pb-2 pt-2">
+              {batchMode ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setBatchSel((prev) =>
+                        prev.size === sortedDocs.length
+                          ? new Set()
+                          : new Set(sortedDocs.map((d) => d.id)),
+                      )
+                    }
+                    className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    {batchSel.size === sortedDocs.length ? '取消全选' : '全选'}
+                  </button>
+                  <span className="text-xs text-muted-foreground">已选 {batchSel.size} 张</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (batchSel.size > 0) setConfirmBatch(true)
+                    }}
+                    disabled={batchSel.size === 0}
+                    className="flex items-center gap-1 text-xs font-medium text-red-600 transition-colors hover:text-red-700 disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    <Trash2 className="size-3.5" strokeWidth={1.75} />
+                    批量删除
+                  </button>
+                </>
+              ) : (
+                <>
+                  <span className="text-xs text-muted-foreground">共 {sortedDocs.length} 张</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBatchMode(true)
+                      setBatchSel(new Set())
+                    }}
+                    className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    <ListChecks className="size-3.5" strokeWidth={1.75} />
+                    批量管理
+                  </button>
+                </>
+              )}
+            </div>
+          )}
           <div className="max-h-96 space-y-2 overflow-y-auto pt-2">
-            {sortedDocs.map((d) => (
-              <div
-                key={d.id}
-                className="flex items-center gap-3 rounded-2xl border border-border bg-card p-3"
-              >
-                <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-600">
-                  <Network className="size-4" strokeWidth={1.75} />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">{d.title}</div>
-                  <div className="truncate text-xs text-muted-foreground">
-                    范围 {d.scope ?? '全文'} · {d.levels ?? 2}级
-                    {d.updatedAt ? ` · ${fmtTime(d.updatedAt)}` : ''}
+            {sortedDocs.map((d) => {
+              const checked = batchSel.has(d.id)
+              return (
+                <div
+                  key={d.id}
+                  role={batchMode ? 'button' : undefined}
+                  onClick={batchMode ? () => toggleBatchDoc(d.id) : undefined}
+                  className={cn(
+                    'flex items-center gap-3 rounded-2xl border p-3 transition-colors',
+                    batchMode
+                      ? checked
+                        ? 'cursor-pointer border-emerald-600 bg-emerald-50 dark:bg-emerald-500/10'
+                        : 'cursor-pointer border-border bg-card hover:bg-accent/60'
+                      : 'border-border bg-card',
+                  )}
+                >
+                  {batchMode ? (
+                    <Checkbox
+                      checked={checked}
+                      onCheckedChange={() => toggleBatchDoc(d.id)}
+                      onClick={(e) => e.stopPropagation()}
+                      className="shrink-0"
+                      aria-label={`选择 ${d.title}`}
+                    />
+                  ) : (
+                    <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-600">
+                      <Network className="size-4" strokeWidth={1.75} />
+                    </span>
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-medium">{d.title}</div>
+                    <div className="truncate text-xs text-muted-foreground">
+                      范围 {d.scope ?? '全文'} · {d.levels ?? 2}级
+                      {d.updatedAt ? ` · ${fmtTime(d.updatedAt)}` : ''}
+                    </div>
                   </div>
+                  {!batchMode && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => openRenameDialog(d)}
+                        aria-label={`重命名 ${d.title}`}
+                        className="flex size-8 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:border-emerald-500/60 hover:text-emerald-600"
+                      >
+                        <Pencil className="size-3.5" strokeWidth={1.75} />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openDoc(d.id)}
+                        className="shrink-0 rounded-full bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-emerald-700"
+                      >
+                        打开
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteId(d.id)}
+                        aria-label={`删除 ${d.title}`}
+                        className="flex size-8 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:border-red-300 hover:text-red-600"
+                      >
+                        <Trash2 className="size-3.5" strokeWidth={1.75} />
+                      </button>
+                    </>
+                  )}
                 </div>
-                <button
-                  type="button"
-                  onClick={() => openDoc(d.id)}
-                  className="shrink-0 rounded-full bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-emerald-700"
-                >
-                  打开
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setConfirmDeleteId(d.id)}
-                  className="shrink-0 rounded-full border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-red-300 hover:text-red-600"
-                >
-                  删除
-                </button>
-              </div>
-            ))}
+              )
+            })}
             {sortedDocs.length === 0 && (
               <div className="py-10 text-center text-sm text-muted-foreground">还没有保存的导图</div>
             )}
           </div>
 
-          {/* delete confirm dialog */}
+          {/* rename dialog */}
+          <Dialog
+            open={renameId !== null}
+            onOpenChange={(o) => {
+              if (!o) setRenameId(null)
+            }}
+          >
+            <DialogContent className="max-w-sm rounded-2xl">
+              <DialogHeader>
+                <DialogTitle>重命名导图</DialogTitle>
+              </DialogHeader>
+              <Input
+                autoFocus
+                value={renameTitle}
+                onChange={(e) => setRenameTitle(e.target.value)}
+                placeholder="导图名称"
+                aria-label="导图名称"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    if (renameId) renameDoc(renameId, renameTitle)
+                  }
+                }}
+              />
+              <DialogFooter className="gap-2">
+                <Button variant="outline" onClick={() => setRenameId(null)}>
+                  取消
+                </Button>
+                <Button
+                  onClick={() => {
+                    if (renameId) renameDoc(renameId, renameTitle)
+                  }}
+                  className="rounded-full bg-emerald-600 text-white hover:bg-emerald-700"
+                >
+                  保存
+                </Button>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+
+          {/* single delete confirm dialog */}
           <AlertDialog
             open={confirmDeleteId !== null}
             onOpenChange={(o) => {
@@ -1147,6 +1615,32 @@ export function MindmapView({
                     if (confirmDeleteId) deleteDoc(confirmDeleteId)
                     setConfirmDeleteId(null)
                   }}
+                  className="bg-red-600 text-white hover:bg-red-700"
+                >
+                  删除
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+
+          {/* batch delete confirm dialog */}
+          <AlertDialog
+            open={confirmBatch}
+            onOpenChange={(o) => {
+              if (!o) setConfirmBatch(false)
+            }}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>批量删除导图</AlertDialogTitle>
+                <AlertDialogDescription>
+                  确定删除已选的 {batchSel.size} 张导图吗？删除后无法恢复。
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>取消</AlertDialogCancel>
+                <AlertDialogAction
+                  onClick={deleteDocsBatch}
                   className="bg-red-600 text-white hover:bg-red-700"
                 >
                   删除
@@ -1279,11 +1773,19 @@ export function MindmapView({
               const st = styleOf(n.id)
               const isSel = selectedId === n.id
               const isEditing = editingId === n.id
+              const ink = effectiveInk(st?.color, isDark)
               return (
                 <div
                   key={n.id}
                   className="absolute z-10"
-                  style={{ left: n.x, top: n.y - NODE_H / 2, width: COL_W }}
+                  style={{
+                    left: n.x,
+                    top: n.y - n.h / 2,
+                    width: n.w,
+                    // minHeight (instead of fixed height) lets real font
+                    // metrics add a wrap line without clipping
+                    minHeight: n.h,
+                  }}
                 >
                   <LongPressMenu
                     actions={nodeMenuActions(n.id)}
@@ -1304,15 +1806,17 @@ export function MindmapView({
                         startEdit(n.id)
                       }}
                       className={cn(
-                        'flex h-9 w-full items-center px-3 text-left shadow-sm transition-all',
+                        'flex min-h-full w-full flex-col items-center justify-center px-3 py-1.5 text-center shadow-sm transition-all',
                         n.isRoot
-                          ? 'rounded-full bg-zinc-900 text-sm font-semibold text-white hover:bg-zinc-800'
+                          ? n.h <= NODE_H + 4
+                            ? 'rounded-full bg-zinc-900 text-sm font-semibold text-white hover:bg-zinc-800'
+                            : 'rounded-2xl bg-zinc-900 text-sm font-semibold text-white hover:bg-zinc-800'
                           : 'rounded-xl border border-border bg-card hover:border-emerald-500/40',
                         !n.isRoot && (st?.size === 'sm' ? 'text-xs' : st?.size === 'lg' ? 'text-sm' : 'text-[13px]'),
                         !n.isRoot && st?.bold && 'font-bold',
                         isSel && 'ring-2 ring-emerald-600 ring-offset-1 ring-offset-background',
                       )}
-                      style={!n.isRoot && st?.color ? { color: st.color } : undefined}
+                      style={!n.isRoot && ink ? { color: ink } : undefined}
                     >
                       {isEditing ? (
                         <input
@@ -1336,7 +1840,10 @@ export function MindmapView({
                           aria-label="编辑节点文字"
                         />
                       ) : (
-                        <span className="block w-full truncate">{n.title}</span>
+                        // full title — wraps instead of ellipsis
+                        <span className="block w-full whitespace-pre-wrap break-words leading-snug">
+                          {n.title}
+                        </span>
                       )}
                     </button>
                   </LongPressMenu>

@@ -25,7 +25,7 @@ function statusInfo(
       return { text: '已掌握', cls: 'text-emerald-600' }
     case 'fuzzy':
     case 'forget':
-      return { text: `复习中(${chapters}章)`, cls: 'text-indigo-600' }
+      return { text: `复习中(${chapters}章)`, cls: 'text-emerald-600' }
     default:
       return { text: '未复习', cls: 'text-muted-foreground' }
   }

@@ -60,6 +60,7 @@ import { PlanDialog } from '@/components/recitation/plan-dialog'
 import { ProgressSheet } from '@/components/recitation/progress-sheet'
 import { ReviewScoreBar } from '@/components/recitation/review-score-bar'
 import { ShareDialog } from '@/components/recitation/share-dialog'
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import NextDynamic from 'next/dynamic'
 
 // 重组件懒加载：拆小首页/阅读页的编译图，避免 dev 编译内存峰值过高。
@@ -132,6 +133,7 @@ const QUICK_CHIPS = [
   { key: 'brush', label: '挖空刷', icon: Highlighter },
   { key: 'manualCloze', label: '手动挖空', icon: Baseline },
   { key: 'ruleCloze', label: '规则挖空', icon: SquareSlash },
+  { key: 'reviewMode', label: '复习模式', icon: Repeat2 },
 ] as const
 
 const TOOL_BUTTONS = [
@@ -194,6 +196,16 @@ export function ReaderView({
   const kwFutureRef = React.useRef<string[][]>([])
   // 编辑模式内的挖空刷开关（不改变 mode，避免退出编辑器）
   const [editorBrush, setEditorBrush] = React.useState(false)
+  // 复习模式：熟悉/模糊/忘记 评分条只在复习时出现
+  const [reviewMode, setReviewMode] = React.useState(false)
+  // TTS 全屏播放器 Sheet
+  const [ttsOpen, setTtsOpen] = React.useState(false)
+  // 眼睛悬浮球位置（可拖动，localStorage 记忆）
+  const [eyePos, setEyePos] = useLocalStorage<{ x: number; y: number } | null>(
+    'eyeFabPos',
+    null,
+  )
+  const eyeDragRef = React.useRef<{ startX: number; startY: number; moved: boolean } | null>(null)
   // 进入卡片时间（评分时长上报用）
   const enterTimeRef = React.useRef<number>(Date.now())
 
@@ -310,6 +322,11 @@ export function ReaderView({
     (text: string) => {
       const t = text.trim()
       if (!t) return
+      // 必须是原文连续子串（含标点），否则无法渲染成挖空
+      if (!card.content.includes(t)) {
+        toast.error('选择包含不连续内容，请重新选择连续的文字')
+        return
+      }
       if (card.keywords.includes(t)) return
       pushKwHistory(card.keywords)
       onUpdateCard({ ...card, keywords: [...card.keywords, t] })
@@ -388,12 +405,28 @@ export function ReaderView({
     }
   }, [card, onUpdateCard, pushKwHistory])
 
+  // 超级编辑器的 blocks（分块）作为分块视图的首选数据源 — 编辑后立即生效
+  const blockChunks = React.useMemo(
+    () =>
+      card.blocks && card.blocks.length > 0
+        ? card.blocks
+            .map((b) => [b.front, b.back].filter((x) => x && x.trim()).join('\n'))
+            .filter((x) => x.trim())
+        : null,
+    [card.blocks],
+  )
+
   const handleToggleChunk = React.useCallback(async () => {
     if (mode === 'chunk') {
       setMode(null)
       return
     }
     setMode('chunk')
+    if (blockChunks) {
+      // 已有编辑器分块：直接使用，不再调用 AI
+      toast.success(`已按编辑器分块显示，共 ${blockChunks.length} 块`)
+      return
+    }
     if (!chunks) {
       setChunksLoading(true)
       try {
@@ -541,6 +574,7 @@ export function ReaderView({
     if (key === 'doodle') return mode === 'doodle'
     if (key === 'brush') return mode === 'brush'
     if (key === 'manualCloze') return mode === 'editor' || mode === 'manual'
+    if (key === 'reviewMode') return reviewMode
     return false
   }
 
@@ -552,6 +586,13 @@ export function ReaderView({
     if (key === 'ruleCloze') return // opens popover (trigger)
     if (key === 'aiChunk') {
       void handleToggleChunk()
+      return
+    }
+    if (key === 'reviewMode') {
+      setReviewMode((v) => {
+        toast.info(v ? '已退出复习模式' : '复习模式：背完后用「熟悉/模糊/忘记」评估本卡')
+        return !v
+      })
       return
     }
     const nextMode: ReaderMode =
@@ -595,7 +636,7 @@ export function ReaderView({
                   <span
                     className={cn(
                       'inline-block h-4 w-7 rounded-[50%] border-2',
-                      settings.clozeStyle === 'circle' && 'border-indigo-600',
+                      settings.clozeStyle === 'circle' && 'border-emerald-600',
                       settings.clozeStyle !== 'circle' && 'border-foreground/60',
                     )}
                   />
@@ -670,30 +711,16 @@ export function ReaderView({
                 >
                   <NotebookPen className="size-5" strokeWidth={1.75} />
                 </Button>
-                {/* AI 朗读控制（朗读控制栏：音色/倍速/上下句/定时/循环） */}
-                <Popover>
-                  <PopoverTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label="AI朗读"
-                      className="text-foreground/80"
-                    >
-                      <Volume2 className="size-5" strokeWidth={1.75} />
-                    </Button>
-                  </PopoverTrigger>
-                  <PopoverContent
-                    align="end"
-                    className="max-h-[70vh] w-80 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-2xl p-4"
-                  >
-                    <p className="mb-3 text-sm font-bold">AI朗读</p>
-                    <TtsPlayer
-                      text={card.content}
-                      settings={settings}
-                      context="reader"
-                    />
-                  </PopoverContent>
-                </Popover>
+                {/* AI 朗读（全屏音乐播放器，可收起为迷你悬浮条） */}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="AI朗读"
+                  className="text-foreground/80"
+                  onClick={() => setTtsOpen(true)}
+                >
+                  <Volume2 className="size-5" strokeWidth={1.75} />
+                </Button>
                 <Button
                   variant="ghost"
                   size="icon"
@@ -733,7 +760,7 @@ export function ReaderView({
               type="button"
               aria-label="本书进度"
               onClick={() => setProgressOpen(true)}
-              className="shrink-0 text-indigo-500 transition-colors hover:text-indigo-600"
+              className="shrink-0 text-emerald-600 transition-colors hover:text-emerald-700"
             >
               <Repeat2 className="size-4" strokeWidth={1.75} />
             </button>
@@ -804,7 +831,7 @@ export function ReaderView({
               selectMenuEnabled
               onSelectionCloze={handleSelectionCloze}
               onSelectionUncloze={handleSelectionUncloze}
-              chunks={mode === 'chunk' ? chunks : null}
+              chunks={mode === 'chunk' ? chunks ?? blockChunks : null}
               pages={mode === 'chunk' ? null : pages}
               onPageChange={(p, total) => setPage(p)}
               revealed={revealed}
@@ -820,22 +847,59 @@ export function ReaderView({
           )}
         </section>
 
-        {/* Floating eye FAB — sticky so it hovers above the bottom toolbar like the reference app */}
+        {/* Floating eye FAB — 可拖动悬浮球，不遮挡文本；点按切换显示答案 */}
         {mode !== 'editor' && (
-          <div className="pointer-events-none sticky bottom-36 z-30 -mt-16 flex justify-end pr-2">
-            <button
-              type="button"
-              aria-label={settings.showAnswers ? '隐藏答案' : '显示答案'}
-              onClick={() => onChangeSettings({ showAnswers: !settings.showAnswers })}
-              className="pointer-events-auto flex size-14 items-center justify-center rounded-full bg-zinc-700 text-white shadow-xl transition-transform hover:scale-105 active:scale-95"
-            >
-              {settings.showAnswers ? (
-                <Eye className="size-6" strokeWidth={1.75} />
-              ) : (
-                <EyeOff className="size-6" strokeWidth={1.75} />
-              )}
-            </button>
-          </div>
+          <button
+            type="button"
+            aria-label={settings.showAnswers ? '隐藏答案' : '显示答案'}
+            onPointerDown={(e) => {
+              try {
+                ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+              } catch {
+                /* 合成事件/无效 pointerId 时忽略 */
+              }
+              eyeDragRef.current = { startX: e.clientX, startY: e.clientY, moved: false }
+            }}
+            onPointerMove={(e) => {
+              const d = eyeDragRef.current
+              if (!d) return
+              if (!d.moved && Math.hypot(e.clientX - d.startX, e.clientY - d.startY) < 8) return
+              d.moved = true
+              setEyePos({
+                x: Math.min(Math.max(e.clientX, 36), window.innerWidth - 36),
+                y: Math.min(Math.max(e.clientY, 60), window.innerHeight - 80),
+              })
+            }}
+            onPointerUp={() => {
+              const d = eyeDragRef.current
+              eyeDragRef.current = null
+              if (d && !d.moved) onChangeSettings({ showAnswers: !settings.showAnswers })
+            }}
+            onPointerCancel={() => {
+              eyeDragRef.current = null
+            }}
+            style={
+              eyePos
+                ? {
+                    position: 'fixed',
+                    left: eyePos.x,
+                    top: eyePos.y,
+                    transform: 'translate(-50%, -50%)',
+                    touchAction: 'none',
+                  }
+                : undefined
+            }
+            className={cn(
+              'z-30 flex touch-none items-center justify-center rounded-full bg-zinc-700 text-white shadow-xl transition-transform hover:scale-105 active:scale-95',
+              eyePos ? 'fixed' : 'sticky bottom-36 -mt-16 mr-2 self-end',
+            )}
+          >
+            {settings.showAnswers ? (
+              <Eye className="size-6" strokeWidth={1.75} />
+            ) : (
+              <EyeOff className="size-6" strokeWidth={1.75} />
+            )}
+          </button>
         )}
 
         {/* ---------- AI title card ---------- */}
@@ -1009,10 +1073,12 @@ export function ReaderView({
             </div>
           )}
 
-          {/* 熟悉/模糊/忘记 评分条（截图8） */}
-          <div className="mt-3">
-            <ReviewScoreBar onScore={(a) => void handleScore(a)} />
-          </div>
+          {/* 熟悉/模糊/忘记 评分条 — 只在复习模式出现 */}
+          {reviewMode && (
+            <div className="mt-3">
+              <ReviewScoreBar onScore={(a) => void handleScore(a)} />
+            </div>
+          )}
 
           {/* 今日计划 card */}
           <div className="mt-3 rounded-2xl border border-border bg-card p-4">
@@ -1232,6 +1298,26 @@ export function ReaderView({
           </div>
         </DialogContent>
       </Dialog>
+
+      {/* AI 朗读 — 全屏音乐播放器（可收起为迷你悬浮条继续播放） */}
+      <Sheet open={ttsOpen} onOpenChange={setTtsOpen}>
+        <SheetContent
+          side="bottom"
+          className="flex h-[94dvh] flex-col rounded-t-3xl bg-background p-0"
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>AI朗读</SheetTitle>
+          </SheetHeader>
+          <TtsPlayer
+            text={card.content}
+            settings={settings}
+            context="reader"
+            cardTitle={card.title}
+            favoritesKey={card.id}
+            onClose={() => setTtsOpen(false)}
+          />
+        </SheetContent>
+      </Sheet>
     </>
   )
 }

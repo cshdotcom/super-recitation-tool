@@ -32,7 +32,7 @@ export function ProgressSheet({
         <div className="w-full rounded-2xl border border-border/60 bg-card px-6 py-5 text-center shadow-sm">
           <p className="text-sm text-muted-foreground">本书进度</p>
           <p className="mt-1.5 text-2xl font-bold">
-            待复习<span className="text-indigo-600">{dueChapters}</span>章
+            待复习<span className="text-emerald-600">{dueChapters}</span>章
           </p>
         </div>
 

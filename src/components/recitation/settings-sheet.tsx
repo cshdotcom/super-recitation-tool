@@ -69,6 +69,7 @@ const QUICK_TOGGLES: { key: keyof ToolToggles; label: string; desc: string }[] =
   { key: 'brush', label: '挖空刷', desc: '快速滑选词语挖空' },
   { key: 'manualCloze', label: '手动挖空', desc: '双击文本快捷挖空' },
   { key: 'ruleCloze', label: '规则挖空', desc: '按照一定规则批量挖空' },
+  { key: 'reviewMode', label: '复习模式', desc: '背完后用「熟悉/模糊/忘记」评估掌握程度' },
 ]
 
 const TOOL_TOGGLES: { key: keyof ToolToggles; label: string; desc: string }[] = [
@@ -508,6 +509,18 @@ export function SettingsSheet({
                 />
               ))}
             </div>
+            <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">已自动保存</p>
+          </section>
+
+          {/* ---------- 导入偏好 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">导入偏好</p>
+            <ToggleRow
+              label="导入时 AI 自动挖空"
+              desc="新建/导入卡片保存后，自动用 AI 挖空关键片段"
+              checked={settings.aiAutoCloze}
+              onCheckedChange={(v) => onChangeSettings({ aiAutoCloze: v })}
+            />
             <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">已自动保存</p>
           </section>
 

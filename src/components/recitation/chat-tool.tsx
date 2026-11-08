@@ -1,7 +1,28 @@
 'use client'
 
+// ChatTool — AI督背 (supervise) & AI问问 (ask) chat panel.
+// Features:
+//   • per-reply actions: copy (copy icon) and delete (trash icon — also drops
+//     the adjacent user message that this reply answers)
+//   • 清空对话 header button with AlertDialog confirmation
+//   • AI visual questions: the model may emit a ```ask fenced block with
+//     {"question","options"} JSON — rendered as an emerald question card
+//     instead of raw code. Tapping an option (or the custom input) sends that
+//     text as the user message and marks the card as answered.
+//   • long replies render via RichContent (markdown / tables / mermaid /
+//     LaTeX / code) with an internal max-height scroll.
 import * as React from 'react'
-import { Send, Loader2, MessageCircleQuestion, ImagePlus, X } from 'lucide-react'
+import {
+  Check,
+  Copy,
+  ImagePlus,
+  Loader2,
+  MessageCircleQuestion,
+  Send,
+  Sparkles,
+  Trash2,
+  X,
+} from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
@@ -9,11 +30,24 @@ import type { ChatMessage } from '@/lib/types'
 import { RichContent } from '@/components/recitation/rich-content'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
 
 const MAX_IMAGES = 4
 /** Files smaller than this keep their original data URL; larger get compressed. */
 const COMPRESS_OVER = 300 * 1024
 const MAX_IMAGE_DIM = 1024
+/** Assistant bubble internal scroll cap (px). */
+const REPLY_MAX_H = 320
 
 interface ChatToolProps {
   mode: 'supervise' | 'ask'
@@ -23,6 +57,7 @@ interface ChatToolProps {
 }
 
 interface UIMessage {
+  id: string
   role: 'user' | 'assistant'
   content: string
   images?: string[]
@@ -31,6 +66,56 @@ interface UIMessage {
 interface PendingImage {
   id: string
   dataUrl: string
+}
+
+/** Parsed ```ask question block emitted by the AI. */
+interface AskBlock {
+  question: string
+  options: string[]
+}
+
+type AskSegment =
+  | { kind: 'md'; value: string }
+  | { kind: 'ask'; ask: AskBlock }
+
+function uid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID()
+  }
+  return `m-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+/** Split assistant content into markdown and ```ask segments.
+ *  Invalid ask JSON degrades to the raw fenced code block. */
+function splitAskSegments(content: string): AskSegment[] {
+  const parts = content.split(/```ask[ \t]*\r?\n?([\s\S]*?)```/g)
+  const segs: AskSegment[] = []
+  for (let i = 0; i < parts.length; i += 1) {
+    if (i % 2 === 0) {
+      segs.push({ kind: 'md', value: parts[i] })
+      continue
+    }
+    let ask: AskBlock | null = null
+    try {
+      const obj = JSON.parse(parts[i]) as { question?: unknown; options?: unknown }
+      if (typeof obj?.question === 'string' && Array.isArray(obj.options)) {
+        const options = obj.options
+          .filter((o): o is string => typeof o === 'string' && o.trim().length > 0)
+          .slice(0, 6)
+        if (obj.question.trim() && options.length > 0) {
+          ask = { question: obj.question.trim(), options }
+        }
+      }
+    } catch {
+      // not valid JSON — fall through to raw rendering
+    }
+    if (ask) {
+      segs.push({ kind: 'ask', ask })
+    } else {
+      segs.push({ kind: 'md', value: `\`\`\`ask\n${parts[i]}\`\`\`` })
+    }
+  }
+  return segs
 }
 
 /** Convert a picked image file to a data URL, compressing oversized ones. */
@@ -72,15 +157,123 @@ function processImageFile(file: File): Promise<string> {
   })
 }
 
+// ---------- ask question card ----------
+
+function AskCard({
+  ask,
+  answered,
+  busy,
+  onSend,
+}: {
+  ask: AskBlock
+  /** Text chosen by the user, when this card has been answered. */
+  answered?: string
+  busy: boolean
+  onSend: (text: string) => void
+}) {
+  const [custom, setCustom] = React.useState('')
+  const done = typeof answered === 'string'
+
+  const submitCustom = () => {
+    const t = custom.trim()
+    if (!t || done || busy) return
+    onSend(t)
+  }
+
+  return (
+    <div
+      className={cn(
+        'w-[85%] rounded-2xl border-2 p-3 transition-colors',
+        done
+          ? 'border-emerald-600/30 bg-emerald-500/5'
+          : 'border-emerald-500/60 bg-emerald-500/5 shadow-sm',
+      )}
+      aria-label="AI 提问卡片"
+    >
+      <div className="mb-2 flex items-start gap-2">
+        <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+          <Sparkles className="size-3.5" strokeWidth={2} />
+        </span>
+        <p className="text-sm font-medium leading-relaxed">{ask.question}</p>
+      </div>
+      <div className="space-y-1.5">
+        {ask.options.map((opt) => {
+          const chosen = done && answered === opt
+          return (
+            <button
+              key={opt}
+              type="button"
+              disabled={done || busy}
+              onClick={() => onSend(opt)}
+              className={cn(
+                'flex w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left text-sm transition-colors',
+                chosen
+                  ? 'border-emerald-600 bg-emerald-600 text-white'
+                  : 'border-border bg-card hover:border-emerald-500/60 hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-50',
+              )}
+            >
+              <span className="min-w-0 break-words">{opt}</span>
+              {chosen && <Check className="size-4 shrink-0" strokeWidth={2.5} />}
+            </button>
+          )
+        })}
+      </div>
+      {done ? (
+        <div className="mt-2 flex items-center gap-1 text-xs text-emerald-600 dark:text-emerald-400">
+          <Check className="size-3.5" strokeWidth={2.5} />
+          已回答：{answered}
+        </div>
+      ) : (
+        <form
+          className="mt-2 flex items-center gap-1.5"
+          onSubmit={(e) => {
+            e.preventDefault()
+            submitCustom()
+          }}
+        >
+          <Input
+            value={custom}
+            onChange={(e) => setCustom(e.target.value)}
+            placeholder="自定义回答…"
+            disabled={busy}
+            className="h-8 bg-card text-xs"
+            aria-label="自定义回答"
+          />
+          <Button
+            type="submit"
+            size="icon"
+            className="size-8 shrink-0"
+            disabled={busy || !custom.trim()}
+            aria-label="发送自定义回答"
+          >
+            <Send className="size-3.5" />
+          </Button>
+        </form>
+      )}
+    </div>
+  )
+}
+
+// ---------- main component ----------
+
 export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) {
   const [messages, setMessages] = React.useState<UIMessage[]>([])
+  const [askAnswered, setAskAnswered] = React.useState<Record<string, string>>({})
+  const [copiedId, setCopiedId] = React.useState<string | null>(null)
   const [input, setInput] = React.useState('')
   const [pending, setPending] = React.useState<PendingImage[]>([])
   const [loading, setLoading] = React.useState(false)
   const scrollRef = React.useRef<HTMLDivElement>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
   const seededRef = React.useRef(false)
+  const copyTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const idRef = React.useRef(0)
+
+  React.useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+    }
+  }, [])
 
   const send = React.useCallback(
     async (text: string, images: string[] = []) => {
@@ -95,9 +288,11 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
         toast.error('请先选择一张有内容的背书卡')
         return
       }
+      idRef.current += 1
       const nextMessages: UIMessage[] = [
         ...messages,
         {
+          id: `u-${idRef.current}-${Date.now().toString(36)}`,
           role: 'user',
           content: trimmed,
           ...(imgs.length > 0 ? { images: imgs } : {}),
@@ -127,7 +322,11 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
         }
         const data = (await res.json()) as { reply: string }
         const reply = (data.reply || '').trim() || '（无回复）'
-        setMessages((prev) => [...prev, { role: 'assistant', content: reply }])
+        idRef.current += 1
+        setMessages((prev) => [
+          ...prev,
+          { id: `a-${idRef.current}-${Date.now().toString(36)}`, role: 'assistant', content: reply },
+        ])
       } catch (err) {
         toast.error(
           mode === 'supervise' ? '督背请求失败' : '提问请求失败',
@@ -148,7 +347,7 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
     if (!content.trim()) return
     if (mode === 'supervise') {
       seededRef.current = true
-      send('开始背诵吧，请引导我。')
+      void send('开始背诵吧，请引导我。')
     } else {
       seededRef.current = true
     }
@@ -206,7 +405,47 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
     e.preventDefault()
     if (loading) return
     const images = allowImages ? pending.map((p) => p.dataUrl) : []
-    send(input, images)
+    void send(input, images)
+  }
+
+  // ---------- per-reply actions ----------
+
+  const copyReply = async (m: UIMessage) => {
+    try {
+      await navigator.clipboard.writeText(m.content)
+      setCopiedId(m.id)
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current)
+      copyTimerRef.current = setTimeout(() => setCopiedId(null), 1600)
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  /** Delete an assistant reply together with the adjacent (preceding) user message. */
+  const deleteReply = (idx: number) => {
+    setMessages((prev) => {
+      const target = prev[idx]
+      if (!target || target.role !== 'assistant') return prev
+      const next = [...prev]
+      next.splice(idx, 1)
+      if (idx > 0 && next[idx - 1]?.role === 'user') {
+        next.splice(idx - 1, 1)
+      }
+      return next
+    })
+  }
+
+  const clearConversation = () => {
+    setMessages([])
+    setAskAnswered({})
+    toast.success('对话已清空')
+  }
+
+  // ---------- ask card plumbing ----------
+
+  const handleAskSend = (msgId: string, text: string) => {
+    setAskAnswered((prev) => ({ ...prev, [msgId]: text }))
+    void send(text)
   }
 
   return (
@@ -216,6 +455,39 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
         className="flex-1 overflow-y-auto rounded-md"
       >
         <div className="flex flex-col gap-3 p-1">
+          {messages.length > 0 && (
+            <div className="flex justify-end">
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <button
+                    type="button"
+                    className="flex items-center gap-1 rounded-full px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  >
+                    <Trash2 className="size-3.5" strokeWidth={1.75} />
+                    清空对话
+                  </button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>清空对话</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      确定清空全部对话记录吗？此操作无法恢复。
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>取消</AlertDialogCancel>
+                    <AlertDialogAction
+                      onClick={clearConversation}
+                      className="bg-red-600 text-white hover:bg-red-700"
+                    >
+                      清空
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </div>
+          )}
+
           {messages.length === 0 && !loading && (
             <div className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
               <MessageCircleQuestion className="size-8 text-muted-foreground/40" />
@@ -229,14 +501,14 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
 
           {messages.map((m, idx) => (
             <div
-              key={idx}
+              key={m.id}
               className={cn(
                 'flex w-full',
                 m.role === 'user' ? 'justify-end' : 'justify-start',
               )}
             >
               {m.role === 'user' ? (
-                <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-primary px-3 py-2 text-sm leading-relaxed text-primary-foreground">
+                <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm bg-primary px-3 py-2 text-sm leading-relaxed text-primary-foreground">
                   {m.images && m.images.length > 0 && (
                     <div className="mb-1.5 flex max-w-[200px] flex-wrap gap-1.5">
                       {m.images.map((src, i) => (
@@ -252,11 +524,49 @@ export function ChatTool({ mode, content, allowImages = false }: ChatToolProps) 
                   {m.content}
                 </div>
               ) : (
-                // Assistant messages render as markdown (code, tables, mermaid…)
-                <RichContent
-                  content={m.content}
-                  className="max-w-[85%] rounded-2xl rounded-bl-sm bg-muted px-3 py-2"
-                />
+                <div className="flex w-full flex-col items-start gap-1">
+                  {splitAskSegments(m.content).map((seg, i) =>
+                    seg.kind === 'ask' ? (
+                      <AskCard
+                        key={i}
+                        ask={seg.ask}
+                        answered={askAnswered[m.id]}
+                        busy={loading}
+                        onSend={(text) => handleAskSend(m.id, text)}
+                      />
+                    ) : seg.value.trim() ? (
+                      <RichContent
+                        key={i}
+                        content={seg.value}
+                        className="max-w-[85%] rounded-2xl rounded-bl-sm bg-muted px-3 py-2"
+                        maxHeight={REPLY_MAX_H}
+                      />
+                    ) : null,
+                  )}
+                  {/* reply actions: copy / delete */}
+                  <div className="ml-1 flex items-center gap-0.5">
+                    <button
+                      type="button"
+                      onClick={() => void copyReply(m)}
+                      aria-label="复制该回复"
+                      className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    >
+                      {copiedId === m.id ? (
+                        <Check className="size-3.5 text-emerald-600" strokeWidth={2} />
+                      ) : (
+                        <Copy className="size-3.5" strokeWidth={1.75} />
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => deleteReply(idx)}
+                      aria-label="删除该回复（连带相邻提问）"
+                      className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-red-600"
+                    >
+                      <Trash2 className="size-3.5" strokeWidth={1.75} />
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
           ))}

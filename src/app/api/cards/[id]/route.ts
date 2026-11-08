@@ -42,7 +42,7 @@ export async function PATCH(
     }
     const { id } = await params
     const body = await req.json().catch(() => ({}))
-    const data: Record<string, string> = {}
+    const data: Record<string, string | number | boolean> = {}
     if (typeof body?.title === 'string' && body.title.trim()) {
       data.title = body.title.trim()
     }
@@ -109,6 +109,16 @@ export async function PATCH(
         }
       })
       data.blocks = JSON.stringify(blocks)
+    }
+    // 项目分类 / 置顶 / 自定义排序
+    if (typeof body?.categoryId === 'string') {
+      data.categoryId = body.categoryId
+    }
+    if (typeof body?.pinned === 'boolean') {
+      data.pinned = body.pinned
+    }
+    if (typeof body?.ord === 'number' && Number.isFinite(body.ord)) {
+      data.ord = Math.round(body.ord)
     }
 
     const updated = await db.card.update({

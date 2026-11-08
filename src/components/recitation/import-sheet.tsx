@@ -97,7 +97,11 @@ export function ImportSheet({
       const res = await fetch('/api/parse', { method: 'POST', body: fd })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) {
-        throw new Error(data.error || '文件解析失败')
+        throw new Error(
+          res.status === 401
+            ? '登录状态已过期，请重新登录后再上传文件'
+            : data.error || '文件解析失败',
+        )
       }
       const payload = data as { title?: string; content?: string }
       if (!payload.content?.trim()) {

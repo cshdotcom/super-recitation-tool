@@ -128,7 +128,19 @@ export interface CardData {
   plan: CardPlan | null
   mindmaps: MindmapDoc[] // 已保存的思维导图
   blocks: MaterialBlock[] // 文字编辑工具 Q&A blocks
+  categoryId: string // 项目分类 id（"" = 未分类）
+  pinned: boolean // 置顶
+  ord: number // 自定义排序序号
   deletedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+// 项目（分类文件夹）
+export interface ProjectData {
+  id: string
+  name: string
+  ord: number
   createdAt: string
   updatedAt: string
 }
@@ -142,6 +154,7 @@ export interface ToolToggles {
   brush: boolean
   manualCloze: boolean
   ruleCloze: boolean
+  reviewMode: boolean
 
   tts: boolean
   quiz: boolean
@@ -161,6 +174,7 @@ export const DEFAULT_TOOLS: ToolToggles = {
   brush: true,
   manualCloze: true,
   ruleCloze: true,
+  reviewMode: true,
 
   tts: true,
   quiz: true,
@@ -247,6 +261,8 @@ export interface SettingsData {
   asrModel: string
   /** 错题本：答对后自动移除 — 答对N次后 */
   quizAutoRemove: 1 | 2 | 3 | 5
+  /** 导入时是否开启 AI 自动挖空 */
+  aiAutoCloze: boolean
 }
 
 export interface ChatMessage {

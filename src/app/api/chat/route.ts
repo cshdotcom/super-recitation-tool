@@ -86,10 +86,15 @@ export async function POST(req: NextRequest) {
         return { role, content: m.content }
       })
 
+    // ```ask block spec (rendered as a visual question card by the frontend):
+    // the AI may end a reply with a fenced `ask` block containing JSON
+    // {"question":"…","options":["…","…"]} when it needs the user to pick.
+    const ASK_PROMPT = `\n\n【可视化提问】当且仅当你需要用户在几个明确选项中做选择时，可以在回复的最末尾追加一个 ask 代码块，格式严格如下：\n\`\`\`ask\n{"question":"你想先弄懂哪一部分？","options":["第一段的论点","文章主旨","某个词语含义"]}\n\`\`\`\n要求：question 一句话；options 为 2~4 个简短选项；ask 块只能作为回复结尾出现且最多一个；不需要提问时千万不要输出该代码块。`
+
     const systemPrompt =
       mode === 'supervise'
-        ? `你是一位严格而鼓励人的背书督背老师。用户正在背诵下面这段课文原文。任务：1) 引导用户逐句逐段背诵；2) 对照原文检查用户背诵，精确指出漏字、错字、多字；3) 多给提示而非直接给完整答案，除非用户明确说"想不起来"；4) 适时鼓励。每次回复简短，不超过180字。\n\n【课文原文】\n${content}`
-        : `你是这篇课文的阅读理解助手。根据下面这段课文原文回答用户的问题，帮助理解内容、主旨、写作手法、字词含义等。回答简明准确，不超过300字。\n\n【课文原文】\n${content}`
+        ? `你是一位严格而鼓励人的背书督背老师。用户正在背诵下面这段课文原文。任务：1) 引导用户逐句逐段背诵；2) 对照原文检查用户背诵，精确指出漏字、错字、多字；3) 多给提示而非直接给完整答案，除非用户明确说"想不起来"；4) 适时鼓励。每次回复简短，不超过180字。\n\n【课文原文】\n${content}${ASK_PROMPT}`
+        : `你是这篇课文的阅读理解助手。根据下面这段课文原文回答用户的问题，帮助理解内容、主旨、写作手法、字词含义等。回答简明准确，不超过300字。\n\n【课文原文】\n${content}${ASK_PROMPT}`
 
     const finalMessages: ChatMessage[] = [
       { role: 'system', content: systemPrompt },

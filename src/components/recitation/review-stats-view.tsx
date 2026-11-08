@@ -285,7 +285,7 @@ export function ReviewStatsView({ onBack }: ReviewStatsViewProps) {
                       key={key}
                       className={cn(
                         'flex h-9 items-center justify-center rounded-lg text-sm tabular-nums',
-                        count > 0 && 'bg-indigo-600 font-semibold text-white',
+                        count > 0 && 'bg-emerald-600 font-semibold text-white',
                         count === 0 && onlyReviewed && 'invisible',
                         isToday && 'ring-1 ring-inset ring-zinc-900',
                       )}

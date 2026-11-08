@@ -1,24 +1,36 @@
 'use client'
 
-// 专注 (focus timer) — three screens:
-//   1. 选择专注内容   list of focus content cards (bg image, stats, reorder, delete)
-//   2. 新建/编辑     name + duration chips + background picker (presets / local image / none)
-//   3. 计时          countdown / count-up segmented control + immersive running overlay
+// 专注（重做版）—— 不再锁死浏览器。
+//
+//   入口两步：① 选择计时方式（⬆ 正计时 / ⬇ 倒计时 两张大卡片）
+//            ② 选择专注内容（可选：/api/focus 预设卡片 + 「不选，直接开始」可跳过，
+//               顶部时钟按钮弹自定义时长 Dialog：时:分选择）
+//   进行中：  全屏大号时间 + 暂停/继续/结束并保存 + 最小化（全局浮时钟，后台继续，
+//             可回主页/背书等任何页面）；计时状态放在 ./focus-bus
+//   统计：    今日专注 X 分钟 / 累计 N 次（/api/focus 聚合）+ 今日会话记录（本设备）
+//   管理：    专注内容的新建/编辑/排序/删除（含背景图，供全屏计时使用）
+//   学霸模式（网页版无法实现，按需求删除）。
 
 import * as React from 'react'
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
   ChevronDown,
   ChevronLeft,
-  ChevronRight,
   ChevronUp,
+  Clock3,
   Loader2,
+  Minimize2,
+  Minus,
+  Pause,
+  Play,
   Plus,
+  Settings2,
   SquarePen,
   Trash2,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { AnimatePresence, motion } from 'framer-motion'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -37,10 +49,29 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import type { FocusContentData } from '@/lib/types'
+import {
+  FOCUS_BUS_EVENTS,
+  fmtClock,
+  fmtDurHuman,
+  getDisplaySec,
+  getElapsedSec,
+  getTodayHistory,
+  pauseFocus,
+  resumeFocus,
+  setImmersiveOpen,
+  startFocus,
+  stopFocus,
+  useFocusState,
+  type FocusHistoryEntry,
+  type FocusMode,
+} from './focus-bus'
 
-const LAST_USED_KEY = 'focus-last'
+const JSON_HEADERS = { 'Content-Type': 'application/json' }
+
+const DURATIONS = [5, 10, 15, 20, 25, 30, 45, 60]
 
 const BG_PRESETS: { key: string; src: string }[] = [
   { key: 'bg-silk', src: '/focus/bg-silk.png' },
@@ -51,12 +82,12 @@ const BG_PRESETS: { key: string; src: string }[] = [
   { key: 'bg-hill', src: '/focus/bg-hill.png' },
 ]
 
-const DURATIONS = [5, 10, 15, 20, 25, 30, 45, 60]
+/** 会话时长上下限（分钟），与自定义时长 Dialog 的 时:分 范围一致 */
+const MIN_MINUTES = 1
+const MAX_MINUTES = 23 * 60 + 59
 
-const JSON_HEADERS = { 'Content-Type': 'application/json' }
-
-type Screen = 'list' | 'edit' | 'timer'
-type TimerMode = 'down' | 'up'
+type Step = 'mode' | 'content'
+type ManageView = 'list' | 'form'
 
 /** preset key 或 dataURL → 直接可用的 URL；''/未知 → null（银灰渐变兜底） */
 function resolveBgUrl(bg: string): string | null {
@@ -66,12 +97,15 @@ function resolveBgUrl(bg: string): string | null {
   return preset ? preset.src : null
 }
 
-/** mm:ss (mm 可超过 60) */
-function fmt(totalSec: number): string {
-  const s = Math.max(0, Math.floor(totalSec))
-  const m = Math.floor(s / 60)
-  const r = s % 60
-  return `${String(m).padStart(2, '0')}:${String(r).padStart(2, '0')}`
+function fmtDurationMin(min: number): string {
+  if (min < 60) return `${min} 分钟`
+  const h = Math.floor(min / 60)
+  const m = min % 60
+  return m === 0 ? `${h} 小时` : `${h} 小时 ${m} 分`
+}
+
+function timeStr(at: number): string {
+  return new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
 function hideImgOnError(e: React.SyntheticEvent<HTMLImageElement>): void {
@@ -106,57 +140,43 @@ async function compressImage(file: File): Promise<string> {
 
 // ---------- 小组件 ----------
 
-/** 卡片底部的小进度环 (今日 seconds / minutes*60) */
-function ProgressRing({ seconds, total }: { seconds: number; total: number }) {
-  const pct = total > 0 ? Math.min(1, Math.max(0, seconds / total)) : 0
-  const R = 26
-  const C = 2 * Math.PI * R
-  return (
-    <div className="relative size-14 shrink-0">
-      <svg viewBox="0 0 56 56" className="size-14 -rotate-90" aria-hidden>
-        <circle cx="28" cy="28" r={R} fill="none" stroke="#d4d4d8" strokeWidth="3" />
-        {pct > 0 && (
-          <circle
-            cx="28"
-            cy="28"
-            r={R}
-            fill="none"
-            stroke="#18181b"
-            strokeWidth="3"
-            strokeLinecap="round"
-            strokeDasharray={`${(C * pct).toFixed(2)} ${C.toFixed(2)}`}
-          />
-        )}
-      </svg>
-      <span className="absolute inset-0 grid place-items-center text-[10px] font-medium text-zinc-600">
-        {Math.round(pct * 100)}%
-      </span>
-    </div>
-  )
-}
-
-/** 卡片左上角圆形图标按钮 */
-function CircleIcon({
+/** 数字步进器（自定义时长 Dialog 的 时/分 用）——函数式更新，连点不丢帧 */
+function Stepper({
   label,
-  onClick,
-  disabled,
-  children,
+  value,
+  min,
+  max,
+  onChange,
 }: {
   label: string
-  onClick: (e: React.MouseEvent<HTMLButtonElement>) => void
-  disabled?: boolean
-  children: React.ReactNode
+  value: number
+  min: number
+  max: number
+  onChange: (update: (v: number) => number) => void
 }) {
   return (
-    <button
-      type="button"
-      aria-label={label}
-      disabled={disabled}
-      onClick={onClick}
-      className="grid size-9 place-items-center rounded-full bg-white/70 backdrop-blur transition-colors hover:bg-white/90 disabled:opacity-40 disabled:hover:bg-white/70"
-    >
-      {children}
-    </button>
+    <div className="flex flex-col items-center gap-1 rounded-xl border p-2">
+      <button
+        type="button"
+        aria-label={`增加${label}`}
+        disabled={value >= max}
+        onClick={() => onChange((v) => Math.min(max, v + 1))}
+        className="grid size-8 place-items-center rounded-full transition-colors hover:bg-zinc-100 disabled:opacity-30"
+      >
+        <Plus className="size-4 text-zinc-700" strokeWidth={1.75} />
+      </button>
+      <span className="text-2xl font-bold tabular-nums">{value}</span>
+      <button
+        type="button"
+        aria-label={`减少${label}`}
+        disabled={value <= min}
+        onClick={() => onChange((v) => Math.max(min, v - 1))}
+        className="grid size-8 place-items-center rounded-full transition-colors hover:bg-zinc-100 disabled:opacity-30"
+      >
+        <Minus className="size-4 text-zinc-700" strokeWidth={1.75} />
+      </button>
+      <span className="text-xs text-zinc-400">{label}</span>
+    </div>
   )
 }
 
@@ -165,52 +185,38 @@ interface FocusAppProps {
 }
 
 export function FocusApp({ onBack }: FocusAppProps) {
+  // ---------- 专注总线（全局计时状态） ----------
+  const st = useFocusState()
+  const running = st.running
+
   // ---------- 数据 ----------
   const [items, setItems] = React.useState<FocusContentData[]>([])
   const [loading, setLoading] = React.useState(true)
-  const [lastUsedId, setLastUsedId] = React.useState<string | null>(null)
+  const [history, setHistory] = React.useState<FocusHistoryEntry[]>([])
 
-  // ---------- 屏幕状态机 ----------
-  const [screen, setScreen] = React.useState<Screen>('list')
+  // ---------- 入口两步 ----------
+  const [step, setStep] = React.useState<Step>('mode')
+  const [mode, setMode] = React.useState<FocusMode>('countdown')
+  const [selected, setSelected] = React.useState<FocusContentData | null>(null)
+  const [durationMin, setDurationMin] = React.useState(25)
+  const [goalOn, setGoalOn] = React.useState(true)
+  const [overlay, setOverlay] = React.useState(false)
 
-  // ---------- 新建/编辑 ----------
+  // ---------- 自定义时长 Dialog ----------
+  const [customOpen, setCustomOpen] = React.useState(false)
+  const [customH, setCustomH] = React.useState(0)
+  const [customM, setCustomM] = React.useState(25)
+  const [unlimited, setUnlimited] = React.useState(false)
+
+  // ---------- 管理预设 Dialog ----------
+  const [manageOpen, setManageOpen] = React.useState(false)
+  const [manageView, setManageView] = React.useState<ManageView>('list')
   const [editing, setEditing] = React.useState<FocusContentData | null>(null)
   const [name, setName] = React.useState('')
-  const [minutes, setMinutes] = React.useState(25)
+  const [mMinutes, setMMinutes] = React.useState(25)
   const [bg, setBg] = React.useState('')
   const [localBg, setLocalBg] = React.useState<string | null>(null)
   const [saving, setSaving] = React.useState(false)
-
-  // ---------- 计时 ----------
-  const [activeId, setActiveId] = React.useState<string | null>(null)
-  const [mode, setMode] = React.useState<TimerMode>('down')
-  const [durationMin, setDurationMin] = React.useState(25)
-  const [running, setRunning] = React.useState(false)
-  const [paused, setPaused] = React.useState(false)
-  const [remainingSec, setRemainingSec] = React.useState(0)
-  const [elapsedSec, setElapsedSec] = React.useState(0)
-  const [scholarMode, setScholarMode] = React.useState(false)
-  const [whitelistOpen, setWhitelistOpen] = React.useState(false)
-  const [giveUpOpen, setGiveUpOpen] = React.useState(false)
-
-  const content = React.useMemo(
-    () => items.find((i) => i.id === activeId) ?? null,
-    [items, activeId],
-  )
-
-  // refs（计时用，避免 stale closure）
-  const modeRef = React.useRef<TimerMode>(mode)
-  modeRef.current = mode
-  const durRef = React.useRef(durationMin)
-  durRef.current = durationMin
-  const pausedRef = React.useRef(paused)
-  pausedRef.current = paused
-  const contentRef = React.useRef<FocusContentData | null>(content)
-  contentRef.current = content
-  const sessionActiveRef = React.useRef(false)
-  const endAtRef = React.useRef<number | null>(null)
-  const baseRef = React.useRef<number | null>(null)
-  const frozenRef = React.useRef<number>(0)
 
   const fetchList = React.useCallback(async () => {
     try {
@@ -225,151 +231,159 @@ export function FocusApp({ onBack }: FocusAppProps) {
     }
   }, [])
 
+  const refreshLocal = React.useCallback(() => {
+    setHistory(getTodayHistory())
+  }, [])
+
   React.useEffect(() => {
     void fetchList()
-    try {
-      setLastUsedId(localStorage.getItem(LAST_USED_KEY))
-    } catch {
-      // localStorage 不可用时忽略
+    refreshLocal()
+  }, [fetchList, refreshLocal])
+
+  // 全屏遮罩 ↔ 浮时钟协调（遮罩打开时隐藏右下角圆钮）
+  React.useEffect(() => {
+    setImmersiveOpen(overlay)
+    return () => {
+      setImmersiveOpen(false)
     }
+  }, [overlay])
+
+  // 会话结束（含到点自动结束 / 其他标签页结束）→ 收起遮罩 + 刷新统计与今日记录
+  const prevRunning = React.useRef(running)
+  React.useEffect(() => {
+    if (prevRunning.current && !running) {
+      setOverlay(false)
+      void fetchList()
+      refreshLocal()
+    }
+    prevRunning.current = running
+  }, [running, fetchList, refreshLocal])
+
+  // 日志写入服务器后再刷新一次统计（上面的刷新可能早于 /api/focus/log 完成）
+  React.useEffect(() => {
+    const onLogged = () => void fetchList()
+    window.addEventListener(FOCUS_BUS_EVENTS.LOGGED, onLogged)
+    return () => window.removeEventListener(FOCUS_BUS_EVENTS.LOGGED, onLogged)
   }, [fetchList])
 
-  // 计时中的内容被删除时退回列表
+  // 全屏计时锁定背景滚动（仅本页遮罩期间）
   React.useEffect(() => {
-    if (screen === 'timer' && !items.some((i) => i.id === activeId)) setScreen('list')
-  }, [screen, items, activeId])
-
-  // ---------- 结束会话（自然完成 / 放弃） ----------
-  const finish = React.useCallback(
-    async (natural: boolean) => {
-      if (!sessionActiveRef.current) return
-      sessionActiveRef.current = false
-      const c = contentRef.current
-      const now = Date.now()
-
-      let seconds: number
-      if (modeRef.current === 'down') {
-        const total = durRef.current * 60
-        if (pausedRef.current) {
-          seconds = total - frozenRef.current
-        } else {
-          seconds = total - Math.max(0, Math.round(((endAtRef.current ?? now) - now) / 1000))
-        }
-      } else {
-        seconds = pausedRef.current
-          ? frozenRef.current
-          : Math.floor((now - (baseRef.current ?? now)) / 1000)
-      }
-      seconds = Math.max(0, Math.min(86400, Math.round(seconds)))
-
-      setRunning(false)
-      setPaused(false)
-      setGiveUpOpen(false)
-
-      // 标记最近使用
-      if (c) {
-        try {
-          localStorage.setItem(LAST_USED_KEY, c.id)
-        } catch {
-          // ignore
-        }
-        setLastUsedId(c.id)
-      }
-
-      const shouldLog = natural ? seconds > 0 : seconds >= 60
-      if (shouldLog && c) {
-        try {
-          const res = await fetch('/api/focus/log', {
-            method: 'POST',
-            headers: JSON_HEADERS,
-            body: JSON.stringify({ contentId: c.id, seconds }),
-          })
-          if (!res.ok) throw new Error('记录专注时长失败')
-        } catch (err) {
-          toast.error(err instanceof Error ? err.message : '记录专注时长失败')
-        }
-      }
-
-      toast.success(
-        natural ? '专注完成！' : shouldLog ? `已专注 ${Math.floor(seconds / 60)} 分钟` : '已退出专注',
-      )
-      setScreen('list')
-      void fetchList()
-    },
-    [fetchList],
-  )
-  const finishRef = React.useRef(finish)
-  finishRef.current = finish
-
-  // ---------- 运行中的 1s tick（drift-free） ----------
-  React.useEffect(() => {
-    if (!running || paused) return
-    const id = window.setInterval(() => {
-      const now = Date.now()
-      if (modeRef.current === 'down') {
-        const rem = Math.max(0, Math.round(((endAtRef.current ?? now) - now) / 1000))
-        setRemainingSec(rem)
-        if (rem <= 0) finishRef.current(true)
-      } else {
-        setElapsedSec(Math.floor((now - (baseRef.current ?? now)) / 1000))
-      }
-    }, 500)
-    return () => window.clearInterval(id)
-  }, [running, paused])
-
-  // ---------- document.title ----------
-  React.useEffect(() => {
-    if (!running) return
-    const prev = document.title
-    return () => {
-      document.title = prev
-    }
-  }, [running])
-  React.useEffect(() => {
-    if (running) {
-      document.title = `专注中 ${fmt(mode === 'down' ? remainingSec : elapsedSec)}`
-    }
-  }, [running, mode, remainingSec, elapsedSec])
-
-  // ---------- 运行中锁定背景滚动 ----------
-  React.useEffect(() => {
-    if (!running) return
+    if (!overlay) return
     const prev = document.body.style.overflow
     document.body.style.overflow = 'hidden'
     return () => {
       document.body.style.overflow = prev
     }
-  }, [running])
+  }, [overlay])
 
-  // ---------- 列表操作 ----------
-  const openEdit = (c: FocusContentData | null) => {
+  // ---------- 统计（/api/focus 聚合） ----------
+  const todayMin = React.useMemo(
+    () => Math.round(items.reduce((a, c) => a + (c.todaySeconds || 0), 0) / 60),
+    [items],
+  )
+  const totalCount = React.useMemo(
+    () => items.reduce((a, c) => a + (c.focusCount || 0), 0),
+    [items],
+  )
+
+  // 正在进行的会话对应的内容（回到本页后也能找回背景图）
+  const activeContent = React.useMemo(
+    () => items.find((c) => c.id === st.contentId) ?? selected,
+    [items, st.contentId, selected],
+  )
+
+  // ---------- 开始 / 结束 ----------
+  const targetSec =
+    mode === 'countdown' || goalOn ? Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, durationMin)) * 60 : undefined
+
+  const startSession = () => {
+    startFocus({
+      mode,
+      targetSec,
+      contentName: selected?.name ?? '自由专注',
+      contentId: selected?.id,
+    })
+    setOverlay(true)
+  }
+
+  const minimize = () => {
+    setOverlay(false)
+    toast('专注已最小化，右下角浮时钟可随时查看', { description: '可以去背书或任何页面，计时在后台继续' })
+  }
+
+  // ---------- 自定义时长 ----------
+  const openCustom = () => {
+    const d = Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, durationMin))
+    setCustomH(Math.floor(d / 60))
+    setCustomM(d % 60)
+    setUnlimited(mode === 'countup' && !goalOn)
+    setCustomOpen(true)
+  }
+
+  const confirmCustom = () => {
+    const total = customH * 60 + customM
+    if (total < MIN_MINUTES) {
+      toast.error('时长至少 1 分钟')
+      return
+    }
+    setDurationMin(Math.min(MAX_MINUTES, total))
+    if (mode === 'countup') setGoalOn(!unlimited)
+    setCustomOpen(false)
+  }
+
+  // ---------- 预设管理 ----------
+  const openManage = () => {
+    setManageView('list')
+    setManageOpen(true)
+  }
+
+  const openForm = (c: FocusContentData | null) => {
     setEditing(c)
     setName(c?.name ?? '')
-    setMinutes(c?.minutes ?? 25)
+    setMMinutes(c?.minutes ?? 25)
     setBg(c?.bg ?? '')
     setLocalBg(c && c.bg.startsWith('data:') ? c.bg : null)
-    setScreen('edit')
+    setManageView('form')
   }
 
-  const openTimer = (c: FocusContentData) => {
-    setActiveId(c.id)
-    setDurationMin(c.minutes)
-    setMode('down')
-    setRemainingSec(c.minutes * 60)
-    setElapsedSec(0)
-    setPaused(false)
-    setRunning(false)
-    setScreen('timer')
+  const savePreset = async () => {
+    const trimmed = name.trim()
+    if (!trimmed || saving) return
+    setSaving(true)
+    try {
+      const payload = { name: trimmed.slice(0, 30), minutes: mMinutes, bg }
+      const res = editing
+        ? await fetch('/api/focus', {
+            method: 'PATCH',
+            headers: JSON_HEADERS,
+            body: JSON.stringify({ id: editing.id, ...payload }),
+          })
+        : await fetch('/api/focus', {
+            method: 'POST',
+            headers: JSON_HEADERS,
+            body: JSON.stringify(payload),
+          })
+      if (!res.ok) {
+        const data = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(data.error || '保存失败')
+      }
+      toast.success('已保存')
+      setManageView('list')
+      void fetchList()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setSaving(false)
+    }
   }
 
-  const move = async (index: number, dir: -1 | 1) => {
+  const movePreset = async (index: number, dir: -1 | 1) => {
     const j = index + dir
     if (j < 0 || j >= items.length) return
     const next = [...items]
     const tmp = next[index]
     next[index] = next[j]
     next[j] = tmp
-    // 本地立即重排 + 顺序号（index+1），只 PATCH 顺序变化的行
     setItems(next.map((c, idx) => ({ ...c, ord: idx + 1 })))
     try {
       const changed = next
@@ -400,49 +414,10 @@ export function FocusApp({ onBack }: FocusAppProps) {
       })
       if (!res.ok) throw new Error('删除失败')
       setItems((list) => list.filter((x) => x.id !== c.id))
-      if (lastUsedId === c.id) {
-        try {
-          localStorage.removeItem(LAST_USED_KEY)
-        } catch {
-          // ignore
-        }
-        setLastUsedId(null)
-      }
+      if (selected?.id === c.id) setSelected(null)
       toast.success('已删除')
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '删除失败')
-    }
-  }
-
-  // ---------- 新建/编辑保存 ----------
-  const save = async () => {
-    const trimmed = name.trim()
-    if (!trimmed || saving) return
-    setSaving(true)
-    try {
-      const payload = { name: trimmed.slice(0, 30), minutes, bg }
-      const res = editing
-        ? await fetch('/api/focus', {
-            method: 'PATCH',
-            headers: JSON_HEADERS,
-            body: JSON.stringify({ id: editing.id, ...payload }),
-          })
-        : await fetch('/api/focus', {
-            method: 'POST',
-            headers: JSON_HEADERS,
-            body: JSON.stringify(payload),
-          })
-      if (!res.ok) {
-        const data = (await res.json().catch(() => ({}))) as { error?: string }
-        throw new Error(data.error || '保存失败')
-      }
-      toast.success('已保存')
-      setScreen('list')
-      void fetchList()
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : '保存失败')
-    } finally {
-      setSaving(false)
     }
   }
 
@@ -459,69 +434,16 @@ export function FocusApp({ onBack }: FocusAppProps) {
     }
   }
 
-  // ---------- 计时操作 ----------
-  const startSession = () => {
-    const now = Date.now()
-    if (mode === 'down') {
-      endAtRef.current = now + durationMin * 60 * 1000
-      frozenRef.current = 0
-      setRemainingSec(durationMin * 60)
-    } else {
-      baseRef.current = now
-      frozenRef.current = 0
-      setElapsedSec(0)
-    }
-    sessionActiveRef.current = true
-    setPaused(false)
-    setRunning(true)
-  }
-
-  const togglePause = () => {
-    const now = Date.now()
-    if (paused) {
-      // 继续
-      if (mode === 'down') {
-        endAtRef.current = now + frozenRef.current * 1000
-      } else {
-        baseRef.current = now - frozenRef.current * 1000
-      }
-      setPaused(false)
-    } else {
-      // 暂停
-      if (mode === 'down') {
-        frozenRef.current = Math.max(0, Math.round(((endAtRef.current ?? now) - now) / 1000))
-      } else {
-        frozenRef.current = Math.floor((now - (baseRef.current ?? now)) / 1000)
-      }
-      setPaused(true)
-    }
-  }
-
-  const displaySec = mode === 'down' ? remainingSec : elapsedSec
+  // ---------- 展示用 ----------
+  const displaySec = getDisplaySec(st)
+  const elapsedSec = getElapsedSec(st)
+  const modeLabel = mode === 'countdown' ? '倒计时' : '正计时'
+  const overlayBgUrl = resolveBgUrl(activeContent?.bg ?? '')
+  const goalActive = mode === 'countdown' || goalOn
 
   // ============================================================
   // 渲染
   // ============================================================
-
-  const headerRight =
-    screen === 'list' ? (
-      <button
-        type="button"
-        onClick={() => openEdit(null)}
-        className="z-10 ml-auto shrink-0 rounded-full px-2 py-1 text-base font-bold text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        新建
-      </button>
-    ) : screen === 'edit' ? (
-      <button
-        type="button"
-        onClick={save}
-        disabled={!name.trim() || saving}
-        className="z-10 ml-auto shrink-0 rounded-full px-2 py-1 text-base font-bold text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-      >
-        {saving ? <Loader2 className="size-4 animate-spin" /> : '完成'}
-      </button>
-    ) : null
 
   return (
     <>
@@ -531,509 +453,655 @@ export function FocusApp({ onBack }: FocusAppProps) {
           <button
             type="button"
             aria-label="返回"
-            onClick={screen === 'list' ? onBack : () => setScreen('list')}
+            onClick={step === 'mode' ? onBack : () => setStep('mode')}
             className="shrink-0 rounded-full p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ChevronLeft className="size-6 text-foreground" strokeWidth={1.75} />
           </button>
-
-          {screen === 'timer' ? (
-            // 计时页：居中分段控件（倒计时/正计时）
-            <div
-              role="tablist"
-              aria-label="计时模式"
-              className="absolute left-1/2 z-10 flex w-56 -translate-x-1/2 rounded-full bg-zinc-200/70 p-1"
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected={mode === 'down'}
-                onClick={() => setMode('down')}
-                className={cn(
-                  'flex-1 rounded-full py-1.5 text-sm transition-colors',
-                  mode === 'down'
-                    ? 'bg-white font-semibold shadow-sm text-foreground'
-                    : 'text-zinc-500',
-                )}
-              >
-                倒计时
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-selected={mode === 'up'}
-                onClick={() => setMode('up')}
-                className={cn(
-                  'flex-1 rounded-full py-1.5 text-sm transition-colors',
-                  mode === 'up'
-                    ? 'bg-white font-semibold shadow-sm text-foreground'
-                    : 'text-zinc-500',
-                )}
-              >
-                正计时
-              </button>
-            </div>
-          ) : (
-            <h1 className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-lg font-bold">
-              {screen === 'list' ? '选择专注内容' : editing ? '编辑专注内容' : '新建专注内容'}
-            </h1>
-          )}
-
-          {headerRight}
+          <h1 className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-lg font-bold">
+            {step === 'mode' ? '专注' : '选择专注内容'}
+          </h1>
         </div>
       </header>
 
       {/* ---------- 主体 ---------- */}
-      {screen === 'list' && (
-        <main className="min-w-0 flex-1 bg-muted/40">
-          <div className="mx-auto w-full max-w-2xl px-4 py-5">
-            {loading ? (
-              <div className="flex items-center justify-center gap-2 py-24 text-muted-foreground">
-                <Loader2 className="size-5 animate-spin" />
-                <span className="text-sm">加载中…</span>
-              </div>
-            ) : items.length === 0 ? (
-              <div className="flex justify-center pt-16">
-                <div className="flex flex-col items-center justify-center rounded-2xl border-2 border-dashed border-zinc-300 px-10 py-14 text-center">
-                  <p className="text-sm text-zinc-500">还没有专注内容，点击右上角「新建」创建</p>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col gap-4">
-                {items.map((c, i) => {
-                  const bgUrl = resolveBgUrl(c.bg)
-                  return (
-                    <div
-                      key={c.id}
-                      role="button"
-                      tabIndex={0}
-                      aria-label={`开始专注：${c.name}`}
-                      onClick={() => openTimer(c)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault()
-                          openTimer(c)
-                        }
-                      }}
-                      className="relative min-h-44 cursor-pointer overflow-hidden rounded-2xl text-zinc-900 shadow-sm outline-none transition-transform focus-visible:ring-2 focus-visible:ring-ring active:scale-[0.99]"
-                    >
-                      {/* 背景层：渐变兜底 + 图片 */}
-                      <div className="absolute inset-0 bg-gradient-to-br from-white via-slate-100 to-slate-200" />
-                      {bgUrl && (
-                        <img
-                          src={bgUrl}
-                          alt=""
-                          onError={hideImgOnError}
-                          className="absolute inset-0 h-full w-full object-cover"
-                        />
-                      )}
-                      {/* 提升文字可读性的浅色遮罩 */}
-                      <div className="absolute inset-0 bg-gradient-to-b from-white/35 via-white/15 to-white/45" />
-
-                      <div className="relative z-10 flex min-h-44 flex-col p-4">
-                        {/* 顶部：图标行 + 最近使用标记 */}
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="flex gap-2">
-                            <CircleIcon label="编辑" onClick={(e) => { e.stopPropagation(); openEdit(c) }}>
-                              <SquarePen className="size-4 text-zinc-700" strokeWidth={1.75} />
-                            </CircleIcon>
-                            <CircleIcon
-                              label="上移"
-                              disabled={i === 0}
-                              onClick={(e) => { e.stopPropagation(); void move(i, -1) }}
-                            >
-                              <ChevronUp className="size-4 text-zinc-700" strokeWidth={1.75} />
-                            </CircleIcon>
-                            <CircleIcon
-                              label="下移"
-                              disabled={i === items.length - 1}
-                              onClick={(e) => { e.stopPropagation(); void move(i, 1) }}
-                            >
-                              <ChevronDown className="size-4 text-zinc-700" strokeWidth={1.75} />
-                            </CircleIcon>
-                            <AlertDialog>
-                              <AlertDialogTrigger asChild>
-                                <CircleIcon
-                                  label="删除"
-                                  onClick={(e) => { e.stopPropagation() }}
-                                >
-                                  <Trash2 className="size-4 text-zinc-700" strokeWidth={1.75} />
-                                </CircleIcon>
-                              </AlertDialogTrigger>
-                              <AlertDialogContent className="max-w-xs rounded-2xl">
-                                <AlertDialogHeader>
-                                  <AlertDialogTitle>删除专注内容？</AlertDialogTitle>
-                                  <AlertDialogDescription>
-                                    将删除「{c.name}」及其全部专注记录，此操作不可恢复。
-                                  </AlertDialogDescription>
-                                </AlertDialogHeader>
-                                <AlertDialogFooter>
-                                  <AlertDialogCancel>取消</AlertDialogCancel>
-                                  <AlertDialogAction
-                                    className="bg-red-500 text-white hover:bg-red-500/90"
-                                    onClick={() => void doDelete(c)}
-                                  >
-                                    删除
-                                  </AlertDialogAction>
-                                </AlertDialogFooter>
-                              </AlertDialogContent>
-                            </AlertDialog>
-                          </div>
-                          {lastUsedId === c.id && (
-                            <span
-                              aria-label="最近使用"
-                              className="grid size-7 shrink-0 place-items-center rounded-full bg-zinc-900"
-                            >
-                              <Check className="size-4 text-white" strokeWidth={2} />
-                            </span>
-                          )}
-                        </div>
-
-                        {/* 中部：名称 */}
-                        <div className="flex flex-1 items-center py-2">
-                          <h2 className="break-words text-2xl font-bold leading-snug">{c.name}</h2>
-                        </div>
-
-                        {/* 底部：时长/次数 + 进度环 + 今日 */}
-                        <div className="flex items-center justify-between gap-3">
-                          <div className="min-w-0">
-                            <p className="text-base font-bold">{c.minutes}分钟</p>
-                            <p className="mt-0.5 text-xs text-zinc-500">已专注 {c.focusCount} 次</p>
-                          </div>
-                          <ProgressRing seconds={c.todaySeconds} total={c.minutes * 60} />
-                          <p className="shrink-0 text-sm font-medium">
-                            今日 {Math.round(c.todaySeconds / 60)} 分钟
-                          </p>
-                        </div>
-                      </div>
+      <main className="min-w-0 flex-1 bg-muted/40">
+        <div className="mx-auto w-full max-w-2xl px-4 py-5">
+          {loading ? (
+            <div className="flex items-center justify-center gap-2 py-24 text-muted-foreground">
+              <Loader2 className="size-5 animate-spin" />
+              <span className="text-sm">加载中…</span>
+            </div>
+          ) : (
+            <>
+              {running ? (
+                /* ===== 专注进行中：横幅（可最小化状态） ===== */
+                <div className="rounded-3xl bg-zinc-900 p-5 text-white shadow-sm">
+                  <div className="flex items-center gap-2">
+                    {!st.paused && (
+                      <span className="relative flex size-2">
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                        <span className="relative inline-flex size-2 rounded-full bg-emerald-500" />
+                      </span>
+                    )}
+                    <span className="text-sm text-white/70">正在专注</span>
+                    <span className="ml-auto text-xs text-white/50">
+                      {st.mode === 'countdown' ? '倒计时' : '正计时'}
+                      {st.paused ? ' · 已暂停' : ''}
+                    </span>
+                  </div>
+                  <div className="mt-2 flex items-end justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-lg font-bold">{st.contentName || '自由专注'}</p>
+                      <p className="text-xs text-white/50">计时在后台继续，可以去背书等任何页面</p>
                     </div>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-        </main>
-      )}
-
-      {screen === 'edit' && (
-        <main className="min-w-0 flex-1 bg-muted/40">
-          <div className="mx-auto w-full max-w-2xl px-4 py-6">
-            <p className="mb-2 text-base text-muted-foreground">专注内容名称</p>
-            <input
-              value={name}
-              maxLength={30}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="请输入专注内容,如:奴才这就去读书"
-              aria-label="专注内容名称"
-              className="h-14 w-full rounded-2xl border-0 bg-white px-4 text-base shadow-sm outline-none placeholder:text-zinc-400 focus-visible:ring-2 focus-visible:ring-ring"
-            />
-
-            <p className="mb-3 mt-6 text-base text-muted-foreground">设置默认专注时长</p>
-            <div className="no-scrollbar flex gap-3 overflow-x-auto pb-1">
-              {DURATIONS.map((d) => (
-                <button
-                  key={d}
-                  type="button"
-                  aria-pressed={minutes === d}
-                  onClick={() => setMinutes(d)}
-                  className={cn(
-                    'flex h-14 min-w-fit shrink-0 items-center rounded-xl border bg-white px-6 text-lg shadow-sm transition-colors',
-                    minutes === d
-                      ? 'border-blue-500 ring-2 ring-blue-500'
-                      : 'border-transparent text-foreground',
-                  )}
-                >
-                  {d}min
-                </button>
-              ))}
-            </div>
-
-            <p className="mb-3 mt-6 text-base text-muted-foreground">选择背景</p>
-            <div className="grid grid-cols-3 gap-3">
-              {/* 本地图片 */}
-              <label
-                className={cn(
-                  'relative flex aspect-[9/16] cursor-pointer flex-col items-center justify-center gap-2 overflow-hidden rounded-2xl border-2 bg-white text-zinc-500 transition',
-                  localBg && bg === localBg
-                    ? 'border-blue-500 ring-2 ring-blue-500/40'
-                    : 'border-dashed border-zinc-300 hover:border-zinc-400',
-                )}
-              >
-                {localBg ? (
-                  <>
-                    <img
-                      src={localBg}
-                      alt="自定义背景"
-                      onError={hideImgOnError}
-                      className="absolute inset-0 h-full w-full object-cover"
-                    />
-                    <span className="relative z-10 rounded-full bg-white/70 px-2 py-0.5 text-xs text-zinc-600 backdrop-blur">
-                      自定义
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <Plus className="size-6" strokeWidth={1.75} />
-                    <span className="text-sm">添加本地图片</span>
-                  </>
-                )}
-                <input
-                  type="file"
-                  accept="image/*"
-                  className="hidden"
-                  aria-label="添加本地图片"
-                  onChange={(e) => void onPickImage(e)}
-                />
-              </label>
-
-              {/* 预设背景 */}
-              {BG_PRESETS.map((p) => (
-                <button
-                  key={p.key}
-                  type="button"
-                  aria-pressed={bg === p.key}
-                  aria-label={`背景 ${p.key}`}
-                  onClick={() => setBg(p.key)}
-                  className={cn(
-                    'relative aspect-[9/16] overflow-hidden rounded-2xl border-2 bg-gradient-to-br from-white via-slate-100 to-slate-200 transition',
-                    bg === p.key
-                      ? 'border-blue-500 ring-2 ring-blue-500/40'
-                      : 'border-transparent',
-                  )}
-                >
-                  <img
-                    src={p.src}
-                    alt=""
-                    onError={hideImgOnError}
-                    className="absolute inset-0 h-full w-full object-cover"
-                  />
-                </button>
-              ))}
-
-              {/* 无背景 */}
-              <button
-                type="button"
-                aria-pressed={bg === ''}
-                aria-label="无背景"
-                onClick={() => setBg('')}
-                className={cn(
-                  'relative flex aspect-[9/16] items-center justify-center overflow-hidden rounded-2xl border-2 bg-gradient-to-br from-white via-slate-100 to-slate-200 transition',
-                  bg === '' ? 'border-blue-500 ring-2 ring-blue-500/40' : 'border-transparent',
-                )}
-              >
-                <span className="text-sm text-zinc-500">无背景</span>
-              </button>
-            </div>
-          </div>
-        </main>
-      )}
-
-      {screen === 'timer' && content && (
-        <main className="min-w-0 flex-1 bg-muted/40">
-          <div className="mx-auto flex w-full max-w-2xl flex-col items-center px-4 pb-10 pt-4">
-            <div className="flex w-full flex-1 flex-col items-center justify-center gap-6">
-              {/* 内容名称（点击返回列表切换） */}
-              <button
-                type="button"
-                aria-label="切换专注内容"
-                onClick={() => setScreen('list')}
-                className="flex items-center gap-1 rounded-full px-3 py-1 outline-none transition-colors hover:bg-white focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                <span className="max-w-[16rem] truncate text-2xl font-bold text-zinc-900">
-                  {content.name}
-                </span>
-                <ChevronRight className="size-5 shrink-0 text-zinc-400" strokeWidth={1.75} />
-              </button>
-
-              {/* 大圆盘 */}
-              {mode === 'down' ? (
-                <div className="relative flex size-80 flex-col items-center justify-center rounded-full border-[3px] border-zinc-200 bg-white/60">
-                  <div className="flex items-center gap-3">
+                    <p className="shrink-0 text-4xl font-bold leading-none tabular-nums">{fmtClock(displaySec)}</p>
+                  </div>
+                  <div className="mt-4 flex gap-2">
                     <button
                       type="button"
-                      aria-label="减少一分钟"
-                      onClick={() => setDurationMin((m) => Math.max(1, m - 1))}
-                      className="grid size-8 place-items-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={() => setOverlay(true)}
+                      className="flex h-11 flex-1 items-center justify-center gap-1.5 rounded-full bg-white text-sm font-semibold text-zinc-900 transition-colors hover:bg-white/90"
                     >
-                      <span className="block h-0 w-0 border-y-[9px] border-y-transparent border-r-[14px] border-r-blue-600" />
+                      <Play className="size-4" strokeWidth={1.75} />
+                      回到计时
                     </button>
-                    <span className="text-6xl font-bold tabular-nums text-zinc-900">
-                      {fmt(durationMin * 60)}
-                    </span>
                     <button
                       type="button"
-                      aria-label="增加一分钟"
-                      onClick={() => setDurationMin((m) => Math.min(180, m + 1))}
-                      className="grid size-8 place-items-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                      onClick={() => void stopFocus(true)}
+                      className="h-11 flex-1 rounded-full bg-white/10 text-sm font-medium text-white transition-colors hover:bg-white/20"
                     >
-                      <span className="block h-0 w-0 border-y-[9px] border-y-transparent border-l-[14px] border-l-blue-600" />
+                      结束并保存
                     </button>
                   </div>
-                  <p className="mt-2 text-base text-muted-foreground">专注时长</p>
+                </div>
+              ) : step === 'mode' ? (
+                /* ===== 第一步：选择计时方式 ===== */
+                <div>
+                  <p className="text-sm text-muted-foreground">第一步 · 选择计时方式</p>
+                  <div className="mt-3 grid grid-cols-2 gap-3">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMode('countup')
+                        setStep('content')
+                      }}
+                      className="flex h-44 flex-col justify-between rounded-3xl border border-transparent bg-white p-5 text-left shadow-sm transition-all hover:border-zinc-900 active:scale-[0.98]"
+                    >
+                      <span className="grid size-12 place-items-center rounded-2xl bg-zinc-900 text-white">
+                        <ArrowUp className="size-6" strokeWidth={1.75} />
+                      </span>
+                      <span>
+                        <span className="block text-2xl font-bold">正计时</span>
+                        <span className="mt-1 block text-sm text-zinc-500">从 0 开始向上累计</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMode('countdown')
+                        setStep('content')
+                      }}
+                      className="flex h-44 flex-col justify-between rounded-3xl border border-transparent bg-white p-5 text-left shadow-sm transition-all hover:border-zinc-900 active:scale-[0.98]"
+                    >
+                      <span className="grid size-12 place-items-center rounded-2xl bg-zinc-900 text-white">
+                        <ArrowDown className="size-6" strokeWidth={1.75} />
+                      </span>
+                      <span>
+                        <span className="block text-2xl font-bold">倒计时</span>
+                        <span className="mt-1 block text-sm text-zinc-500">设定时长，倒数到 0</span>
+                      </span>
+                    </button>
+                  </div>
+                  <p className="mt-3 text-xs text-zinc-400">选好后第二步可选专注内容（可跳过）</p>
                 </div>
               ) : (
-                <div className="relative flex size-80 items-center justify-center">
-                  <svg
-                    viewBox="0 0 320 320"
-                    className="absolute inset-0 size-80 -rotate-90"
-                    aria-hidden
+                /* ===== 第二步：选择专注内容（可选） ===== */
+                <div className="flex flex-col gap-3">
+                  <p className="text-sm text-muted-foreground">
+                    第二步 · 选择专注内容<span className="text-zinc-400">（可选，不选也能开始）</span>
+                  </p>
+
+                  {/* 顶部：自定义时长 + 管理预设 */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={openCustom}
+                      className="flex h-10 items-center gap-2 rounded-full border bg-white px-4 text-sm font-medium transition-colors hover:bg-zinc-50"
+                    >
+                      <Clock3 className="size-4 text-zinc-500" strokeWidth={1.75} />
+                      自定义时长
+                    </button>
+                    <button
+                      type="button"
+                      onClick={openManage}
+                      className="ml-auto flex h-10 items-center gap-1.5 rounded-full border bg-white px-4 text-sm font-medium transition-colors hover:bg-zinc-50"
+                    >
+                      <Settings2 className="size-4 text-zinc-500" strokeWidth={1.75} />
+                      管理预设
+                    </button>
+                  </div>
+
+                  {/* 不选，直接开始 */}
+                  <button
+                    type="button"
+                    aria-pressed={selected === null}
+                    onClick={() => setSelected(null)}
+                    className={cn(
+                      'flex items-center gap-3 rounded-2xl border-2 border-dashed p-4 text-left transition-colors',
+                      selected === null ? 'border-zinc-900 bg-zinc-50' : 'border-zinc-300 bg-white',
+                    )}
                   >
-                    <circle
-                      cx="160"
-                      cy="160"
-                      r="156"
-                      fill="none"
-                      stroke="#e4e4e7"
-                      strokeWidth="4"
-                      strokeLinecap="round"
-                      strokeDasharray="2.2 14.14"
-                    />
-                  </svg>
-                  <span className="text-6xl font-bold tabular-nums text-zinc-900">00:00</span>
+                    <span className="grid size-10 shrink-0 place-items-center rounded-full bg-zinc-900 text-white">
+                      <Play className="size-4" strokeWidth={1.75} />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block font-bold">不选，直接开始</span>
+                      <span className="block text-xs text-zinc-500">跳过内容选择，随时开始专注</span>
+                    </span>
+                    {selected === null && <Check className="size-5 shrink-0 text-zinc-900" strokeWidth={2} />}
+                  </button>
+
+                  {/* 预设卡片 */}
+                  {items.map((c) => {
+                    const active = selected?.id === c.id
+                    return (
+                      <button
+                        key={c.id}
+                        type="button"
+                        aria-pressed={active}
+                        onClick={() => {
+                          setSelected(c)
+                          setDurationMin(Math.min(MAX_MINUTES, Math.max(MIN_MINUTES, c.minutes)))
+                        }}
+                        className={cn(
+                          'flex items-center gap-3 rounded-2xl border-2 bg-white p-4 text-left transition-all',
+                          active ? 'border-zinc-900 ring-2 ring-zinc-900/10' : 'border-transparent shadow-sm',
+                        )}
+                      >
+                        <span className="grid size-10 shrink-0 place-items-center rounded-full bg-zinc-100 text-sm font-bold text-zinc-700">
+                          {c.minutes}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate font-bold">{c.name}</span>
+                          <span className="block text-xs text-zinc-500">
+                            默认 {fmtDurationMin(c.minutes)} · 今日 {Math.round((c.todaySeconds || 0) / 60)} 分钟
+                          </span>
+                        </span>
+                        {active && <Check className="size-5 shrink-0 text-zinc-900" strokeWidth={2} />}
+                      </button>
+                    )
+                  })}
+
+                  {items.length === 0 && (
+                    <div className="rounded-2xl border-2 border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-500">
+                      还没有专注内容，点右上角「管理预设」新建，或直接「不选，直接开始」
+                    </div>
+                  )}
+
+                  {/* 本次时长（正计时 = 目标时长） */}
+                  <div className="rounded-2xl border bg-white p-4">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-sm text-muted-foreground">
+                        {mode === 'countdown'
+                          ? '本次倒数时长'
+                          : goalOn
+                            ? '目标时长（到点提醒）'
+                            : '正计时不限时'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={openCustom}
+                        className="text-sm font-medium text-zinc-500 underline-offset-2 transition-colors hover:text-zinc-900 hover:underline"
+                      >
+                        自定义
+                      </button>
+                    </div>
+                    <div className="mt-2 flex items-center justify-center gap-4">
+                      <button
+                        type="button"
+                        aria-label="减少一分钟"
+                        disabled={!goalActive || durationMin <= MIN_MINUTES}
+                        onClick={() => {
+                          setDurationMin((m) => Math.max(MIN_MINUTES, m - 1))
+                          if (mode === 'countup') setGoalOn(true)
+                        }}
+                        className="grid size-9 place-items-center rounded-full border transition-colors hover:bg-zinc-50 disabled:opacity-30"
+                      >
+                        <Minus className="size-4 text-zinc-700" strokeWidth={1.75} />
+                      </button>
+                      <span className="min-w-24 text-center text-2xl font-bold tabular-nums">
+                        {goalActive ? fmtDurationMin(durationMin) : '不限时'}
+                      </span>
+                      <button
+                        type="button"
+                        aria-label="增加一分钟"
+                        disabled={!goalActive || durationMin >= MAX_MINUTES}
+                        onClick={() => {
+                          setDurationMin((m) => Math.min(MAX_MINUTES, m + 1))
+                          if (mode === 'countup') setGoalOn(true)
+                        }}
+                        className="grid size-9 place-items-center rounded-full border transition-colors hover:bg-zinc-50 disabled:opacity-30"
+                      >
+                        <Plus className="size-4 text-zinc-700" strokeWidth={1.75} />
+                      </button>
+                    </div>
+                    {mode === 'countup' && (
+                      <div className="mt-3 flex items-center justify-center gap-2">
+                        <Switch
+                          checked={goalOn}
+                          onCheckedChange={(v: boolean) => setGoalOn(v)}
+                          aria-label="到点提醒开关"
+                        />
+                        <span className="text-xs text-zinc-500">到点提醒（达到目标时长自动结束）</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 开始按钮：黑色大胶囊 */}
+                  <button
+                    type="button"
+                    onClick={startSession}
+                    className="mt-1 h-14 w-full rounded-full bg-zinc-900 text-lg font-medium text-white shadow-sm transition-transform active:scale-[0.98]"
+                  >
+                    开始专注
+                  </button>
                 </div>
               )}
+
+              {/* ===== 统计（首页/横幅页展示） ===== */}
+              {step === 'mode' && (
+                <section className="mt-8">
+                  <h2 className="mb-3 text-sm font-semibold text-zinc-500">专注统计</h2>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="rounded-2xl bg-white p-4 shadow-sm">
+                      <p className="text-xs text-zinc-500">今日专注</p>
+                      <p className="mt-1 text-2xl font-bold tabular-nums">
+                        {todayMin}
+                        <span className="ml-1 text-sm font-medium text-zinc-500">分钟</span>
+                      </p>
+                    </div>
+                    <div className="rounded-2xl bg-white p-4 shadow-sm">
+                      <p className="text-xs text-zinc-500">累计专注</p>
+                      <p className="mt-1 text-2xl font-bold tabular-nums">
+                        {totalCount}
+                        <span className="ml-1 text-sm font-medium text-zinc-500">次</span>
+                      </p>
+                    </div>
+                  </div>
+
+                  <h2 className="mb-3 mt-6 text-sm font-semibold text-zinc-500">今日记录</h2>
+                  <div className="overflow-hidden rounded-2xl bg-white shadow-sm">
+                    {history.length === 0 ? (
+                      <p className="p-5 text-center text-sm text-zinc-400">今天还没有专注记录</p>
+                    ) : (
+                      history
+                        .slice()
+                        .reverse()
+                        .map((e, i) => (
+                          <div
+                            key={`${e.at}-${i}`}
+                            className={cn(
+                              'flex items-center justify-between gap-3 px-4 py-3',
+                              i > 0 && 'border-t',
+                            )}
+                          >
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-medium">{e.name}</p>
+                              <p className="text-xs text-zinc-400">{timeStr(e.at)} 结束</p>
+                            </div>
+                            <p className="shrink-0 text-sm font-semibold tabular-nums">
+                              {fmtDurHuman(e.seconds)}
+                            </p>
+                          </div>
+                        ))
+                    )}
+                  </div>
+                  <p className="mt-2 text-center text-[11px] text-zinc-400">
+                    记录列表保存在本设备 · 分钟/次数统计来自服务器
+                  </p>
+                </section>
+              )}
+            </>
+          )}
+        </div>
+      </main>
+
+      {/* ---------- 全屏计时遮罩（不锁死：可最小化） ---------- */}
+      {overlay && running && (
+        <div
+          className="fixed inset-0 z-50 overflow-hidden bg-zinc-900"
+          role="timer"
+          aria-label="专注计时中"
+        >
+          {overlayBgUrl && (
+            <img
+              src={overlayBgUrl}
+              alt=""
+              onError={hideImgOnError}
+              className="absolute inset-0 h-full w-full object-cover"
+            />
+          )}
+          <div className="absolute inset-0 bg-gradient-to-b from-black/60 via-black/40 to-black/60" />
+
+          {/* 最小化 */}
+          <button
+            type="button"
+            onClick={minimize}
+            className="absolute left-4 top-4 z-10 flex h-10 items-center gap-1.5 rounded-full bg-white/10 px-4 text-sm font-medium text-white backdrop-blur transition-colors hover:bg-white/20"
+          >
+            <Minimize2 className="size-4" strokeWidth={1.75} />
+            最小化
+          </button>
+
+          <div className="relative z-10 flex h-full flex-col items-center justify-center px-6 pb-28">
+            <p className="max-w-full truncate text-base font-medium text-white/70">
+              {st.contentName || '自由专注'}
+            </p>
+            <div className="mt-4 text-6xl font-bold tabular-nums text-white sm:text-7xl">
+              {fmtClock(displaySec)}
             </div>
-
-            {/* 开始按钮 */}
-            <button
-              type="button"
-              onClick={startSession}
-              className="h-14 w-full max-w-sm rounded-full bg-zinc-900 text-lg font-medium text-white shadow-sm transition-transform active:scale-[0.98]"
-            >
-              开始专注
-            </button>
-
-            {/* 学霸模式 */}
-            <div className="mt-5 flex items-center justify-center gap-3 rounded-2xl bg-white px-6 py-3 shadow-sm">
-              <button
-                type="button"
-                role="switch"
-                aria-checked={scholarMode}
-                aria-label="学霸模式开关"
-                onClick={() => setScholarMode((v) => !v)}
-                className={cn(
-                  'grid size-5 shrink-0 place-items-center rounded-full border-2 transition-colors',
-                  scholarMode ? 'border-zinc-900' : 'border-zinc-300',
-                )}
-              >
-                {scholarMode && <span className="size-2.5 rounded-full bg-zinc-900" />}
-              </button>
-              <span className="text-base font-medium text-zinc-900">学霸模式</span>
-              <button
-                type="button"
-                onClick={() => setWhitelistOpen(true)}
-                className="text-base font-medium text-blue-600 underline-offset-2 hover:underline"
-              >
-                白名单
-              </button>
-            </div>
-
-            <p className="mt-4 px-8 text-center text-xs leading-relaxed text-zinc-500">
-              学霸模式：打开学霸模式并开始计时后，会阻止其他app打开，以达到专注的效果
+            <p className="mt-3 text-sm text-white/60">
+              {st.mode === 'countdown'
+                ? `倒计时 · 已专注 ${fmtClock(elapsedSec)}`
+                : st.targetSec
+                  ? `正计时 · 目标 ${fmtClock(st.targetSec)}`
+                  : '正计时不限时'}
+              {st.paused ? ' · 已暂停' : ''}
             </p>
           </div>
-        </main>
+
+          {/* 暂停 / 结束 */}
+          <div className="absolute inset-x-0 bottom-12 z-10 flex justify-center gap-3 px-6">
+            <button
+              type="button"
+              onClick={st.paused ? resumeFocus : pauseFocus}
+              className="h-12 w-32 rounded-full bg-white/10 text-base font-medium text-white backdrop-blur transition-colors hover:bg-white/20"
+            >
+              {st.paused ? '继续' : '暂停'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void stopFocus(true)}
+              className="h-12 w-32 rounded-full bg-white text-base font-semibold text-zinc-900 transition-colors hover:bg-white/90"
+            >
+              结束并保存
+            </button>
+          </div>
+          <p className="absolute inset-x-0 bottom-3 z-10 text-center text-xs text-white/40">
+            最小化后计时仍在后台继续
+          </p>
+        </div>
       )}
 
-      {/* ---------- 白名单说明弹窗 ---------- */}
-      <Dialog open={whitelistOpen} onOpenChange={setWhitelistOpen}>
+      {/* ---------- 自定义时长 Dialog ---------- */}
+      <Dialog open={customOpen} onOpenChange={setCustomOpen}>
         <DialogContent className="max-w-xs rounded-2xl">
           <DialogHeader>
-            <DialogTitle>白名单</DialogTitle>
-            <DialogDescription className="text-sm leading-relaxed">
-              白名单功能仅限APP，网页版可在专注时保持本标签页
+            <DialogTitle>自定义时长</DialogTitle>
+            <DialogDescription>
+              {mode === 'countdown' ? '本次倒计时的倒数时长' : '正计时的目标时长，到点自动结束'}
             </DialogDescription>
           </DialogHeader>
+
+          <div className="grid grid-cols-2 gap-3">
+            <Stepper label="时" value={customH} min={0} max={23} onChange={setCustomH} />
+            <Stepper label="分" value={customM} min={0} max={59} onChange={setCustomM} />
+          </div>
+          <p className="text-center text-sm text-zinc-500">共 {customH * 60 + customM} 分钟</p>
+
+          <div className="no-scrollbar flex justify-center gap-2 overflow-x-auto">
+            {[15, 25, 45, 60, 90].map((d) => (
+              <button
+                key={d}
+                type="button"
+                onClick={() => {
+                  setCustomH(Math.floor(d / 60))
+                  setCustomM(d % 60)
+                }}
+                className={cn(
+                  'shrink-0 rounded-full border px-3 py-1.5 text-sm transition-colors hover:bg-zinc-50',
+                  customH * 60 + customM === d && 'border-zinc-900 font-semibold',
+                )}
+              >
+                {d} 分钟
+              </button>
+            ))}
+          </div>
+
+          {mode === 'countup' && (
+            <label className="flex items-center justify-between rounded-xl border p-3">
+              <span className="text-sm">不限时（不设目标）</span>
+              <Switch checked={unlimited} onCheckedChange={(v: boolean) => setUnlimited(v)} />
+            </label>
+          )}
+
+          <button
+            type="button"
+            onClick={confirmCustom}
+            disabled={customH * 60 + customM < MIN_MINUTES}
+            className="h-12 w-full rounded-full bg-zinc-900 font-medium text-white transition-transform active:scale-[0.98] disabled:opacity-40"
+          >
+            确定
+          </button>
         </DialogContent>
       </Dialog>
 
-      {/* ---------- 沉浸式计时全屏遮罩 ---------- */}
-      <AnimatePresence>
-        {running && content && (
-          <motion.div
-            key="focus-running"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.3 }}
-            className="fixed inset-0 z-50 overflow-hidden bg-zinc-900"
-            role="timer"
-            aria-label="专注计时中"
-          >
-            {/* 背景图 + 暗色渐变 */}
-            {(() => {
-              const bgUrl = resolveBgUrl(content.bg)
-              return (
-                <>
-                  {bgUrl && (
-                    <img
-                      src={bgUrl}
-                      alt=""
-                      onError={hideImgOnError}
-                      className="absolute inset-0 h-full w-full object-cover"
-                    />
-                  )}
-                  <div className="absolute inset-0 bg-gradient-to-b from-black/60 via-black/40 to-black/60" />
-                </>
-              )
-            })()}
-
-            <div className="relative z-10 flex h-full flex-col items-center justify-center px-6">
-              <p className="max-w-full truncate text-base font-medium text-white/70">
-                {content.name}
-              </p>
-              <div className="mt-4 text-7xl font-bold tabular-nums text-white">{fmt(displaySec)}</div>
-              <p className="mt-3 text-sm text-white/60">
-                {mode === 'down' ? (paused ? '已暂停' : '倒计时') : paused ? '已暂停' : '正计时'}
-              </p>
-
-              <div className="mt-14 flex items-center gap-4">
-                <button
-                  type="button"
-                  onClick={togglePause}
-                  className="h-12 rounded-full bg-white/10 px-8 text-base font-medium text-white backdrop-blur transition-colors hover:bg-white/20"
-                >
-                  {paused ? '继续' : '暂停'}
-                </button>
-                <AlertDialog
-                  open={giveUpOpen}
-                  onOpenChange={(open) => {
-                    setGiveUpOpen(open)
-                  }}
-                >
-                  <AlertDialogTrigger asChild>
+      {/* ---------- 管理预设 Dialog ---------- */}
+      <Dialog
+        open={manageOpen}
+        onOpenChange={(o) => {
+          setManageOpen(o)
+          if (!o) setManageView('list')
+        }}
+      >
+        <DialogContent className="max-w-md rounded-2xl">
+          {manageView === 'list' ? (
+            <>
+              <DialogHeader>
+                <DialogTitle>管理专注内容</DialogTitle>
+                <DialogDescription>新建、编辑、排序或删除专注内容预设</DialogDescription>
+              </DialogHeader>
+              <div className="flex max-h-[50vh] flex-col gap-2 overflow-y-auto">
+                {items.map((c, i) => (
+                  <div key={c.id} className="flex items-center gap-1.5 rounded-xl border p-2.5">
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm font-semibold">{c.name}</p>
+                      <p className="text-xs text-zinc-500">默认 {fmtDurationMin(c.minutes)}</p>
+                    </div>
                     <button
                       type="button"
-                      className="h-12 rounded-full bg-red-500 px-8 text-base font-medium text-white transition-colors hover:bg-red-500/90"
+                      aria-label={`上移 ${c.name}`}
+                      disabled={i === 0}
+                      onClick={() => void movePreset(i, -1)}
+                      className="grid size-8 shrink-0 place-items-center rounded-full transition-colors hover:bg-zinc-100 disabled:opacity-30"
                     >
-                      放弃
+                      <ChevronUp className="size-4 text-zinc-600" strokeWidth={1.75} />
                     </button>
-                  </AlertDialogTrigger>
-                  <AlertDialogContent className="max-w-xs rounded-2xl bg-zinc-900 text-white">
-                    <AlertDialogHeader>
-                      <AlertDialogTitle className="text-white">放弃专注？</AlertDialogTitle>
-                      <AlertDialogDescription className="text-white/70">
-                        已专注 {Math.floor(displaySec / 60)} 分钟，超过 1 分钟的时长仍会被记录。
-                      </AlertDialogDescription>
-                    </AlertDialogHeader>
-                    <AlertDialogFooter>
-                      <AlertDialogCancel className="bg-transparent text-white hover:bg-white/10 hover:text-white">
-                        继续专注
-                      </AlertDialogCancel>
-                      <AlertDialogAction
-                        className="bg-red-500 text-white hover:bg-red-500/90"
-                        onClick={() => void finishRef.current(false)}
-                      >
-                        放弃
-                      </AlertDialogAction>
-                    </AlertDialogFooter>
-                  </AlertDialogContent>
-                </AlertDialog>
+                    <button
+                      type="button"
+                      aria-label={`下移 ${c.name}`}
+                      disabled={i === items.length - 1}
+                      onClick={() => void movePreset(i, 1)}
+                      className="grid size-8 shrink-0 place-items-center rounded-full transition-colors hover:bg-zinc-100 disabled:opacity-30"
+                    >
+                      <ChevronDown className="size-4 text-zinc-600" strokeWidth={1.75} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`编辑 ${c.name}`}
+                      onClick={() => openForm(c)}
+                      className="grid size-8 shrink-0 place-items-center rounded-full transition-colors hover:bg-zinc-100"
+                    >
+                      <SquarePen className="size-4 text-zinc-600" strokeWidth={1.75} />
+                    </button>
+                    <AlertDialog>
+                      <AlertDialogTrigger asChild>
+                        <button
+                          type="button"
+                          aria-label={`删除 ${c.name}`}
+                          className="grid size-8 shrink-0 place-items-center rounded-full transition-colors hover:bg-zinc-100"
+                        >
+                          <Trash2 className="size-4 text-zinc-600" strokeWidth={1.75} />
+                        </button>
+                      </AlertDialogTrigger>
+                      <AlertDialogContent className="max-w-xs rounded-2xl">
+                        <AlertDialogHeader>
+                          <AlertDialogTitle>删除专注内容？</AlertDialogTitle>
+                          <AlertDialogDescription>
+                            将删除「{c.name}」及其全部专注记录，此操作不可恢复。
+                          </AlertDialogDescription>
+                        </AlertDialogHeader>
+                        <AlertDialogFooter>
+                          <AlertDialogCancel>取消</AlertDialogCancel>
+                          <AlertDialogAction
+                            className="bg-red-500 text-white hover:bg-red-500/90"
+                            onClick={() => void doDelete(c)}
+                          >
+                            删除
+                          </AlertDialogAction>
+                        </AlertDialogFooter>
+                      </AlertDialogContent>
+                    </AlertDialog>
+                  </div>
+                ))}
+                {items.length === 0 && (
+                  <p className="py-6 text-center text-sm text-zinc-400">还没有专注内容</p>
+                )}
               </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+              <button
+                type="button"
+                onClick={() => openForm(null)}
+                className="h-11 w-full rounded-full bg-zinc-900 text-sm font-medium text-white transition-transform active:scale-[0.98]"
+              >
+                ＋ 新建专注内容
+              </button>
+            </>
+          ) : (
+            <>
+              <DialogHeader>
+                <DialogTitle>{editing ? '编辑专注内容' : '新建专注内容'}</DialogTitle>
+              </DialogHeader>
+
+              <input
+                value={name}
+                maxLength={30}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="专注内容名称，如：背第一章"
+                aria-label="专注内容名称"
+                className="h-11 w-full rounded-xl border bg-background px-3 text-base outline-none placeholder:text-zinc-400 focus-visible:ring-2 focus-visible:ring-ring"
+              />
+
+              <div>
+                <p className="mb-2 text-sm text-muted-foreground">默认专注时长</p>
+                <div className="no-scrollbar flex gap-2 overflow-x-auto pb-1">
+                  {DURATIONS.map((d) => (
+                    <button
+                      key={d}
+                      type="button"
+                      aria-pressed={mMinutes === d}
+                      onClick={() => setMMinutes(d)}
+                      className={cn(
+                        'flex h-10 shrink-0 items-center rounded-xl border bg-white px-4 text-sm transition-colors',
+                        mMinutes === d
+                          ? 'border-zinc-900 font-semibold ring-2 ring-zinc-900/10'
+                          : 'border-zinc-200 text-foreground',
+                      )}
+                    >
+                      {d}min
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <p className="mb-2 text-sm text-muted-foreground">选择背景（全屏计时展示）</p>
+                <div className="grid grid-cols-4 gap-2">
+                  <label
+                    className={cn(
+                      'relative flex aspect-square cursor-pointer flex-col items-center justify-center gap-1 overflow-hidden rounded-xl border-2 text-zinc-500 transition',
+                      localBg && bg === localBg
+                        ? 'border-zinc-900'
+                        : 'border-dashed border-zinc-300 hover:border-zinc-400',
+                    )}
+                  >
+                    {localBg ? (
+                      <img
+                        src={localBg}
+                        alt="自定义背景"
+                        onError={hideImgOnError}
+                        className="absolute inset-0 h-full w-full object-cover"
+                      />
+                    ) : (
+                      <>
+                        <Plus className="size-5" strokeWidth={1.75} />
+                        <span className="text-xs">本地图</span>
+                      </>
+                    )}
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      aria-label="添加本地图片"
+                      onChange={(e) => void onPickImage(e)}
+                    />
+                  </label>
+                  {BG_PRESETS.map((p) => (
+                    <button
+                      key={p.key}
+                      type="button"
+                      aria-label={`背景 ${p.key}`}
+                      aria-pressed={bg === p.key}
+                      onClick={() => setBg(p.key)}
+                      className={cn(
+                        'relative aspect-square overflow-hidden rounded-xl border-2 transition',
+                        bg === p.key ? 'border-zinc-900' : 'border-transparent',
+                      )}
+                    >
+                      <img
+                        src={p.src}
+                        alt=""
+                        onError={hideImgOnError}
+                        className="absolute inset-0 h-full w-full object-cover"
+                      />
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    aria-label="无背景"
+                    aria-pressed={bg === ''}
+                    onClick={() => setBg('')}
+                    className={cn(
+                      'flex aspect-square items-center justify-center overflow-hidden rounded-xl border-2 bg-gradient-to-br from-zinc-100 to-zinc-200 text-xs text-zinc-500 transition',
+                      bg === '' ? 'border-zinc-900' : 'border-transparent',
+                    )}
+                  >
+                    无背景
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setManageView('list')}
+                  className="h-11 flex-1 rounded-full border text-sm font-medium transition-colors hover:bg-zinc-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void savePreset()}
+                  disabled={!name.trim() || saving}
+                  className="h-11 flex-1 rounded-full bg-zinc-900 text-sm font-medium text-white transition-colors hover:bg-zinc-800 disabled:opacity-40"
+                >
+                  {saving ? <Loader2 className="mx-auto size-4 animate-spin" /> : '保存'}
+                </button>
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
     </>
   )
 }

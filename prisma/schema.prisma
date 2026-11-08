@@ -17,15 +17,27 @@ datasource db {
 //              [{ front, back, hidden }] (核心论点/完整内容)
 // `deletedAt`: soft-delete timestamp — set when moved to 回收站, null = active
 model Card {
+  id         String    @id @default(uuid())
+  title      String
+  content    String
+  keywords   String    @default("[]")
+  strokes    String    @default("[]")
+  plan       String    @default("")
+  mindmaps   String    @default("[]")
+  blocks     String    @default("[]")
+  categoryId String    @default("") // 项目分类 id（"" = 未分类）
+  pinned     Boolean   @default(false) // 置顶
+  ord        Int       @default(0) // 自定义排序序号
+  deletedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+}
+
+// 项目（分类文件夹）— 侧边栏「项目」区。删除项目时卡片移入未分类("")。
+model Project {
   id        String   @id @default(uuid())
-  title     String
-  content   String
-  keywords  String   @default("[]")
-  strokes   String   @default("[]")
-  plan      String   @default("")
-  mindmaps  String   @default("[]")
-  blocks    String   @default("[]")
-  deletedAt DateTime?
+  name      String
+  ord       Int      @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -59,6 +71,8 @@ model Settings {
   asrModel    String?
   // 错题本：答对后自动移除错题 — 答对N次后 (1/2/3/5)
   quizAutoRemove Int @default(2)
+  // 导入时是否开启 AI 自动挖空
+  aiAutoCloze Boolean @default(false)
 }
 
 // The single app account. Registration is only allowed while this table is

@@ -46,7 +46,7 @@ export function ClozeEditorBar({
               className={cn(
                 'flex h-11 items-center justify-center gap-1.5 rounded-xl border px-1 transition-colors',
                 t.active
-                  ? 'border-indigo-600 bg-indigo-600/10 text-indigo-600'
+                  ? 'border-emerald-600 bg-emerald-600/10 text-emerald-600'
                   : 'border-border bg-background text-foreground hover:bg-accent/60',
               )}
             >
