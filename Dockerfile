@@ -45,8 +45,17 @@ RUN mkdir -p /app/data \
   && chown -R node:node /app
 VOLUME /app/data
 
-# Next.js standalone output: server.js + .next + node_modules subset.
+# Next.js standalone output: server.js + .next + node_modules subset (nft-traced).
 COPY --from=builder --chown=node:node /app/.next/standalone ./
+
+# serverExternalPackages (pdf-parse/pdfjs-dist/mammoth) are NOT bundled into the
+# server bundle — they stay as runtime require(). nft tracing copies them into
+# standalone/node_modules, but mammoth's complex dep tree (@xmldom/xmldom, jszip,
+# lop, underscore, xmlbuilder …) and pdf-parse's worker files are frequently
+# MISSED by nft, causing `Cannot find module 'mammoth'` at runtime → /api/parse
+# returns 500 before even reaching the session check. Copy the FULL node_modules
+# to guarantee every external package + its deps are resolvable at runtime.
+COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 
 EXPOSE 3000
 
