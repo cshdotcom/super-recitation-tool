@@ -1,10 +1,10 @@
-// 待复习（due for review）：
-// GET  /api/review/due -> { cards: [{ id, title, lastAction, lastActionAt, daysSince }] }
-//   规则：取每张卡最近一次打分动作（familiar/fuzzy/forget）作为「上次复习」；
-//   有动作即视为待复习；跳过提醒免打扰未到期（AppState review:snooze:<cardId>）的卡片。
-//   按上次复习时间升序（最久未复习在前）。
-// POST /api/review/due { cardIds: string[], days: number } -> { ok: true }
-//   为卡片设置 N 天提醒免打扰（AppState key: review:snooze:<cardId>，value: 到期 ISO 时间）。
+// 待复习（due for review）—— SM-2 间隔复习驱动：
+// GET  /api/review/due -> { cards: [{ id, title, lastAction, lastActionAt, daysSince, nextReviewAt }] }
+//   规则：卡片 nextReviewAt <= now（到期待复习）或 nextReviewAt 为空（从未复习的新导入卡片）。
+//   复习后 POST /api/review 会更新 nextReviewAt = now + interval，卡片自动离开待复习队列。
+//   跳过提醒免打扰未到期（AppState review:snooze:<cardId>）的卡片。
+//   按 nextReviewAt 升序（最该复习的在前），无 nextReviewAt 的（新卡）排最前。
+// POST /api/review/due { cardIds, days } -> { ok: true }  N 天免打扰
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAccount } from '@/lib/auth'
@@ -21,24 +21,29 @@ export async function GET() {
 
   try {
     const now = new Date()
-    // Single-user app: datasets are small, aggregate in memory.
     const [logs, cards, snoozes] = await Promise.all([
       db.reviewLog.findMany({ orderBy: { createdAt: 'asc' } }),
       db.card.findMany({
         where: { deletedAt: null },
-        select: { id: true, title: true },
+        select: {
+          id: true,
+          title: true,
+          nextReviewAt: true,
+          lastReviewedAt: true,
+          interval: true,
+        },
       }),
       db.appState.findMany({ where: { key: { startsWith: SNOOZE_PREFIX } } }),
     ])
 
-    // Latest score action per card (logs are asc → last write wins).
+    // 最新一次评分动作（用于显示上次复习状态）
     const latestByCard = new Map<string, { action: string; at: Date }>()
     for (const l of logs) {
       if (!(SCORE_ACTIONS as readonly string[]).includes(l.action)) continue
       latestByCard.set(l.cardId, { action: l.action, at: l.createdAt })
     }
 
-    // 提醒免打扰：cardId -> snoozeUntil (ms)
+    // 免打扰到期时间
     const snoozeUntil = new Map<string, number>()
     for (const s of snoozes) {
       const t = new Date(s.value).getTime()
@@ -51,24 +56,42 @@ export async function GET() {
       lastAction: string
       lastActionAt: string
       daysSince: number
+      nextReviewAt: string | null
+      isNew: boolean
     }[] = []
 
+    const nowMs = now.getTime()
     for (const c of cards) {
-      const last = latestByCard.get(c.id)
-      if (!last) continue
+      // 免打扰未到期 → 跳过
       const until = snoozeUntil.get(c.id)
-      if (until !== undefined && until > now.getTime()) continue
+      if (until !== undefined && until > nowMs) continue
+
+      const last = latestByCard.get(c.id)
+      // 待复习条件：nextReviewAt 为空（从未复习的新卡）或 nextReviewAt <= now（到期）
+      const nr = c.nextReviewAt
+      const isDue = nr === null || nr.getTime() <= nowMs
+      if (!isDue) continue
+
       due.push({
         id: c.id,
         title: c.title,
-        lastAction: last.action,
-        lastActionAt: last.at.toISOString(),
-        daysSince: Math.max(0, Math.floor((now.getTime() - last.at.getTime()) / DAY_MS)),
+        lastAction: last?.action ?? 'none',
+        lastActionAt: last?.at.toISOString() ?? c.createdAt.toISOString(),
+        daysSince: last
+          ? Math.max(0, Math.floor((nowMs - last.at.getTime()) / DAY_MS))
+          : Math.max(0, Math.floor((nowMs - c.createdAt.getTime()) / DAY_MS)),
+        nextReviewAt: nr ? nr.toISOString() : null,
+        isNew: nr === null,
       })
     }
 
-    // 最久未复习的排前面
-    due.sort((a, b) => a.lastActionAt.localeCompare(b.lastActionAt))
+    // 排序：新卡（无 nextReviewAt）排最前，其次按 nextReviewAt 升序（最该复习的在前）
+    due.sort((a, b) => {
+      if (a.isNew && !b.isNew) return -1
+      if (!a.isNew && b.isNew) return 1
+      if (a.nextReviewAt && b.nextReviewAt) return a.nextReviewAt.localeCompare(b.nextReviewAt)
+      return 0
+    })
 
     return NextResponse.json({ cards: due })
   } catch (err) {

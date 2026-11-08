@@ -11,6 +11,12 @@ import { kwText, normKeywordEntries } from '@/lib/cloze'
 import { extractClozeMarks } from '@/lib/editor-cloze'
 import type { ImportPayload } from '@/components/recitation/import-sheet'
 import NextDynamic from 'next/dynamic'
+import {
+  Sheet as SheetGlobal,
+  SheetContent as SheetContentGlobal,
+  SheetHeader as SheetHeaderGlobal,
+  SheetTitle as SheetTitleGlobal,
+} from '@/components/ui/sheet'
 
 // 全部视图与重型组件懒加载：拆小编译图，避免 dev 编译内存峰值触发 OOM。
 const HomeView = NextDynamic(
@@ -93,6 +99,11 @@ const CameraCapture = NextDynamic(
   () => import('@/components/recitation/camera-capture').then((m) => m.CameraCapture),
   { ssr: false, loading: () => null },
 )
+// 全局朗读播放器：挂载在 app 根，跨视图持续播放，收起后迷你条在任何界面都显示
+const TtsPlayerGlobal = NextDynamic(
+  () => import('@/components/recitation/tts-player').then((m) => m.TtsPlayer),
+  { ssr: false, loading: () => null },
+)
 
 function PageSkeleton() {
   return (
@@ -172,6 +183,9 @@ export default function Page() {
   const [editorTitle, setEditorTitle] = React.useState('')
   const [shareCard, setShareCard] = React.useState<CardData | null>(null)
   const [settingsOpen, setSettingsOpen] = React.useState(false)
+  // 全局朗读播放器：ttsCard 非空即挂载；收起后 ttsCollapsed=true，迷你条跨视图常驻
+  const [ttsCard, setTtsCard] = React.useState<CardData | null>(null)
+  const [ttsCollapsed, setTtsCollapsed] = React.useState(false)
 
   const saveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -845,6 +859,7 @@ export default function Page() {
           onOpenMaterialEditor={handleEditContent}
           onOpenOverview={() => setView('review-overview')}
           onOpenPlanEditor={handleOpenPlanEditor}
+          onStartTts={(c) => { setTtsCard(c); setTtsCollapsed(false) }}
         />
       ) : view === 'wrong' ? (
         <WrongQuestionsView onBack={() => setView('home')} />
@@ -966,6 +981,37 @@ export default function Page() {
 
       {/* 全局浮时钟（专注进行中右下角可见，点击查看详情） */}
       <FocusFloatingClock />
+
+      {/* 全局朗读播放器：跨视图持续播放，收起后迷你条在任何界面都显示直到关闭。
+          Sheet open 联动 !ttsCollapsed；forceMount 保持 TtsPlayer 挂载，音频不中断。
+          收起时 Sheet 滑出屏幕（无空白），迷你条 portal 到 body 在所有界面显示。 */}
+      {ttsCard && settings && (
+        <SheetGlobal
+          open={!ttsCollapsed}
+          onOpenChange={(o) => { if (!o) setTtsCollapsed(true) }}
+        >
+          <SheetContentGlobal
+            side="bottom"
+            forceMount
+            className="flex h-[94dvh] flex-col rounded-t-3xl bg-background p-0"
+          >
+            <SheetHeaderGlobal className="sr-only">
+              <SheetTitleGlobal>AI朗读</SheetTitleGlobal>
+            </SheetHeaderGlobal>
+            <TtsPlayerGlobal
+              text={ttsCard.content}
+              settings={settings}
+              context="reader"
+              cardTitle={ttsCard.title}
+              cardId={ttsCard.id}
+              favoritesKey={ttsCard.id}
+              collapsed={ttsCollapsed}
+              onCollapsedChange={setTtsCollapsed}
+              onClose={() => { setTtsCard(null); setTtsCollapsed(false) }}
+            />
+          </SheetContentGlobal>
+        </SheetGlobal>
+      )}
     </div>
   )
 }

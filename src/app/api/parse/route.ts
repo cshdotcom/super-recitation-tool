@@ -139,11 +139,9 @@ export async function POST(req: NextRequest) {
         await parser.destroy().catch(() => {})
       }
     } else if (kind === 'docx') {
-      // Pass BOTH `buffer` (Node path) and `arrayBuffer` (browser-field path).
-      // Under a standalone production build where mammoth is NOT listed in
-      // serverExternalPackages, its `browser` field would remap unzip.js to a
-      // build that only reads options.arrayBuffer — supplying both keeps the
-      // call robust regardless of which unzip implementation is loaded.
+      // 同时传 buffer（Node 版 unzip 用）+ arrayBuffer（browser-field 版 unzip 用），
+      // 无论 mammoth 是否被外部化都能正常解析。mammoth 已列入 serverExternalPackages，
+      // 生产环境用 Node 版 lib/unzip.js（认 buffer），此 arrayBuffer 为防御性兜底。
       const arrayBuffer = buffer.buffer.slice(
         buffer.byteOffset,
         buffer.byteOffset + buffer.byteLength,
@@ -159,10 +157,11 @@ export async function POST(req: NextRequest) {
 
     content = tidyText(content)
     if (!content) {
-      return NextResponse.json(
-        { error: '未能从文件中提取到文字（可能是扫描版 PDF 或空文档）' },
-        { status: 422 },
-      )
+      const hint =
+        kind === 'pdf'
+          ? '未能从文件中提取到文字（可能是扫描版 PDF 或图片版 PDF，无文字层）。建议改用「拍照/AI 扫描」识别图片文字'
+          : '未能从文件中提取到文字（可能是空文档）'
+      return NextResponse.json({ error: hint }, { status: 422 })
     }
 
     const title = deriveTitle(filename, content, kind)

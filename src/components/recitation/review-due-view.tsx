@@ -76,6 +76,21 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
     void load()
   }, [load])
 
+  // 复习后回到本列表自动刷新：页面重新可见（从阅读页返回）或窗口聚焦时重新拉取，
+  // 让刚评分的卡片（nextReviewAt 已推进）立即从待复习队列消失。
+  React.useEffect(() => {
+    const reload = () => void load()
+    const onVis = () => {
+      if (document.visibilityState === 'visible') reload()
+    }
+    document.addEventListener('visibilitychange', onVis)
+    window.addEventListener('focus', reload)
+    return () => {
+      document.removeEventListener('visibilitychange', onVis)
+      window.removeEventListener('focus', reload)
+    }
+  }, [load])
+
   // ---------- selection ----------
   const toggleSelect = (id: string) => {
     setSelected((prev) => {

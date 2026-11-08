@@ -27,15 +27,58 @@ export async function POST(req: NextRequest) {
     if (!cardId) return NextResponse.json({ error: '缺少 cardId' }, { status: 400 })
     const duration = Math.min(3600, Math.max(0, Math.round(Number(body?.durationSec) || 0)))
 
-    const log = await db.reviewLog.create({
-      data: {
-        cardId,
-        cardTitle: String(body?.cardTitle || '').slice(0, 120),
-        action,
-        durationSec: duration,
-      },
+    // ---- SM-2 间隔复习调度 ----
+    // 根据本次评分(familiar/fuzzy/forget) + 卡片当前 ease/interval 计算下次复习时间，
+    // 并更新 Card 的复习字段。这样复习过的卡片不会立即再次出现在待复习队列。
+    const card = await db.card.findUnique({
+      where: { id: cardId },
+      select: { ease: true, interval: true, reviewCount: true },
     })
-    return NextResponse.json({ id: log.id })
+    let ease = card?.ease ?? 2.5
+    let interval = card?.interval ?? 0
+    const reps = (card?.reviewCount ?? 0) + 1
+
+    // 评分映射到 SM-2 quality：熟悉=5(完美) 模糊=3(模糊) 忘记=1(忘记但认得)
+    const q = action === 'familiar' ? 5 : action === 'fuzzy' ? 3 : 1
+    // 更新 ease：ease += 0.1 - (5-q)*(0.08+(5-q)*0.02)，下限 1.3
+    ease = Math.max(1.3, ease + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02)))
+    // 计算新间隔
+    if (q < 3) {
+      // 忘记/模糊：重置间隔为 1 天（重新开始）
+      interval = 1
+    } else if (reps === 1) {
+      interval = 1
+    } else if (reps === 2) {
+      interval = action === 'familiar' ? 3 : 2
+    } else {
+      // 后续：interval = round(interval * ease)，熟悉上限 30 天，模糊上限 7 天
+      const nextInt = Math.round(interval * ease)
+      interval = action === 'familiar' ? Math.min(30, nextInt) : Math.min(7, nextInt)
+    }
+    const nextReviewAt = new Date(Date.now() + interval * 86400000)
+
+    // 并行：写日志 + 更新卡片复习调度
+    const [log] = await Promise.all([
+      db.reviewLog.create({
+        data: {
+          cardId,
+          cardTitle: String(body?.cardTitle || '').slice(0, 120),
+          action,
+          durationSec: duration,
+        },
+      }),
+      db.card.update({
+        where: { id: cardId },
+        data: {
+          ease,
+          interval,
+          reviewCount: reps,
+          lastReviewedAt: new Date(),
+          nextReviewAt,
+        },
+      }),
+    ])
+    return NextResponse.json({ id: log.id, nextReviewAt, interval })
   } catch (err) {
     console.error('[POST /api/review] failed:', err)
     return NextResponse.json(

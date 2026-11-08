@@ -114,6 +114,9 @@ interface ReaderViewProps {
   onOpenOverview?: () => void
   /** 打开制作背书计划（本书进度弹窗 → 计划管理） */
   onOpenPlanEditor?: () => void
+  /** 全局朗读：由父级（page.tsx）挂载 TtsPlayer，跨视图持续播放。
+   *  提供时本组件不再渲染本地播放器 Sheet，朗读按钮改为调用此回调。 */
+  onStartTts?: (card: CardData) => void
 }
 
 // Split paragraphs into paged-mode pages (~3 paragraphs or ~600 chars each).
@@ -201,6 +204,7 @@ export function ReaderView({
   onOpenMaterialEditor,
   onOpenOverview,
   onOpenPlanEditor,
+  onStartTts,
 }: ReaderViewProps) {
   // reading state
   const [revealed, setRevealed] = React.useState<Set<number>>(new Set())
@@ -838,8 +842,8 @@ export function ReaderView({
                   )}
                   onClick={() => {
                     toast.info(`朗读将使用：${ttsEngineLabel(settings)}`)
-                    setPlayerCollapsed(false)
-                    setTtsOpen(true)
+                    if (onStartTts) onStartTts(card)
+                    else { setPlayerCollapsed(false); setTtsOpen(true) }
                   }}
                 >
                   <Volume2 className="size-5" strokeWidth={1.75} />
@@ -1467,32 +1471,32 @@ export function ReaderView({
       {/* 选区朗读临时播放器（主播放器未打开时也生效，取消即消失） */}
       <SelectionReadPlayer settings={settings} context="reader" />
 
-      {/* AI 朗读 — 全屏音乐播放器（可收起为迷你悬浮条继续播放）
-          收起时 Sheet 关闭（forceMount 保持 TtsPlayer 挂载，音频不中断），
-          迷你条 portal 到 body 显示；展开时 Sheet 重新滑入显示完整面板。
-          这样收起后不再有「一片空白」的空 Sheet 面板。 */}
-      <Sheet open={ttsOpen && !playerCollapsed} onOpenChange={(o) => { setTtsOpen(o); if (!o) setPlayerCollapsed(false) }}>
-        <SheetContent
-          side="bottom"
-          forceMount
-          className="flex h-[94dvh] flex-col rounded-t-3xl bg-background p-0"
-        >
-          <SheetHeader className="sr-only">
-            <SheetTitle>AI朗读</SheetTitle>
-          </SheetHeader>
-          <TtsPlayer
-            text={card.content}
-            settings={settings}
-            context="reader"
-            cardTitle={card.title}
-            cardId={card.id}
-            favoritesKey={card.id}
-            collapsed={playerCollapsed}
-            onCollapsedChange={setPlayerCollapsed}
-            onClose={() => { setTtsOpen(false); setPlayerCollapsed(false) }}
-          />
-        </SheetContent>
-      </Sheet>
+      {/* AI 朗读 — 本地播放器（仅当未启用全局播放器时渲染；全局播放器由 page.tsx 挂载）。
+          收起时 Sheet 关闭（forceMount 保活），迷你条 portal 到 body。 */}
+      {!onStartTts && (
+        <Sheet open={ttsOpen && !playerCollapsed} onOpenChange={(o) => { setTtsOpen(o); if (!o) setPlayerCollapsed(false) }}>
+          <SheetContent
+            side="bottom"
+            forceMount
+            className="flex h-[94dvh] flex-col rounded-t-3xl bg-background p-0"
+          >
+            <SheetHeader className="sr-only">
+              <SheetTitle>AI朗读</SheetTitle>
+            </SheetHeader>
+            <TtsPlayer
+              text={card.content}
+              settings={settings}
+              context="reader"
+              cardTitle={card.title}
+              cardId={card.id}
+              favoritesKey={card.id}
+              collapsed={playerCollapsed}
+              onCollapsedChange={setPlayerCollapsed}
+              onClose={() => { setTtsOpen(false); setPlayerCollapsed(false) }}
+            />
+          </SheetContent>
+        </Sheet>
+      )}
     </>
   )
 }
