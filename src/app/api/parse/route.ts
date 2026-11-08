@@ -139,7 +139,19 @@ export async function POST(req: NextRequest) {
         await parser.destroy().catch(() => {})
       }
     } else if (kind === 'docx') {
-      const { value } = await mammoth.extractRawText({ buffer })
+      // Pass BOTH `buffer` (Node path) and `arrayBuffer` (browser-field path).
+      // Under a standalone production build where mammoth is NOT listed in
+      // serverExternalPackages, its `browser` field would remap unzip.js to a
+      // build that only reads options.arrayBuffer — supplying both keeps the
+      // call robust regardless of which unzip implementation is loaded.
+      const arrayBuffer = buffer.buffer.slice(
+        buffer.byteOffset,
+        buffer.byteOffset + buffer.byteLength,
+      )
+      const { value } = await mammoth.extractRawText({
+        buffer,
+        arrayBuffer,
+      })
       content = value || ''
     } else {
       content = decodeText(buffer)
