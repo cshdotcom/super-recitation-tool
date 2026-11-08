@@ -297,7 +297,7 @@ export function SharedCardView({ token, onExit }: SharedCardViewProps) {
                 </div>
                 <ClozeText
                   content={state.card.content}
-                  keywords={state.card.keywords}
+                  keywords={normKeywordEntries(state.card.keywords)}
                   style="circle"
                   showAnswers={showAnswers}
                   fontSize={18}

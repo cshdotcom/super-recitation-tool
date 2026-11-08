@@ -139,7 +139,9 @@ model FocusContent {
 // One row per completed focus session — powers 今日 X 分钟 / 已专注 N 次 stats.
 model FocusLog {
   id        String   @id @default(uuid())
-  contentId String
+  // 关联专注内容（自由专注未选内容时为空，用 name 记录展示名）
+  contentId String?
+  name      String   @default("")
   seconds   Int      @default(0)
   createdAt DateTime @default(now())
 }

@@ -261,3 +261,60 @@ export function extractJSON<T = unknown>(text: string): T {
     }
   }
 }
+
+/**
+ * Last-resort salvage: scan raw LLM output for balanced `{...}` objects that
+ * look like quiz questions (contain "question") and parse each one
+ * independently. Survives truncated or outer-malformed responses where the
+ * whole payload cannot be repaired as a unit.
+ */
+export function extractQuestionObjects(raw: string): unknown[] {
+  const t = raw || ''
+  const out: unknown[] = []
+  let i = 0
+  while (i < t.length) {
+    if (t[i] !== '{') {
+      i++
+      continue
+    }
+    let depth = 0
+    let inStr = false
+    let esc = false
+    let end = -1
+    for (let j = i; j < t.length; j++) {
+      const ch = t[j]
+      if (inStr) {
+        if (esc) esc = false
+        else if (ch === '\\') esc = true
+        else if (ch === '"') inStr = false
+      } else if (ch === '"') {
+        inStr = true
+      } else if (ch === '{') {
+        depth++
+      } else if (ch === '}') {
+        depth--
+        if (depth === 0) {
+          end = j
+          break
+        }
+      }
+    }
+    if (end === -1) break
+    const slice = t.slice(i, end + 1)
+    if (slice.includes('"question"') || slice.includes('question')) {
+      let obj: unknown = null
+      try {
+        obj = JSON.parse(slice)
+      } catch {
+        try {
+          obj = JSON.parse(repairJSON(slice))
+        } catch {
+          obj = null
+        }
+      }
+      if (obj && typeof obj === 'object') out.push(obj)
+    }
+    i = end + 1
+  }
+  return out
+}

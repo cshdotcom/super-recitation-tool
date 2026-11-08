@@ -17,7 +17,8 @@
 //   UI 协调    setImmersiveOpen / isImmersiveOpen（focus-app 全屏计时时隐藏浮时钟圆钮）
 //   铃声       getFocusSoundPrefs / saveFocusSoundPrefs / playFocusBell / playBuiltin
 //             FOCUS_BUILTIN_SOUNDS（内置铃声清单）
-//   历史       getTodayHistory（本设备今日会话记录）
+//   历史       今日会话记录已全部服务端持久化（/api/focus/log GET/POST/DELETE，
+//             多设备可见）；本机仅保留运行中会话状态（跨标签页同步需要）
 //   UI 跳转    requestOpenFocusView / consumeOpenFocusRequest（浮时钟「全屏计时」→
 //             window 派发 CustomEvent('sb-open-focus')，页面据此切到专注视图）
 //   组件       FocusFloatingClock（全局挂载一次；圆钮可拖动，位置持久化 ui:focusClockPos）
@@ -72,7 +73,6 @@ export interface FocusStopInfo {
 }
 
 export const FOCUS_BUS_STATE_KEY = 'focus-bus-state-v1'
-export const FOCUS_BUS_HISTORY_KEY = 'focus-bus-history-v1'
 export const FOCUS_BUS_SOUND_KEY = 'focus-bus-sound-v1'
 
 export const FOCUS_BUS_EVENTS = {
@@ -237,7 +237,7 @@ export function resumeFocus(): void {
   ensureTicker()
 }
 
-/** 结束会话。save=true 时写本机历史并上报 /api/focus/log（有 contentId 时）。 */
+/** 结束会话。save=true 时上报 /api/focus/log（自由专注也记录，仅名字）。 */
 export async function stopFocus(save: boolean): Promise<void> {
   if (!state.running) return
   const seconds = getElapsedSec(state)
@@ -246,12 +246,7 @@ export async function stopFocus(save: boolean): Promise<void> {
   setIdle()
   dispatchEv(FOCUS_BUS_EVENTS.STOP, { seconds, name, contentId, save } satisfies FocusStopInfo)
   if (!save || seconds < 1) return
-  pushHistory({ name, seconds, at: Date.now() })
-  if (contentId) {
-    await logToServer(contentId, seconds, false)
-  } else {
-    toast.success(`已结束 · 专注 ${fmtDurHuman(seconds)}（未选专注内容，仅本机记录）`)
-  }
+  await logToServer(contentId ?? null, seconds, false, name)
 }
 
 /** 当前会话状态（只读，勿直接修改） */
@@ -276,12 +271,17 @@ export function consumeRecentComplete(): FocusStopInfo | null {
   return null
 }
 
-async function logToServer(contentId: string, seconds: number, natural: boolean): Promise<boolean> {
+async function logToServer(
+  contentId: string | null,
+  seconds: number,
+  natural: boolean,
+  name: string,
+): Promise<boolean> {
   try {
     const res = await fetch('/api/focus/log', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contentId, seconds }),
+      body: JSON.stringify({ contentId: contentId ?? undefined, name, seconds }),
     })
     if (!res.ok) throw new Error('记录专注时长失败')
     toast.success(`${natural ? '专注完成' : '已结束'} · 已记录 ${fmtDurHuman(seconds)}`)
@@ -320,13 +320,10 @@ async function completeNatural(): Promise<void> {
   const name = state.contentName || '自由专注'
   const contentId = state.contentId
   setIdle()
-  lastComplete = { seconds, name, contentId, saved: Boolean(contentId), at: Date.now() }
+  lastComplete = { seconds, name, contentId, saved: true, at: Date.now() }
   dispatchEv(FOCUS_BUS_EVENTS.COMPLETE, lastComplete satisfies FocusStopInfo)
-  if (seconds >= 1) pushHistory({ name, seconds, at: Date.now() })
-  if (contentId && seconds >= 1) {
-    await logToServer(contentId, seconds, true)
-  } else {
-    toast.success(`专注完成 · ${fmtDurHuman(seconds)}`)
+  if (seconds >= 1) {
+    await logToServer(contentId ?? null, seconds, true, name)
   }
   if (getFocusSoundPrefs().enabled) playFocusBell()
 }
@@ -461,9 +458,11 @@ export function consumeOpenFocusRequest(): boolean {
   return false
 }
 
-// ---------- 本机会话历史（今日记录列表用；服务器 API 无逐条日志查询） ----------
+// ---------- 今日会话记录（服务端持久化 /api/focus/log，多设备可见） ----------
 
 export interface FocusHistoryEntry {
+  /** 服务端记录 id（删除单条用） */
+  id?: string
   /** 内容名（未选内容 = 自由专注） */
   name: string
   seconds: number
@@ -471,34 +470,32 @@ export interface FocusHistoryEntry {
   at: number
 }
 
-function readHistory(): FocusHistoryEntry[] {
-  if (typeof window === 'undefined') return []
+/** 拉取今天的专注会话记录（服务端） */
+export async function fetchTodayFocusLogs(): Promise<FocusHistoryEntry[]> {
   try {
-    const raw = window.localStorage.getItem(FOCUS_BUS_HISTORY_KEY)
-    const list = raw ? (JSON.parse(raw) as FocusHistoryEntry[]) : []
-    return Array.isArray(list) ? list.filter((e) => e && typeof e.at === 'number') : []
+    const res = await fetch(
+      `/api/focus/log?tzOffset=${new Date().getTimezoneOffset()}`,
+    )
+    if (!res.ok) throw new Error('加载专注记录失败')
+    const data = (await res.json()) as { logs?: FocusHistoryEntry[] }
+    return Array.isArray(data.logs) ? data.logs : []
   } catch {
     return []
   }
 }
 
-function pushHistory(entry: FocusHistoryEntry): void {
-  if (typeof window === 'undefined') return
+/** 删除单条专注记录（服务端） */
+export async function deleteFocusLog(id: string): Promise<boolean> {
   try {
-    const list = readHistory()
-    list.push(entry)
-    while (list.length > 500) list.shift()
-    window.localStorage.setItem(FOCUS_BUS_HISTORY_KEY, JSON.stringify(list))
-  } catch {
-    // ignore
+    const res = await fetch(`/api/focus/log?id=${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    })
+    if (!res.ok) throw new Error('删除专注记录失败')
+    return true
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : '删除专注记录失败')
+    return false
   }
-}
-
-/** 今天的会话记录（本设备，按结束时间升序） */
-export function getTodayHistory(): FocusHistoryEntry[] {
-  const start = new Date()
-  start.setHours(0, 0, 0, 0)
-  return readHistory().filter((e) => e.at >= start.getTime())
 }
 
 // ---------- 结束铃声（内置 WebAudio 多款 + 自定义音频 dataURL） ----------

@@ -88,7 +88,13 @@ export async function GET(req: NextRequest) {
     for (const c of contents) {
       agg.set(c.id, { todaySeconds: 0, totalSeconds: 0, focusCount: 0 })
     }
+    // 自由专注（无 contentId）不计入内容卡片聚合，但计入全局 totals
+    const totals = { todaySeconds: 0, totalSeconds: 0, focusCount: 0 }
     for (const l of logs) {
+      totals.totalSeconds += l.seconds
+      totals.focusCount += 1
+      if (dayKey(l.createdAt, tzOffset) === today) totals.todaySeconds += l.seconds
+      if (!l.contentId) continue
       const a = agg.get(l.contentId)
       if (!a) continue
       a.totalSeconds += l.seconds
@@ -100,6 +106,7 @@ export async function GET(req: NextRequest) {
       contents: contents.map((c) =>
         serialize(c, agg.get(c.id) ?? { todaySeconds: 0, totalSeconds: 0, focusCount: 0 }),
       ),
+      totals,
     })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)

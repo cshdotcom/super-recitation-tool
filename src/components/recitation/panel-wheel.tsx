@@ -8,7 +8,7 @@
 //   `wheel:done:<cardId>` -> { [YYYYMMDD]: string[] }  (item ids marked done that day)
 //
 // Views: main (wheel + spin + result) and edit (转盘名称 / 全选 / item list).
-// New wheels are created from a source picker: AI 智能分块 / 按段落 / 按句子 / 按知识块.
+// New wheels are created from a source picker: AI 智能分块 / 按段落 / 按空行 / 按标点 / 按知识块.
 
 import * as React from 'react'
 import { motion } from 'framer-motion'
@@ -26,6 +26,7 @@ import {
   Plus,
   RefreshCw,
   RotateCw,
+  Rows3,
   Sparkles,
   Square,
   Trash2,
@@ -185,7 +186,7 @@ interface WheelPanelProps {
   card?: CardData | null
 }
 
-type WheelSource = 'ai' | 'para' | 'sent' | 'blocks'
+type WheelSource = 'ai' | 'para' | 'blank' | 'sent' | 'blocks'
 
 export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps) {
   const settingsLite = useSettingsLite()
@@ -427,7 +428,14 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
       }
       setAiLoading(false)
     } else if (source === 'para') {
-      texts = content.split(/\n+/).map((t) => t.trim()).filter(Boolean)
+      // 按段落：每一行（含缩进正文行）视为一段
+      texts = content.split(/\n/).map((t) => t.trim()).filter(Boolean)
+    } else if (source === 'blank') {
+      // 按空行：空行（连续换行）之间的文字视为一块
+      texts = content
+        .split(/\n[ \t\u3000]*\n+/)
+        .map((t) => t.replace(/\n/g, ' ').trim())
+        .filter(Boolean)
     } else if (source === 'sent') {
       texts = splitSentences(content).slice(0, SOURCE_CAP)
     } else {
@@ -966,7 +974,7 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
           if (!o && aiLoading) return
           setNewOpen(o)
         }}
-        title="选择抽背范围"
+        title="分块规则"
       >
         <div className="mt-4 flex flex-col gap-2 pb-4">
           <button
@@ -997,8 +1005,25 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
               <AlignLeft className="size-5" strokeWidth={1.75} />
             </span>
             <span className="min-w-0 flex-1">
-              <span className="block text-sm font-semibold">按段落</span>
-              <span className="block truncate text-xs text-muted-foreground">按换行切分段落，每段一项</span>
+              <span className="block text-sm font-semibold">按段落分块</span>
+              <span className="block truncate text-xs text-muted-foreground">每一行视为一段，逐段抽背</span>
+            </span>
+          </button>
+
+          <button
+            type="button"
+            disabled={aiLoading}
+            onClick={() => createWheel('blank')}
+            className="flex min-h-16 w-full items-center gap-3 rounded-2xl border border-border bg-card p-3 text-left transition-colors hover:bg-muted/50 disabled:opacity-60"
+          >
+            <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-teal-100 text-teal-600">
+              <Rows3 className="size-5" strokeWidth={1.75} />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-semibold">按空行分块</span>
+              <span className="block truncate text-xs text-muted-foreground">
+                空行之间的文字合为一块，适合长段落
+              </span>
             </span>
           </button>
 
@@ -1012,7 +1037,7 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
               <Type className="size-5" strokeWidth={1.75} />
             </span>
             <span className="min-w-0 flex-1">
-              <span className="block text-sm font-semibold">按句子</span>
+              <span className="block text-sm font-semibold">按标点分块</span>
               <span className="block truncate text-xs text-muted-foreground">按标点自动分句，最多 30 句</span>
             </span>
           </button>

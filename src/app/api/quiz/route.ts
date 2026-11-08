@@ -12,9 +12,44 @@
 // 'multi' (多选) and 'judge' (判断) types, keeping the original fields intact.
 import { NextRequest, NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
-import { chatComplete, extractJSON } from '@/lib/ai'
+import { chatComplete, extractJSON, extractQuestionObjects } from '@/lib/ai'
 import { getAIConfig } from '@/lib/settings'
 import type { QuizQuestion } from '@/lib/types'
+
+/**
+ * Parse LLM quiz output with layered fallbacks:
+ *   1. extractJSON (balanced extraction + repair)
+ *   2. salvage individual {"question":...} objects from raw text
+ * Returns [] when nothing usable was found.
+ */
+async function parseQuizRaw(raw: string): Promise<QuizQuestionX[]> {
+  try {
+    const parsed = extractJSON<{ questions?: unknown }>(raw)
+    const qs = normalizeQuestions(parsed?.questions)
+    if (qs.length > 0) return qs
+  } catch {
+    /* fall through to salvage */
+  }
+  return normalizeQuestions(extractQuestionObjects(raw))
+}
+
+/** Ask the model once more to re-emit strict JSON when parsing failed. */
+async function retryStrictJSON(
+  raw: string,
+  messages: { role: 'system' | 'user'; content: string }[],
+  config: Awaited<ReturnType<typeof getAIConfig>>,
+): Promise<string> {
+  return chatComplete(
+    [
+      ...messages,
+      {
+        role: 'user' as const,
+        content: `你上一次的回答无法被解析为合法 JSON。请把题目重新输出为严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要代码块以外的任何文字，确保字符串内的引号已转义。`,
+      },
+    ],
+    config,
+  )
+}
 
 type QuizTypeX = QuizQuestion['type'] | 'multi' | 'judge'
 
@@ -121,8 +156,22 @@ export async function POST(req: NextRequest) {
         ],
         config,
       )
-      const parsed = extractJSON<{ questions?: unknown }>(raw)
-      return NextResponse.json({ questions: normalizeQuestions(parsed?.questions) })
+      const messages = [
+        { role: 'system' as const, content: system },
+        { role: 'user' as const, content: `学生做错的题目：\n${listText}` },
+      ]
+      let qs = await parseQuizRaw(raw)
+      if (qs.length === 0) {
+        try {
+          qs = await parseQuizRaw(await retryStrictJSON(raw, messages, config))
+        } catch {
+          qs = []
+        }
+      }
+      if (qs.length === 0) {
+        return NextResponse.json({ error: 'AI 未能生成有效题目，请重试' }, { status: 502 })
+      }
+      return NextResponse.json({ questions: qs })
     }
 
     const content: string = typeof body?.content === 'string' ? body.content : ''
@@ -173,15 +222,24 @@ export async function POST(req: NextRequest) {
         keywords.length > 0 ? `\n\n重点关注词语：${keywords.join('、')}` : ''
       }`
 
-      const raw = await chatComplete(
-        [
-          { role: 'system' as const, content: system },
-          { role: 'user' as const, content: user },
-        ],
-        config,
-      )
-      const parsed = extractJSON<{ questions?: unknown }>(raw)
-      return NextResponse.json({ questions: normalizeQuestions(parsed?.questions) })
+      const messages = [
+        { role: 'system' as const, content: system },
+        { role: 'user' as const, content: user },
+      ]
+
+      const raw = await chatComplete(messages, config)
+      let qs = await parseQuizRaw(raw)
+      if (qs.length === 0) {
+        try {
+          qs = await parseQuizRaw(await retryStrictJSON(raw, messages, config))
+        } catch {
+          qs = []
+        }
+      }
+      if (qs.length === 0) {
+        return NextResponse.json({ error: 'AI 未能生成有效题目，请重试' }, { status: 502 })
+      }
+      return NextResponse.json({ questions: qs })
     }
 
     // ---------- Mode 1: legacy mixed quiz (compat) ----------
@@ -204,9 +262,18 @@ export async function POST(req: NextRequest) {
     ]
 
     const raw = await chatComplete(messages, config)
-    const parsed = extractJSON<{ questions?: unknown }>(raw)
-    const questions = normalizeQuestions(parsed?.questions).slice(0, count)
-    return NextResponse.json({ questions })
+    let questions = await parseQuizRaw(raw)
+    if (questions.length === 0) {
+      try {
+        questions = await parseQuizRaw(await retryStrictJSON(raw, messages, config))
+      } catch {
+        questions = []
+      }
+    }
+    if (questions.length === 0) {
+      return NextResponse.json({ error: 'AI 未能生成有效题目，请重试' }, { status: 502 })
+    }
+    return NextResponse.json({ questions: questions.slice(0, count) })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('[POST /api/quiz] failed:', err)

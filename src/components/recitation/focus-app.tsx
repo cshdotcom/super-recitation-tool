@@ -50,6 +50,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import type { FocusContentData } from '@/lib/types'
@@ -61,7 +62,8 @@ import {
   getDisplaySec,
   getElapsedSec,
   getFocusState,
-  getTodayHistory,
+  fetchTodayFocusLogs,
+  deleteFocusLog,
   pauseFocus,
   resumeFocus,
   setImmersiveOpen,
@@ -219,8 +221,15 @@ export function FocusApp({ onBack }: FocusAppProps) {
   const [items, setItems] = React.useState<FocusContentData[]>([])
   const [loading, setLoading] = React.useState(true)
   const [history, setHistory] = React.useState<FocusHistoryEntry[]>([])
-  // 今日记录详情 Dialog（本地 FocusHistoryEntry，无服务端 id，不可单条删除，仅展示）
+  // 今日记录详情 Dialog（服务端记录，可单条删除）
   const [entryDetail, setEntryDetail] = React.useState<FocusHistoryEntry | null>(null)
+  const [deletingLog, setDeletingLog] = React.useState(false)
+  /** 全局统计（含自由专注），来自 /api/focus totals */
+  const [totals, setTotals] = React.useState<{
+    todaySeconds: number
+    totalSeconds: number
+    focusCount: number
+  } | null>(null)
 
   // ---------- 入口两步 ----------
   const [step, setStep] = React.useState<Step>('mode')
@@ -250,8 +259,12 @@ export function FocusApp({ onBack }: FocusAppProps) {
     try {
       const res = await fetch(`/api/focus?tzOffset=${new Date().getTimezoneOffset()}`)
       if (!res.ok) throw new Error('加载专注内容失败')
-      const data = (await res.json()) as { contents?: FocusContentData[] }
+      const data = (await res.json()) as {
+        contents?: FocusContentData[]
+        totals?: { todaySeconds: number; totalSeconds: number; focusCount: number } | null
+      }
       setItems(data.contents ?? [])
+      setTotals(data.totals ?? null)
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '加载专注内容失败')
     } finally {
@@ -260,7 +273,7 @@ export function FocusApp({ onBack }: FocusAppProps) {
   }, [])
 
   const refreshLocal = React.useCallback(() => {
-    setHistory(getTodayHistory())
+    void fetchTodayFocusLogs().then(setHistory)
   }, [])
 
   React.useEffect(() => {
@@ -315,15 +328,15 @@ export function FocusApp({ onBack }: FocusAppProps) {
     }
   }, [overlay])
 
-  // ---------- 统计（/api/focus 聚合） ----------
-  const todayMin = React.useMemo(
-    () => Math.round(items.reduce((a, c) => a + (c.todaySeconds || 0), 0) / 60),
-    [items],
-  )
-  const totalCount = React.useMemo(
-    () => items.reduce((a, c) => a + (c.focusCount || 0), 0),
-    [items],
-  )
+  // ---------- 统计（/api/focus 聚合；totals 含自由专注） ----------
+  const todayMin = React.useMemo(() => {
+    if (totals) return Math.round(totals.todaySeconds / 60)
+    return Math.round(items.reduce((a, c) => a + (c.todaySeconds || 0), 0) / 60)
+  }, [items, totals])
+  const totalCount = React.useMemo(() => {
+    if (totals) return totals.focusCount
+    return items.reduce((a, c) => a + (c.focusCount || 0), 0)
+  }, [items, totals])
 
   // 正在进行的会话对应的内容（回到本页后也能找回背景图）
   const activeContent = React.useMemo(
@@ -801,7 +814,7 @@ export function FocusApp({ onBack }: FocusAppProps) {
                     )}
                   </div>
                   <p className="mt-2 text-center text-[11px] text-zinc-400">
-                    点击记录可查看详情 · 记录保存在本设备，分钟/次数统计来自服务器
+                    点击记录可查看详情 · 专注记录云端同步，多设备可见
                   </p>
                 </section>
               )}
@@ -1150,7 +1163,7 @@ export function FocusApp({ onBack }: FocusAppProps) {
       </Dialog>
 
       {/* ---------- 今日记录详情 Dialog ---------- */}
-      {/* 说明：本机记录（localStorage）没有服务端 id，/api/focus/log 也无单条删除接口，故仅展示详情 */}
+      {/* 说明：记录已服务端持久化，支持单条删除 */}
       <Dialog
         open={entryDetail !== null}
         onOpenChange={(o) => {
@@ -1182,7 +1195,31 @@ export function FocusApp({ onBack }: FocusAppProps) {
                   <dd className="text-right font-semibold tabular-nums">{fmtDurHuman(entryDetail.seconds)}</dd>
                 </div>
               </dl>
-              <p className="text-center text-[11px] text-zinc-400">专注记录保存在本设备</p>
+              <div className="flex items-center justify-center gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-10 flex-1 rounded-full text-red-600 hover:bg-red-50 hover:text-red-700"
+                  disabled={!entryDetail.id || deletingLog}
+                  onClick={() => {
+                    if (!entryDetail.id) return
+                    void (async () => {
+                      setDeletingLog(true)
+                      const ok = await deleteFocusLog(entryDetail.id as string)
+                      setDeletingLog(false)
+                      if (ok) {
+                        toast.success('已删除记录')
+                        setEntryDetail(null)
+                        refreshLocal()
+                        void fetchList()
+                      }
+                    })()
+                  }}
+                >
+                  {deletingLog ? <Loader2 className="size-4 animate-spin" /> : '删除记录'}
+                </Button>
+              </div>
+              <p className="text-center text-[11px] text-zinc-400">专注记录云端同步，多设备可见</p>
             </>
           )}
         </DialogContent>

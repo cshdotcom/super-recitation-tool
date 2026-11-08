@@ -364,6 +364,23 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
 
   // ---- UI 状态 ----
   const [title, setTitle] = React.useState(() => card.title?.trim() || '新材料')
+  // ---- 未保存保护：初始快照 + dirty 判定（需求图：是否保存文章弹窗） ----
+  const initialSnapRef = React.useRef<{ title: string; blocks: string } | null>(null)
+  if (initialSnapRef.current === null) {
+    initialSnapRef.current = {
+      title: card.title?.trim() || '',
+      blocks: JSON.stringify(
+        blocksRef.current.map((b) => [b.front ?? '', b.back ?? '', b.hidden === true]),
+      ),
+    }
+  }
+  const dirty =
+    JSON.stringify(blocksRef.current.map((b) => [b.front ?? '', b.back ?? '', b.hidden === true])) !==
+      initialSnapRef.current.blocks ||
+    (title.trim() !== '' &&
+      title.trim() !== '新材料' &&
+      title.trim() !== initialSnapRef.current.title)
+  const [confirmBack, setConfirmBack] = React.useState(false)
   const [batch, setBatch] = React.useState(false)
   const [selected, setSelected] = React.useState<ReadonlySet<number>>(new Set())
   const [aiIdx, setAiIdx] = React.useState<number | null>(null)
@@ -985,7 +1002,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
               <>
                 <button
                   type="button"
-                  onClick={onBack}
+                  onClick={() => (dirty ? setConfirmBack(true) : onBack())}
                   aria-label="返回"
                   className={HEADER_ICON_BTN}
                 >
@@ -1777,6 +1794,19 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
         }}
         onConfirm={(box) => void insertCropped(box)}
       />
+      {/* 未保存返回确认 */}
+      <ConfirmBackDialog
+        open={confirmBack}
+        onOpenChange={setConfirmBack}
+        onDiscard={() => {
+          setConfirmBack(false)
+          onBack()
+        }}
+        onSave={() => {
+          setConfirmBack(false)
+          handleDone()
+        }}
+      />
     </>
   )
 }
@@ -1855,5 +1885,41 @@ function CropDialog({
         </div>
       </DialogContent>
     </Dialog>
+  )
+}
+
+// ---------- 未保存返回确认（需求图：是否保存文章） ----------
+function ConfirmBackDialog(props: {
+  open: boolean
+  onOpenChange: (o: boolean) => void
+  onDiscard: () => void
+  onSave: () => void
+}): React.JSX.Element {
+  return (
+    <AlertDialog open={props.open} onOpenChange={props.onOpenChange}>
+      <AlertDialogContent className="max-w-[88vw] rounded-3xl">
+        <AlertDialogHeader className="items-center text-center">
+          <AlertDialogTitle>是否保存文章</AlertDialogTitle>
+          <AlertDialogDescription>
+            检测到有编辑未保存的文章，退出后将丢失这些更改。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter className="flex-row items-center justify-center gap-2 sm:justify-center">
+          <AlertDialogCancel className="mt-0 flex-1 rounded-full">取消</AlertDialogCancel>
+          <AlertDialogAction
+            className="flex-1 rounded-full border border-border bg-transparent text-foreground hover:bg-muted"
+            onClick={props.onDiscard}
+          >
+            不保存
+          </AlertDialogAction>
+          <AlertDialogAction
+            className="flex-1 rounded-full bg-primary text-primary-foreground hover:bg-primary/90"
+            onClick={props.onSave}
+          >
+            保存并退出
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   )
 }
