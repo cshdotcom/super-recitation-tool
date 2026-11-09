@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -45,3 +45,81 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # ---------- standalone tarball（可直接下载运行，无需 Docker）----------
+  build-standalone:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: bun run db:generate
+        env:
+          DATABASE_URL: file:/tmp/beishuba.db
+
+      - name: Build Next.js standalone
+        run: bun run build
+        env:
+          DATABASE_URL: file:/tmp/beishuba.db
+          NEXT_TELEMETRY_DISABLED: '1'
+
+      - name: Assemble standalone package
+        run: |
+          # standalone 输出在 .next/standalone（含 server.js + .next + traced node_modules）
+          # 补入运行所需：完整 node_modules（外部包依赖树）、prisma schema、public、说明
+          mkdir -p package/data
+          cp -r .next/standalone/. package/
+          # 覆盖 node_modules 为完整版（确保 mammoth/pdf-parse 等依赖树齐全）
+          cp -r node_modules/. package/node_modules/
+          # public 静态资源
+          cp -r public/. package/public/ 2>/dev/null || mkdir -p package/public
+          # prisma schema（运行时 migrate 需要）
+          mkdir -p package/prisma
+          cp prisma/schema.prisma package/prisma/
+          # package.json + 说明
+          cp package.json package/
+          cat > package/README.md <<'RDEOF'
+          # 背书吧 standalone
+
+          ## 运行
+          ```bash
+          # 1. 解压
+          tar xzf beishuba-standalone-*.tar.gz
+          cd beishuba-standalone
+
+          # 2. 初始化数据库
+          mkdir -p data
+          export DATABASE_URL="file:$(pwd)/data/beishuba.db"
+          npx prisma db push || bunx prisma db push
+
+          # 3. 启动
+          node server.js
+          ```
+          打开 http://localhost:3000 即可使用。
+
+          ## 说明
+          - Node.js >= 20 推荐
+          - 数据持久化在 ./data/beishuba.db
+          - 首次启动注册一个账号（单用户制），之后仅可登录
+          RDEOF
+
+          # 打包
+          VERSION=${GITHUB_REF_NAME:-latest}
+          mv package beishuba-standalone-${VERSION}
+          tar czf beishuba-standalone-${VERSION}.tar.gz beishuba-standalone-${VERSION}
+          ls -lh beishuba-standalone-${VERSION}.tar.gz
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: beishuba-standalone-*.tar.gz
+          tag_name: ${{ github.ref_name }}
