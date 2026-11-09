@@ -117,6 +117,14 @@ export async function PATCH(req: NextRequest) {
     if (typeof body?.ttsModel === 'string') {
       data.ttsModel = body.ttsModel
     }
+    // 全局默认 TTS 音色/倍速（per-context voicePrefs 未设置时回退到此）
+    if (typeof body?.ttsVoice === 'string') {
+      data.ttsVoice = body.ttsVoice
+    }
+    if (typeof body?.ttsSpeed === 'number' && Number.isFinite(body.ttsSpeed)) {
+      // 0.5-3，与 clampSpeed 一致
+      data.ttsSpeed = Math.min(3, Math.max(0.5, body.ttsSpeed))
+    }
     // ASR provider: same options as TTS
     if (typeof body?.asrProvider === 'string') {
       data.asrProvider =

@@ -181,14 +181,21 @@ interface SbReadProgressDetail {
 // ---------------------------------------------------------------------------
 // 朗读引擎说明：点「AI朗读 / 朗读文本」时 toast 提示本次走哪个引擎。
 // 解析顺序与 tts-player 的 seedQuickPref 一致：voicePrefs[context].tts 优先
-// （reader 场景，回退 tts 工具场景），再回退到全局 settings.ttsProvider。
+// （reader 场景，回退 tts 工具场景），再回退到全局 settings.ttsProvider/ttsVoice。
 // ---------------------------------------------------------------------------
 function ttsEngineLabel(settings: SettingsData): string {
   const pref = settings?.voicePrefs?.['reader']?.tts ?? settings?.voicePrefs?.['tts']?.tts
-  const provider = pref?.provider ?? settings?.ttsProvider ?? 'zai'
+  // 全局为 browser（系统静音）时回退到 z-ai，与 tts-player 默认初始化一致
+  const provider =
+    pref?.provider ??
+    (settings?.ttsProvider === 'custom'
+      ? 'custom'
+      : settings?.ttsProvider === 'browser'
+        ? 'zai'
+        : settings?.ttsProvider ?? 'zai')
   if (provider === 'custom') return '自定义 TTS 服务'
   if (provider === 'browser') return '系统语音'
-  const voice = pref?.voice
+  const voice = pref?.voice ?? settings?.ttsVoice
   const match = voice ? TTS_VOICES.find((v) => v.value === voice) : undefined
   const name = match?.label.split('·')[0]?.trim()
   return name ? `AI 音色 · ${name}` : 'AI 音色（童童等）'

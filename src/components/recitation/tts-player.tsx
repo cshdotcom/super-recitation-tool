@@ -369,10 +369,15 @@ export function TtsPlayer({
   const [seeded] = React.useState(() => settings.voicePrefs?.[context]?.tts)
 
   // ---- 引擎：provider / voice / speed ----
+  // 默认优先 per-context seed；否则回退到全局 settings.ttsProvider。
+  // 若全局为 browser（系统静音语音），改为优先 z-ai AI 音色（童童），
+  // 避免新用户开箱即遇到无声 / 系统陌生语音。
   const [provider, setProvider] = React.useState<VoiceProvider>(
-    () => seeded?.provider ?? settings.ttsProvider,
+    () => seeded?.provider ?? (settings.ttsProvider === 'custom' ? 'custom' : 'zai'),
   )
-  const [speed, setSpeed] = React.useState<number>(() => clampSpeed(seeded?.speed ?? 1))
+  const [speed, setSpeed] = React.useState<number>(() =>
+    clampSpeed(seeded?.speed ?? settings.ttsSpeed ?? 1),
+  )
   const audioRef = React.useRef<HTMLAudioElement>(null)
   const audioUrlRef = React.useRef<string | null>(null)
   const [audioUrl, setAudioUrl] = React.useState<string | null>(null)
@@ -382,9 +387,19 @@ export function TtsPlayer({
   const genRef = React.useRef(0)
 
   const [voice, setVoice] = React.useState<string>(() => {
+    // 1) per-context seed 优先
     if (seeded?.provider === 'zai' && seeded.voice && TTS_VOICES.some((v) => v.value === seeded.voice)) {
       return seeded.voice
     }
+    // 2) 全局 settings.ttsVoice（用户在「设置 → 默认全局配置」里指定）
+    if (
+      settings.ttsProvider !== 'browser' &&
+      settings.ttsVoice &&
+      TTS_VOICES.some((v) => v.value === settings.ttsVoice)
+    ) {
+      return settings.ttsVoice
+    }
+    // 3) 默认童童 AI 音色
     return 'tongtong'
   })
   const [customVoice, setCustomVoice] = React.useState('')
@@ -1746,19 +1761,32 @@ export interface QuickTtsPref {
 
 function seedQuickPref(context: string, settings: SettingsData | null): QuickTtsPref {
   const p = settings?.voicePrefs?.[context]?.tts
-  const provider = p?.provider ?? settings?.ttsProvider ?? 'zai'
+  // 引擎：per-context seed > 全局 ttsProvider；browser（系统静音）回退到 z-ai
+  const provider =
+    p?.provider ??
+    (settings?.ttsProvider === 'custom'
+      ? 'custom'
+      : settings?.ttsProvider === 'browser'
+        ? 'zai'
+        : settings?.ttsProvider ?? 'zai')
+  const globalVoice =
+    settings && settings.ttsProvider !== 'browser' && settings.ttsVoice
+      ? settings.ttsVoice
+      : ''
   const voice =
     provider === 'zai'
       ? p?.voice && TTS_VOICES.some((v) => v.value === p.voice)
         ? p.voice
-        : 'tongtong'
+        : globalVoice && TTS_VOICES.some((v) => v.value === globalVoice)
+          ? globalVoice
+          : 'tongtong'
       : provider === 'custom'
-        ? p?.voice ?? ''
+        ? p?.voice ?? globalVoice ?? ''
         : ''
   return {
     provider,
     voice,
-    speed: clampSpeed(p?.speed ?? 1),
+    speed: clampSpeed(p?.speed ?? settings?.ttsSpeed ?? 1),
     voiceURI: provider === 'browser' ? p?.voiceURI ?? '' : undefined,
   }
 }

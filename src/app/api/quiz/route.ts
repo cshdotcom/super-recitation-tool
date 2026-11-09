@@ -62,8 +62,9 @@ interface QuizQuestionX {
 
 const MAX_CONTENT = 6000
 const VALID_TYPES: readonly string[] = ['fill', 'short', 'choice', 'multi', 'judge']
-const MAX_PER_TYPE = 10
-const MAX_TOTAL = 30
+// 按用户要求放开自定义题数上限（原 MAX_PER_TYPE=10 / MAX_TOTAL=30）。
+const MAX_PER_TYPE = 100
+const MAX_TOTAL = 100
 
 function clampCount(n: unknown, max = MAX_PER_TYPE): number {
   const v = Math.floor(Number(n))
@@ -261,7 +262,7 @@ export async function POST(req: NextRequest) {
     let count: number =
       typeof body?.count === 'number' && Number.isFinite(body.count) ? Math.floor(body.count) : 5
     if (count < 1) count = 1
-    if (count > 10) count = 10
+    if (count > MAX_TOTAL) count = MAX_TOTAL
 
     const system = `你是语文出题老师。根据下面这段文字生成背书练习题，题型混合：填空题(type="fill")、简答题(type="short")、选择题(type="choice")。要求：填空题用____表示空缺，answer为应填内容；选择题必须提供options(恰好4个选项的字符串数组)和answer(正确选项的完整文本，须与options中某一项完全一致)；简答题answer为参考答案。共生成${count}道题。只返回JSON：{"questions":[{"type":"fill"|"short"|"choice","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
     const user = `课文：\n${content.slice(0, MAX_CONTENT)}\n\n重点关注词语：${

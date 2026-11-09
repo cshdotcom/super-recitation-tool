@@ -158,9 +158,36 @@ const QUESTION_TYPES = [
   { key: 'short', label: '简答题', hint: '简答要点 · 自评对错', def: 3 },
 ] as const
 type QuestionTypeKey = (typeof QUESTION_TYPES)[number]['key']
-const MAX_PER_TYPE = 10
-/** 题目个数选择器上限（1–20）；/api/quiz 两步模式另有 单题型≤10、总数≤30 的服务端限制 */
-const MAX_TOTAL_QUESTIONS = 20
+const MAX_PER_TYPE = 100
+
+/** 压缩答题图片为 dataURL（≤800px 宽，JPEG 0.8）——简答题上传图片作答用 */
+async function compressAnswerImage(file: File): Promise<string> {
+  const bitmap = await createImageBitmap(file).catch(() => null)
+  if (!bitmap) {
+    // 回退：FileReader 直读
+    return new Promise((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(String(r.result))
+      r.onerror = () => reject(new Error('图片读取失败'))
+      r.readAsDataURL(file)
+    })
+  }
+  const maxW = 800
+  const scale = Math.min(1, maxW / bitmap.width)
+  const w = Math.max(1, Math.round(bitmap.width * scale))
+  const h = Math.max(1, Math.round(bitmap.height * scale))
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('画布不可用')
+  ctx.drawImage(bitmap, 0, 0, w, h)
+  bitmap.close?.()
+  return canvas.toDataURL('image/jpeg', 0.8)
+}
+/** 题目个数选择器上限（1–100，按用户要求放开自定义个数）；/api/quiz 两步模式另有
+ *  单题型≤100、总数≤100 的服务端限制（与客户端一致） */
+const MAX_TOTAL_QUESTIONS = 100
 
 // ---------- 出题期间进度文案 ----------
 const POINT_STAGES = ['正在阅读课文…', '正在提炼核心考点…', '正在整理知识点…', '即将完成…']
@@ -246,7 +273,7 @@ export function recordQuizUserAnswer(cardId: string, question: string, userAnswe
   void (async () => {
     const all = await fetchQuizUserAnswers()
     all[userAnswerKey(cardId, question)] = {
-      userAnswer: userAnswer.slice(0, 500),
+      userAnswer: userAnswer.slice(0, 500000),
       at: Date.now(),
     }
     writeLocalAnswers(all)
@@ -449,7 +476,7 @@ export function QuizPanel({
     setTypeCounts((prev) => ({ ...prev, [target.key]: Math.max(0, prev[target.key] - 1) }))
   }
 
-  /** 直接设定总题数（1–20）：在已选题型间均衡分配，超出单题型上限的部分轮补给仍有余量的题型 */
+  /** 直接设定总题数（1–100）：在已选题型间均衡分配，超出单题型上限的部分轮补给仍有余量的题型 */
   const setTotalQuestions = (n: number) => {
     const target = Math.max(1, Math.min(MAX_TOTAL_QUESTIONS, Math.floor(Number(n)) || 1))
     const active = QUESTION_TYPES.filter((t) => typeCounts[t.key] > 0)
@@ -822,7 +849,7 @@ export function QuizPanel({
         result: right ? 'right' : 'wrong',
         autoRemove,
         durationSec: Math.min(600, Math.round((Date.now() - quizStart) / 1000)),
-        userAnswer: userAns.slice(0, 500),
+        userAnswer: userAns.slice(0, 500000),
       }),
     }).catch(() => {})
     recordQuizUserAnswer(cardId || '', q.question, userAns)
@@ -1238,7 +1265,7 @@ export function QuizPanel({
             </div>
           </div>
 
-          {/* 题目个数：1–20 步进器（+/- 均衡增减，可直接输入总题数） */}
+          {/* 题目个数：1–100 步进器（+/- 均衡增减，可直接输入总题数） */}
           <div className="mt-2.5 flex items-center justify-between gap-2 rounded-2xl border border-border bg-card px-4 py-3">
             <div className="min-w-0 flex-1">
               <p className="text-sm font-bold">题目个数</p>
@@ -1302,7 +1329,7 @@ export function QuizPanel({
                         max={MAX_PER_TYPE}
                         value={n}
                         onChange={(e) => {
-                          // 单题型 ≤10，且总题数 ≤20（其他题型已占 totalCount - n）
+                          // 单题型 ≤100，且总题数 ≤100（其他题型已占 totalCount - n）
                           const cap = Math.max(
                             0,
                             Math.min(MAX_PER_TYPE, MAX_TOTAL_QUESTIONS - (totalCount - n)),
@@ -1546,31 +1573,87 @@ export function QuizPanel({
                       </div>
                     )}
 
-                    {/* 填空 / 简答（均支持语音输入） */}
+                    {/* 填空 / 简答（均支持语音输入 + 简答支持图片上传） */}
                     {(q.type === 'fill' || isShort) && (
                       <div className="flex flex-col gap-2">
                         {isShort ? (
-                          <div className="flex items-end gap-1.5">
-                            <Textarea
-                              value={userAnswer}
-                              onChange={(e) => setAnswer(idx, e.target.value)}
-                              placeholder="在此输入你的答案…（可语音输入）"
-                              rows={3}
-                              disabled={isRevealed}
-                              className="text-sm"
-                            />
-                            <VoiceInput
-                              size="sm"
-                              context="quiz"
-                              disabled={isRevealed}
-                              onText={(t) =>
-                                // 函数式追加：避免录音期间answers变化的闭包过期问题
-                                setAnswers((prev) => ({
-                                  ...prev,
-                                  [idx]: (prev[idx] || '') + t,
-                                }))
-                              }
-                            />
+                          <div className="flex flex-col gap-1.5">
+                            <div className="flex items-end gap-1.5">
+                              <Textarea
+                                value={userAnswer}
+                                onChange={(e) => setAnswer(idx, e.target.value)}
+                                placeholder="在此输入你的答案…（可语音输入 / 上传图片）"
+                                rows={3}
+                                disabled={isRevealed}
+                                className="text-sm"
+                              />
+                              <VoiceInput
+                                size="sm"
+                                context="quiz"
+                                disabled={isRevealed}
+                                onText={(t) =>
+                                  setAnswers((prev) => ({
+                                    ...prev,
+                                    [idx]: (prev[idx] || '') + t,
+                                  }))
+                                }
+                              />
+                            </div>
+                            {/* 简答题上传图片作答 */}
+                            <label
+                              className={cn(
+                                'flex w-fit cursor-pointer items-center gap-1 rounded-full border border-border px-2.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-accent',
+                                isRevealed && 'pointer-events-none opacity-40',
+                              )}
+                            >
+                              <ImagePlus className="size-3" strokeWidth={1.75} />
+                              上传图片作答
+                              <input
+                                type="file"
+                                accept="image/*"
+                                className="hidden"
+                                disabled={isRevealed}
+                                onChange={async (e) => {
+                                  const f = e.target.files?.[0]
+                                  e.target.value = ''
+                                  if (!f) return
+                                  if (!f.type.startsWith('image/')) {
+                                    toast.error('请选择图片文件')
+                                    return
+                                  }
+                                  const tid = toast.loading('正在处理图片…')
+                                  try {
+                                    const dataUrl = await compressAnswerImage(f)
+                                    setAnswers((prev) => ({
+                                      ...prev,
+                                      [idx]: (prev[idx] || '') + `\n![答题图片](${dataUrl})`,
+                                    }))
+                                    toast.success('图片已附加', { id: tid })
+                                  } catch {
+                                    toast.error('图片处理失败', { id: tid })
+                                  }
+                                }}
+                              />
+                            </label>
+                            {/* 已上传图片预览 */}
+                            {userAnswer.includes('![答题图片]') && (
+                              <div className="flex flex-wrap gap-1.5">
+                                {userAnswer
+                                  .match(/!\[答题图片\]\(([^)]+)\)/g)
+                                  ?.slice(0, 4)
+                                  .map((m, i) => {
+                                    const url = m.match(/\(([^)]+)\)/)?.[1] ?? ''
+                                    return (
+                                      <img
+                                        key={i}
+                                        src={url}
+                                        alt={`答题图片${i + 1}`}
+                                        className="h-16 rounded-lg border border-border object-cover"
+                                      />
+                                    )
+                                  })}
+                              </div>
+                            )}
                           </div>
                         ) : (
                           <div className="flex items-center gap-1.5">

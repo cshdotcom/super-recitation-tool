@@ -262,6 +262,10 @@ export interface SettingsData {
   ttsBaseURL: string
   ttsApiKey: string
   ttsModel: string
+  /** 全局默认 TTS 音色（per-context voicePrefs 未设置时回退；空 = 童童 tongtong） */
+  ttsVoice: string
+  /** 全局默认 TTS 倍速 0.5-3（per-context 未设置时回退；默认 1） */
+  ttsSpeed: number
   asrProvider: VoiceProvider
   asrBaseURL: string
   asrApiKey: string

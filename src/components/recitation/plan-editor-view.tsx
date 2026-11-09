@@ -21,11 +21,12 @@ interface PlanEditorViewProps {
 }
 
 // 范围与服务端 PATCH /api/cards/:id 对 plan 的校验完全一致：
-// goal 1–200 / dailyNew 1–50 / reviewTimes 1–20。
-// UI 上限 = 服务端上限：范围内可无级自由调节，且不会提交会被服务端静默截断的值。
+// goal 1–9999 / dailyNew 1–9999 / reviewTimes 1–20。
+// goal / dailyNew 已按用户要求放开上限（最多 9999），可无级自由调节；
+// reviewTimes 仍保留 1–20。
 const FIELD_MIN = 1
-const GOAL_MAX = 200
-const DAILY_NEW_MAX = 50
+const GOAL_MAX = 9999
+const DAILY_NEW_MAX = 9999
 const REVIEW_TIMES_MAX = 20
 
 // 目标词数快捷预设（均在上限内）
@@ -224,7 +225,7 @@ export function PlanEditorView({
         <div className="divide-y divide-border rounded-2xl bg-card shadow-sm">
           <PlanField
             label="新学章节量"
-            hint="每天新学 1–50 章，步进或直接输入均可"
+            hint="每天新学 1–9999 章，步进或直接输入均可"
             stepper={
               <NumberStepper
                 value={dailyNew}
@@ -250,7 +251,7 @@ export function PlanEditorView({
           />
           <PlanField
             label="目标词数"
-            hint="目标 1–200 词，步进或直接输入均可"
+            hint="目标 1–9999 词，步进或直接输入均可"
             stepper={
               <NumberStepper
                 value={goal}

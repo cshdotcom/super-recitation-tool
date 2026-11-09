@@ -43,7 +43,7 @@ export function PlanDialog({
   const goal = card.plan?.goal ?? 10
   const pct = Math.min(100, Math.round((Math.min(progress, goal) / goal) * 100))
   const parsed = Math.round(Number(goalDraft))
-  const valid = Number.isFinite(parsed) && parsed >= 1 && parsed <= 200
+  const valid = Number.isFinite(parsed) && parsed >= 1 && parsed <= 9999
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -77,7 +77,7 @@ export function PlanDialog({
               id="plan-goal"
               type="number"
               min={1}
-              max={200}
+              max={9999}
               value={goalDraft}
               onChange={(e) => setGoalDraft(e.target.value)}
               className="h-11 rounded-xl"

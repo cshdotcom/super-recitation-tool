@@ -359,8 +359,13 @@ export function FocusApp({ onBack }: FocusAppProps) {
   }
 
   const minimize = () => {
+    // 显式同步浮时钟协调标记：先派发 IMMERSIVE=false，让右下角浮时钟 pill 立刻可见，
+    // 再收起全屏遮罩。避免仅靠 useEffect 异步触发导致「点了没反应 / 看不到 pill」的体验。
+    setImmersiveOpen(false)
     setOverlay(false)
-    toast('专注已最小化，右下角浮时钟可随时查看', { description: '可以去背书或任何页面，计时在后台继续' })
+    toast('专注已最小化，右下角浮时钟可随时查看', {
+      description: '点击浮时钟即可回到全屏计时',
+    })
   }
 
   // ---------- 自定义时长 ----------

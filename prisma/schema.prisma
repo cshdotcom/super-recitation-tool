@@ -71,6 +71,11 @@ model Settings {
   ttsBaseURL  String?
   ttsApiKey   String?
   ttsModel    String?
+  // 全局默认 TTS 音色/倍速（per-context voicePrefs 未设置时回退到此）。
+  // ttsVoice: z-ai 音色名（tongtong/chuichui/...）或 custom 音色 id；空 = 默认童童。
+  // ttsSpeed: 0.5-3 倍速（默认 1）。
+  ttsVoice    String?
+  ttsSpeed    Float?
   // ASR provider: zai | custom(OpenAI 兼容 /audio/transcriptions) | browser(SpeechRecognition)
   asrProvider String  @default("zai")
   asrBaseURL  String?

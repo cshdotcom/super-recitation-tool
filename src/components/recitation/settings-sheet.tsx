@@ -3,16 +3,19 @@
 import * as React from 'react'
 import JSZip from 'jszip'
 import {
+  AudioLines,
   CalendarClock,
   ChevronRight,
   Cpu,
   Database,
   Download,
+  Gauge,
   Globe,
   KeyRound,
   Loader2,
   Mic,
   Palette,
+  Star,
   Trash2,
   Upload,
   Volume2,
@@ -28,7 +31,7 @@ import type {
 } from '@/lib/types'
 import { TTS_VOICES, VOICE_CONTEXTS } from '@/lib/types'
 import { cn } from '@/lib/utils'
-import { clampSpeed, saveVoicePref } from '@/lib/voice-prefs'
+import { clampSpeed, saveVoicePref, SPEED_OPTIONS } from '@/lib/voice-prefs'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import { ThemePicker } from '@/components/recitation/more-sheet'
 import { VoiceSpeedBar, type QuickTtsPref } from '@/components/recitation/tts-player'
@@ -389,6 +392,10 @@ export function SettingsSheet({
     ttsBaseURL: '',
     ttsApiKey: '',
     ttsModel: '',
+    // 默认全局配置：z-ai 音色名（tongtong/chuichui/…）或 custom 音色 id；空 = 童童。
+    ttsVoice: '',
+    // 默认全局倍速 0.5-3
+    ttsSpeed: 1,
     asrProvider: 'zai' as VoiceProvider,
     asrBaseURL: '',
     asrApiKey: '',
@@ -416,6 +423,8 @@ export function SettingsSheet({
         ttsBaseURL: settings.ttsBaseURL,
         ttsApiKey: settings.ttsApiKey,
         ttsModel: settings.ttsModel,
+        ttsVoice: settings.ttsVoice ?? '',
+        ttsSpeed: clampSpeed(settings.ttsSpeed ?? 1),
         asrProvider: settings.asrProvider,
         asrBaseURL: settings.asrBaseURL,
         asrApiKey: settings.asrApiKey,
@@ -1012,6 +1021,105 @@ export function SettingsSheet({
                   <p className="mt-3 rounded-xl bg-muted/60 px-3 py-2.5 text-xs leading-relaxed text-muted-foreground">
                     使用系统内置语音，无需配置
                   </p>
+                )}
+
+                {/* 默认全局配置 —— 朗读音色/倍速（per-context 未设置时回退到此） */}
+                {voiceDraft.ttsProvider !== 'browser' && (
+                  <div className="mt-4 space-y-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3">
+                    <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground/80">
+                      <Star className="size-3 text-amber-500" strokeWidth={1.75} />
+                      默认全局配置
+                      <span className="font-normal text-muted-foreground/80">
+                        ·未单独设置的功能跟随此音色/倍速
+                      </span>
+                    </div>
+
+                    {voiceDraft.ttsProvider === 'zai' && (
+                      <div className="space-y-1.5">
+                        <Label
+                          htmlFor="tts-default-voice"
+                          className="flex items-center gap-1 text-xs text-muted-foreground"
+                        >
+                          <AudioLines className="size-3" /> 默认朗读音色
+                        </Label>
+                        <Select
+                          value={
+                            TTS_VOICES.some((v) => v.value === voiceDraft.ttsVoice)
+                              ? voiceDraft.ttsVoice
+                              : 'tongtong'
+                          }
+                          onValueChange={(v) =>
+                            setVoiceDraft((d) => ({ ...d, ttsVoice: v }))
+                          }
+                        >
+                          <SelectTrigger id="tts-default-voice" className="h-10 rounded-xl">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {TTS_VOICES.map((v) => (
+                              <SelectItem key={v.value} value={v.value}>
+                                {v.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+                    )}
+
+                    {voiceDraft.ttsProvider === 'custom' && (
+                      <div className="space-y-1.5">
+                        <Label
+                          htmlFor="tts-default-voice-custom"
+                          className="flex items-center gap-1 text-xs text-muted-foreground"
+                        >
+                          <AudioLines className="size-3" /> 默认朗读音色
+                        </Label>
+                        <Input
+                          id="tts-default-voice-custom"
+                          value={voiceDraft.ttsVoice}
+                          onChange={(e) =>
+                            setVoiceDraft((d) => ({ ...d, ttsVoice: e.target.value }))
+                          }
+                          placeholder="音色名，如 alloy / nova"
+                          className="h-10 rounded-xl"
+                        />
+                      </div>
+                    )}
+
+                    <div className="space-y-1.5">
+                      <Label className="flex items-center gap-1 text-xs text-muted-foreground">
+                        <Gauge className="size-3" /> 默认朗读倍速
+                      </Label>
+                      <div
+                        className="flex flex-wrap gap-1.5"
+                        role="group"
+                        aria-label="默认朗读倍速"
+                      >
+                        {SPEED_OPTIONS.map((s) => {
+                          const active =
+                            Math.abs(voiceDraft.ttsSpeed - s) < 0.001
+                          return (
+                            <button
+                              key={s}
+                              type="button"
+                              aria-pressed={active}
+                              onClick={() =>
+                                setVoiceDraft((d) => ({ ...d, ttsSpeed: s }))
+                              }
+                              className={cn(
+                                'h-8 rounded-full px-2.5 text-xs font-medium tabular-nums transition-colors',
+                                active
+                                  ? 'bg-primary text-primary-foreground'
+                                  : 'border border-border bg-background text-muted-foreground hover:bg-accent',
+                              )}
+                            >
+                              {s}x
+                            </button>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  </div>
                 )}
 
                 {voiceDraft.ttsProvider === 'custom' && (

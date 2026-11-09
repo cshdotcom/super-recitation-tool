@@ -73,10 +73,11 @@ export async function PATCH(
         Number.isFinite(body.plan.goal)
       ) {
         const planObj: Record<string, number> = {
-          goal: Math.min(200, Math.max(1, Math.round(body.plan.goal))),
+          // goal / dailyNew 上限已按用户要求放开到 9999（原 200 / 50）
+          goal: Math.min(9999, Math.max(1, Math.round(body.plan.goal))),
         }
         if (typeof body.plan.dailyNew === 'number' && Number.isFinite(body.plan.dailyNew)) {
-          planObj.dailyNew = Math.min(50, Math.max(1, Math.round(body.plan.dailyNew)))
+          planObj.dailyNew = Math.min(9999, Math.max(1, Math.round(body.plan.dailyNew)))
         }
         if (typeof body.plan.reviewTimes === 'number' && Number.isFinite(body.plan.reviewTimes)) {
           planObj.reviewTimes = Math.min(20, Math.max(1, Math.round(body.plan.reviewTimes)))

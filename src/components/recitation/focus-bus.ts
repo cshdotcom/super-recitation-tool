@@ -1009,13 +1009,15 @@ export function FocusFloatingClock() {
           {
             key: 'pill',
             type: 'button',
-            'aria-label': '专注浮时钟（可拖动）',
+            'aria-label': '专注浮时钟（点击回到全屏计时，可拖动）',
             onClick: () => {
               if (suppressClickRef.current) {
                 suppressClickRef.current = false
-                return // 刚完成一次拖拽，不要误开详情
+                return // 刚完成一次拖拽，不要误触展开
               }
-              setDetailOpen(true)
+              // 点击浮时钟 pill → 直接展开回全屏计时遮罩（派发 'sb-open-focus'，
+              // 页面据此切到专注视图，FocusApp 监听同事件并 setOverlay(true)）。
+              requestOpenFocusView()
             },
             onPointerDown: onPillPointerDown,
             onPointerMove: onPillPointerMove,

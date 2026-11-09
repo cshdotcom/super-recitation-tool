@@ -57,8 +57,15 @@ COPY --from=builder --chown=node:node /app/.next/standalone ./
 # to guarantee every external package + its deps are resolvable at runtime.
 COPY --from=builder --chown=node:node /app/node_modules ./node_modules
 
+# Prisma schema（启动时 db push 自动迁移需要）
+COPY --from=builder --chown=node:node /app/prisma ./prisma
+
 EXPOSE 3000
 
 USER node
 
-CMD ["node", "server.js"]
+# 启动前自动迁移数据库（prisma db push）：确保 schema 新增列（如 SM-2 复习字段
+# nextReviewAt/ease/interval/reviewCount/lastReviewedAt）在 SQLite 中存在，
+# 否则 /api/review/due 等查询会因列不存在而 500。SQLite 加列是非破坏性的。
+# --skip-generate：client 已在构建阶段生成，无需重复。
+CMD ["sh", "-c", "./node_modules/.bin/prisma db push --skip-generate --accept-data-loss 2>/dev/null; node server.js"]

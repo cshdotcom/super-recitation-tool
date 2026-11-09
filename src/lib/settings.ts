@@ -30,6 +30,8 @@ export function parseSettings(row: {
   ttsBaseURL?: string | null
   ttsApiKey?: string | null
   ttsModel?: string | null
+  ttsVoice?: string | null
+  ttsSpeed?: number | null
   asrProvider?: string | null
   asrBaseURL?: string | null
   asrApiKey?: string | null
@@ -84,6 +86,14 @@ export function parseSettings(row: {
     ttsBaseURL: row?.ttsBaseURL ?? '',
     ttsApiKey: row?.ttsApiKey ?? '',
     ttsModel: row?.ttsModel ?? '',
+    // 全局默认 TTS 音色：z-ai 音色名（tongtong/chuichui/…）或 custom 音色 id。
+    // 只接受 TTS_VOICES 里的有效值，否则空串 → 播放器回退到默认童童。
+    ttsVoice:
+      typeof row?.ttsVoice === 'string' && row.ttsVoice ? row.ttsVoice : '',
+    ttsSpeed:
+      typeof row?.ttsSpeed === 'number' && Number.isFinite(row.ttsSpeed)
+        ? Math.min(3, Math.max(0.5, row.ttsSpeed))
+        : 1,
     asrProvider: voiceProvider(row?.asrProvider),
     asrBaseURL: row?.asrBaseURL ?? '',
     asrApiKey: row?.asrApiKey ?? '',
