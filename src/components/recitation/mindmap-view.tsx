@@ -1559,7 +1559,7 @@ export function MindmapView({
               if (!o) setRenameId(null)
             }}
           >
-            <DialogContent className="max-w-sm rounded-2xl">
+            <DialogContent className="max-w-sm rounded-2xl" aria-describedby={undefined}>
               <DialogHeader>
                 <DialogTitle>重命名导图</DialogTitle>
               </DialogHeader>

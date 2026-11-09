@@ -69,6 +69,7 @@ import {
   setImmersiveOpen,
   startFocus,
   stopFocus,
+  syncFocusProgressFromServer,
   useFocusState,
   type FocusHistoryEntry,
   type FocusMode,
@@ -279,6 +280,9 @@ export function FocusApp({ onBack }: FocusAppProps) {
   React.useEffect(() => {
     void fetchList()
     refreshLocal()
+    // 进入专注视图：拉取云端进度（focus:progress）—— 本地无进行中会话时恢复，
+    // 与本地冲突时以 updatedAt 较新者为准
+    void syncFocusProgressFromServer()
   }, [fetchList, refreshLocal])
 
   // 全屏遮罩 ↔ 浮时钟协调（遮罩打开时隐藏右下角圆钮）

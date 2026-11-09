@@ -49,10 +49,12 @@ interface InlineRun {
   math?: string
   /** true = $$…$$ 展示型（同行内出现） */
   mathDisplay?: boolean
+  /** 行内图片 ![alt](src)：原位渲染 <img>；text 恒为空串，不进入 plain（alt/base64 永不显示为文本） */
+  image?: { alt: string; src: string }
 }
 
 const INLINE_RE =
-  /\$\$([^$\n]+?)\$\$|\$([^$\n]+)\$|%%([^|\n]+)\|([^%\n]*)%%|==([^=\n]+)==|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|`([^`\n]+)`|\*([^*\n]+)\*/g
+  /\$\$([^$\n]+?)\$\$|\$([^$\n]+)\$|%%([^|\n]+)\|([^%\n]*)%%|==([^=\n]+)==|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|`([^`\n]+)`|\*([^*\n]+)\*|!\[([^\]]*)\]\(([^)]+)\)/g
 
 function parseInline(line: string): { runs: InlineRun[]; plain: string } {
   const runs: InlineRun[] = []
@@ -92,6 +94,10 @@ function parseInline(line: string): { runs: InlineRun[]; plain: string } {
     } else if (m[9] !== undefined) {
       runs.push({ text: m[9], start: plain.length, cls: 'italic' })
       plain += m[9]
+    } else if (m[10] !== undefined) {
+      // 行内图片（alt 可含 / 等特殊字符）：原位渲染，不进入 plain、不可挖空，
+      // 从而 alt 与 base64 永不会作为可见文本泄漏
+      runs.push({ text: '', start: plain.length, image: { alt: m[10], src: m[11] ?? '' } })
     }
     last = m.index + m[0].length
   }
@@ -1539,6 +1545,21 @@ export function ClozeText({
           ri += 1
           continue
         }
+        // 行内图片 run：原位渲染 <img>（零长度 run，不推进 plain，不可挖空）
+        if (run.image) {
+          out.push(
+            <img
+              key={`${blockKey}-img${runStart}-${ri}`}
+              src={run.image.src}
+              alt={run.image.alt || '课文配图'}
+              loading="lazy"
+              className="my-1 inline-block h-auto max-w-full rounded-xl align-middle"
+            />,
+          )
+          pos = runEndAbs
+          ri += 1
+          continue
+        }
         // 在 run 内：下一段到 run 末尾或下一个空白起点
         const nextBlank = ctx.blanks.find((bb) => bb.start > pos && bb.start < runEndAbs)
         const segEnd = nextBlank ? Math.min(nextBlank.start, runEndAbs) : runEndAbs
@@ -1600,6 +1621,20 @@ export function ClozeText({
         }
         if (pos >= runEndAbs) ri += 1
       }
+      // while 条件（pos < pEnd）可能在还有零长度图片 run 时提前退出（如段落末尾/纯图片行）：补渲染
+      for (; ri < runs.length; ri += 1) {
+        const run = runs[ri]
+        if (!run.image) break
+        out.push(
+          <img
+            key={`${blockKey}-img${pStart + run.start}-${ri}`}
+            src={run.image.src}
+            alt={run.image.alt || '课文配图'}
+            loading="lazy"
+            className="my-1 inline-block h-auto max-w-full rounded-xl align-middle"
+          />,
+        )
+      }
       // run 之后的尾文本（防御）
       if (pos < pEnd) {
         const rest = pPlain.slice(pos - pStart)
@@ -1620,12 +1655,11 @@ export function ClozeText({
         case 'image':
           return (
             <div key={`img${i}`} className="py-1">
-              { }
               <img
                 src={block.src}
                 alt={block.alt || '课文配图'}
-                className="max-h-96 max-w-full rounded-xl border border-border object-contain"
                 loading="lazy"
+                className="max-w-full h-auto rounded-xl"
               />
             </div>
           )

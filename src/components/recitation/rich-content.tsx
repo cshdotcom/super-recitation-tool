@@ -93,8 +93,9 @@ function splitSvgSegments(content: string): Array<{ type: 'md' | 'svg'; value: s
     .map((value) => ({ type: /^<svg\b/i.test(value) ? ('svg' as const) : ('md' as const), value }))
 }
 
-/** Minimal sanitizer: drop <script> tags, on* handlers and js: hrefs. */
-function sanitizeSvg(html: string): string {
+/** Minimal sanitizer for embedded markup (raw SVG or raw HTML blocks):
+ *  drop <script> tags, on* handlers and js: hrefs. */
+function sanitizeEmbeddedHtml(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script\s*>/gi, '')
     .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
@@ -111,6 +112,91 @@ function SvgSegment({ html }: { html: string }) {
       aria-label="内嵌 SVG 图"
     />
   )
+}
+
+// ---------- raw user HTML blocks (Shadow DOM sandbox) ----------
+
+/** A line that opens a raw HTML block (CommonMark-ish): begins with `<tag`,
+ *  `</tag` or `<!`. Plain text like "5 < 6" or "<- arrow" never matches.
+ *  Detection runs BEFORE %%…%% directives are expanded, so our generated
+ *  inline <span style> markup is never captured — only genuine user HTML. */
+const HTML_BLOCK_OPEN_RE = /^\s*<(?:\/[a-zA-Z]|[a-zA-Z][a-zA-Z0-9-]*[\s/>]|!)/
+
+/** Split a markdown segment into regular markdown and raw HTML blocks.
+ *  An HTML block runs from its opening line to the first blank line
+ *  (CommonMark type-6 rule); everything inside is treated as user HTML.
+ *  Lines inside ``` / ~~~ fenced code are never captured — a fenced ```html
+ *  block keeps rendering as a code block, only bare raw-HTML lines (and the
+ *  bare html snippets ClozeText passes for ```html fences) are sandboxed. */
+function splitHtmlSegments(content: string): Array<{ type: 'md' | 'html'; value: string }> {
+  const out: Array<{ type: 'md' | 'html'; value: string }> = []
+  const lines = content.split('\n')
+  let buf: string[] = []
+  let mode: 'md' | 'html' | null = null
+  let fence = false
+  const flush = () => {
+    if (mode && buf.length) out.push({ type: mode, value: buf.join('\n') })
+    buf = []
+  }
+  for (const line of lines) {
+    const t = line.trim()
+    // 围栏代码块内部：全部按 markdown 原样处理，不识别为 HTML 块
+    if (fence) {
+      if (mode === null) mode = 'md'
+      buf.push(line)
+      if (t.startsWith('```') || t.startsWith('~~~')) fence = false
+      continue
+    }
+    if (mode === 'html') {
+      if (t === '') {
+        // 空行结束 HTML 块；空行本身归入后续 markdown 段
+        flush()
+        mode = 'md'
+        buf.push(line)
+      } else {
+        buf.push(line)
+      }
+      continue
+    }
+    if (t.startsWith('```') || t.startsWith('~~~')) {
+      if (mode === null) mode = 'md'
+      buf.push(line)
+      fence = true
+      continue
+    }
+    if (HTML_BLOCK_OPEN_RE.test(line)) {
+      flush()
+      mode = 'html'
+      buf.push(line)
+      continue
+    }
+    if (mode === null) mode = 'md'
+    buf.push(line)
+  }
+  flush()
+  return out.filter((s) => s.value.trim() !== '')
+}
+
+/** HtmlSandbox — renders raw user HTML inside a real Shadow DOM so styles and
+ *  layout (position / float / wide tables …) can never leak into or out of the
+ *  page. The host element is width-bounded and scroll-contained. */
+function HtmlSandbox({ html, className }: { html: string; className?: string }) {
+  const hostRef = React.useRef<HTMLDivElement>(null)
+  React.useEffect(() => {
+    const host = hostRef.current
+    if (!host) return
+    let root: ShadowRoot | null = null
+    if (host.shadowRoot) root = host.shadowRoot
+    else root = host.attachShadow({ mode: 'open' })
+    // minimal base styles inside the shadow so content is readable but contained
+    root.innerHTML = `<style>
+      :host { display: block; max-width: 100%; overflow-x: auto; contain: layout style; }
+      * { max-width: 100%; }
+      img { max-width: 100%; height: auto; }
+      table { max-width: 100%; table-layout: auto; }
+    </style>${sanitizeEmbeddedHtml(html)}`
+  }, [html])
+  return <div ref={hostRef} className={cn('min-w-0 max-w-full overflow-x-auto', className)} />
 }
 
 // ---------- mermaid ----------
@@ -321,7 +407,7 @@ const MARKDOWN_COMPONENTS: Components = {
       src={typeof src === 'string' ? src : undefined}
       alt={alt ?? ''}
       loading="lazy"
-      className="my-2 max-w-full rounded-lg"
+      className="my-2 max-w-full h-auto rounded-xl"
       // 任何来源的图片都不允许撑破容器宽度
       style={{ maxWidth: '100%', height: 'auto' }}
     />
@@ -384,17 +470,24 @@ export const RichContent = React.memo(function RichContent({
     >
       {segments.map((seg, i) =>
         seg.type === 'svg' ? (
-          <SvgSegment key={i} html={sanitizeSvg(seg.value)} />
+          <SvgSegment key={`s${i}`} html={sanitizeEmbeddedHtml(seg.value)} />
         ) : (
-          <ReactMarkdown
-            key={i}
-            remarkPlugins={[remarkGfm, remarkMath]}
-            rehypePlugins={[rehypeRaw, rehypeHighlight, rehypeKatex]}
-            components={MARKDOWN_COMPONENTS}
-          >
-            {/* 先展开 %%样式|文字%% 指令（代码段内不动），再护住非数学的 $ 货币对 */}
-            {guardDollarsOutsideCode(expandSpanDirectives(seg.value))}
-          </ReactMarkdown>
+          splitHtmlSegments(seg.value).map((sub, j) =>
+            sub.type === 'html' ? (
+              // 原生用户 HTML 块 → Shadow DOM 沙盒（样式/布局双向隔离，永不撑破页面）
+              <HtmlSandbox key={`h${i}-${j}`} html={sub.value} className="my-3" />
+            ) : (
+              <ReactMarkdown
+                key={`m${i}-${j}`}
+                remarkPlugins={[remarkGfm, remarkMath]}
+                rehypePlugins={[rehypeRaw, rehypeHighlight, rehypeKatex]}
+                components={MARKDOWN_COMPONENTS}
+              >
+                {/* 先展开 %%样式|文字%% 指令（代码段内不动），再护住非数学的 $ 货币对 */}
+                {guardDollarsOutsideCode(expandSpanDirectives(sub.value))}
+              </ReactMarkdown>
+            ),
+          )
         ),
       )}
     </div>

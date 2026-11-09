@@ -19,6 +19,9 @@
 //             FOCUS_BUILTIN_SOUNDS（内置铃声清单）
 //   历史       今日会话记录已全部服务端持久化（/api/focus/log GET/POST/DELETE，
 //             多设备可见）；本机仅保留运行中会话状态（跨标签页同步需要）
+//   云端进度   运行中每 30s 心跳 + 切后台/离开页面前，把进度推到 /api/state 的
+//             focus:progress 键；模块加载/进入专注视图时拉取 —— 换设备/清存储
+//             后可恢复进行中的会话（本地与云端冲突时以 updatedAt 较新者为准）
 //   UI 跳转    requestOpenFocusView / consumeOpenFocusRequest（浮时钟「全屏计时」→
 //             window 派发 CustomEvent('sb-open-focus')，页面据此切到专注视图）
 //   组件       FocusFloatingClock（全局挂载一次；圆钮可拖动，位置持久化 ui:focusClockPos）
@@ -35,7 +38,7 @@ import {
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
-import { putState } from '@/lib/server-state'
+import { getState, putState } from '@/lib/server-state'
 
 // ---------- 类型 ----------
 
@@ -58,6 +61,8 @@ export interface FocusBusState {
   pausedAccum: number
   /** 当前连续计时的起点 epoch 毫秒（暂停时为 0） */
   activeSince: number
+  /** 本状态最后变更的 epoch 毫秒（本地/云端进度冲突时以较新者为准） */
+  updatedAt?: number
 }
 
 /** 到点 / 结束事件的 detail */
@@ -73,8 +78,40 @@ export interface FocusStopInfo {
   at?: number
 }
 
+/** 云端进度快照（focus:progress 键的 JSON 结构） */
+export interface FocusProgress {
+  /** 会话开始的 epoch 毫秒 */
+  startedAt: number
+  /** 推送时刻已专注秒数 */
+  elapsedSec: number
+  mode: FocusMode
+  /** 会话进行中（含暂停） */
+  running: boolean
+  paused: boolean
+  /** 倒计时总长 / 正计时目标（秒，可选） */
+  targetSec?: number
+  /** 专注内容名 / id（自由专注时无 id）—— 恢复会话用 */
+  contentName: string
+  contentId?: string
+  /** 本次推送的 epoch 毫秒（本地/云端冲突时以较新者为准） */
+  updatedAt: number
+}
+
 export const FOCUS_BUS_STATE_KEY = 'focus-bus-state-v1'
 export const FOCUS_BUS_SOUND_KEY = 'focus-bus-sound-v1'
+
+/** 服务端进度 KV key（/api/state）—— 换设备/清存储后恢复进行中的会话 */
+export const FOCUS_PROGRESS_KEY = 'focus:progress'
+/** 运行中的云端心跳推送间隔（ms） */
+const PROGRESS_PUSH_INTERVAL_MS = 30 * 1000
+/** 云端进度有效期：updatedAt 超过 24h 不再恢复 */
+const PROGRESS_MAX_AGE_MS = 24 * 60 * 60 * 1000
+/** 心跳中断超过该时长视为源设备已离开 —— 恢复时冻结为暂停，不把离线时长计入专注 */
+const PROGRESS_STALE_MS = 5 * 60 * 1000
+/** 本地/云端已专注秒数差异超过该值视为冲突（以 updatedAt 较新者为准） */
+const PROGRESS_CONFLICT_SEC = 5
+/** 两次云端拉取的最小间隔（防抖，避免反复进出专注页打接口） */
+const PROGRESS_SYNC_MIN_INTERVAL_MS = 10 * 1000
 
 export const FOCUS_BUS_EVENTS = {
   /** 状态变化（start/pause/resume/stop） */
@@ -139,6 +176,7 @@ function loadState(): FocusBusState {
       pausedAccum: Number(p.pausedAccum) || 0,
       // 兜底：运行中却丢了 activeSince（脏数据），从当前时刻重新起算，避免时长爆炸
       activeSince: !paused && activeSince <= 0 ? Date.now() : activeSince,
+      updatedAt: Number(p.updatedAt) || 0,
     }
   } catch {
     return { ...IDLE }
@@ -154,6 +192,142 @@ function persistState(): void {
   }
   // 实时同步服务端（AppState 表为真源，localStorage 仅离线镜像）
   void putState(FOCUS_BUS_STATE_KEY, JSON.stringify(state))
+  // 进度快照（focus:progress）随每次状态变更一并推送 —— 结束会话时 running=false
+  // 也随之下发，其他设备据此不再恢复该会话
+  pushProgress()
+}
+
+// ---------- 云端进度同步（focus:progress：30s 心跳 + 离开推送 + 进入拉取） ----------
+
+/** 最近一次进度推送时间（变更推送与心跳共用，重置 30s 心跳窗口） */
+let lastProgressPushAt = 0
+/** 云端拉取进行中标记（防并发重入） */
+let progressSyncInFlight = false
+/** 最近一次云端拉取时间（防抖） */
+let lastProgressSyncAt = 0
+
+function buildProgress(): FocusProgress {
+  return {
+    startedAt: state.startedAt,
+    // 已结束（idle）时归零 —— running=false 的墓碑值，elapsedSec 无意义
+    elapsedSec: state.running ? getElapsedSec(state) : 0,
+    mode: state.mode,
+    running: state.running,
+    paused: state.paused,
+    targetSec: state.targetSec,
+    contentName: state.contentName,
+    contentId: state.contentId,
+    updatedAt: Date.now(),
+  }
+}
+
+/** 把当前进度推到云端。keepalive=true 供卸载/切后台瞬间使用（浏览器保证请求发出）。 */
+function pushProgress(opts?: { keepalive?: boolean }): void {
+  if (typeof window === 'undefined') return
+  lastProgressPushAt = Date.now()
+  const payload = JSON.stringify(buildProgress())
+  if (opts?.keepalive) {
+    try {
+      void fetch('/api/state', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: FOCUS_PROGRESS_KEY, value: payload }),
+        keepalive: true,
+      }).catch(() => {
+        // 卸载瞬间失败只能放弃（下次加载会拉取云端重新纠偏）
+      })
+    } catch {
+      // ignore
+    }
+    return
+  }
+  void putState(FOCUS_PROGRESS_KEY, payload)
+}
+
+/** 运行中每 30s 心跳推送一次（由 500ms tick 驱动；暂停时不推 —— 暂停瞬间已随变更推送） */
+function maybePushProgressHeartbeat(): void {
+  if (!state.running || state.paused) return
+  if (Date.now() - lastProgressPushAt < PROGRESS_PUSH_INTERVAL_MS) return
+  pushProgress()
+}
+
+/** 校验云端进度：结构合法、running 且 updatedAt 在 24h 内才可恢复 */
+function parseCloudProgress(raw: string): FocusProgress | null {
+  try {
+    const p = JSON.parse(raw) as Partial<FocusProgress>
+    if (!p || typeof p !== 'object' || p.running !== true) return null
+    const startedAt = Number(p.startedAt)
+    const updatedAt = Number(p.updatedAt)
+    const elapsedSec = Number(p.elapsedSec)
+    if (!Number.isFinite(startedAt) || startedAt <= 0) return null
+    if (!Number.isFinite(updatedAt) || updatedAt <= 0) return null
+    if (Date.now() - updatedAt > PROGRESS_MAX_AGE_MS) return null
+    const targetSec = Number(p.targetSec)
+    return {
+      startedAt,
+      updatedAt,
+      elapsedSec: Math.max(0, Math.min(86400, Math.round(elapsedSec) || 0)),
+      mode: p.mode === 'countup' ? 'countup' : 'countdown',
+      running: true,
+      paused: p.paused === true,
+      targetSec: Number.isFinite(targetSec) && targetSec > 0 ? Math.round(targetSec) : undefined,
+      contentName: typeof p.contentName === 'string' ? p.contentName : '',
+      contentId: typeof p.contentId === 'string' && p.contentId ? p.contentId : undefined,
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 用云端进度重建本地会话：elapsedSec 是 updatedAt 时刻的已专注秒数 ——
+ *  继续计时则从 updatedAt 起算；心跳已中断（源设备离开）则冻结为暂停，
+ *  不把离线时段计入专注时长。 */
+function adoptCloudProgress(p: FocusProgress): void {
+  const paused = p.paused || Date.now() - p.updatedAt > PROGRESS_STALE_MS
+  state = {
+    running: true,
+    mode: p.mode,
+    startedAt: p.startedAt,
+    targetSec: p.targetSec,
+    contentName: p.contentName,
+    contentId: p.contentId,
+    paused,
+    pausedAccum: p.elapsedSec * 1000,
+    activeSince: paused ? 0 : p.updatedAt,
+    updatedAt: p.updatedAt,
+  }
+  publish()
+  ensureTicker()
+}
+
+/** 拉取云端进度并按需恢复（模块加载时 + FocusApp 挂载进入专注视图时调用）：
+ *  - 本地无进行中会话 → 直接恢复（云端 running 且 updatedAt 在 24h 内）
+ *  - 两边都有且差异 >5s 或不同会话 → 简化冲突处理：以 updatedAt 较新者为准 */
+export async function syncFocusProgressFromServer(): Promise<void> {
+  if (typeof window === 'undefined' || progressSyncInFlight) return
+  if (Date.now() - lastProgressSyncAt < PROGRESS_SYNC_MIN_INTERVAL_MS) return
+  progressSyncInFlight = true
+  lastProgressSyncAt = Date.now()
+  try {
+    const values = await getState([FOCUS_PROGRESS_KEY])
+    const raw = values[FOCUS_PROGRESS_KEY]
+    if (typeof raw !== 'string' || !raw) return
+    const cloud = parseCloudProgress(raw)
+    if (!cloud) return
+    if (state.running) {
+      const sameSession = state.startedAt === cloud.startedAt
+      const elapsedGap = Math.abs(getElapsedSec(state) - cloud.elapsedSec)
+      // 同一会话且进度一致（时间戳驱动，误差 <5s）→ 本地即最新，无需处理
+      if (sameSession && elapsedGap <= PROGRESS_CONFLICT_SEC) return
+      // 冲突：本地较新则保留本地
+      if ((state.updatedAt ?? 0) >= cloud.updatedAt) return
+    }
+    adoptCloudProgress(cloud)
+  } catch {
+    // 网络失败静默跳过，本地会话不受影响
+  } finally {
+    progressSyncInFlight = false
+  }
 }
 
 function dispatchEv(type: string, detail: unknown): void {
@@ -221,6 +395,7 @@ export function startFocus(opts: {
     paused: false,
     pausedAccum: 0,
     activeSince: now,
+    updatedAt: now,
   }
   publish()
   ensureTicker()
@@ -228,14 +403,15 @@ export function startFocus(opts: {
 
 export function pauseFocus(): void {
   if (!state.running || state.paused) return
-  state = { ...state, paused: true, pausedAccum: getElapsedMs(state), activeSince: 0 }
+  state = { ...state, paused: true, pausedAccum: getElapsedMs(state), activeSince: 0, updatedAt: Date.now() }
   publish()
   ensureTicker()
 }
 
 export function resumeFocus(): void {
   if (!state.running || !state.paused) return
-  state = { ...state, paused: false, activeSince: Date.now() }
+  const now = Date.now()
+  state = { ...state, paused: false, activeSince: now, updatedAt: now }
   publish()
   ensureTicker()
 }
@@ -352,6 +528,7 @@ function tick(): void {
   }
   bump()
   dispatchEv(FOCUS_BUS_EVENTS.TICK, state)
+  maybePushProgressHeartbeat()
   if (state.targetSec && getElapsedSec(state) >= state.targetSec) {
     void completeNatural()
   }
@@ -377,10 +554,22 @@ if (typeof window !== 'undefined') {
     publish(false) // 状态来自其他标签页的写入，不回写 localStorage（避免回声循环）
     ensureTicker()
   })
+  // 页面加载：拉取云端进度 —— 本地无进行中会话时恢复（换设备/清存储场景），
+  // 与本地冲突时以 updatedAt 较新者为准
+  void syncFocusProgressFromServer()
+  // 刷新/关闭页面前：会话进行中则立即把进度推到云端（keepalive 保证请求发出）
+  window.addEventListener('beforeunload', () => {
+    if (state.running) pushProgress({ keepalive: true })
+  })
 }
 if (typeof document !== 'undefined') {
   document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible' && state.running && !state.paused) tick()
+    if (document.visibilityState === 'visible' && state.running && !state.paused) {
+      tick()
+    } else if (document.visibilityState === 'hidden' && state.running) {
+      // 切标签 / 最小化：立即同步一次进度（后台定时器被浏览器节流，心跳可能延迟）
+      pushProgress({ keepalive: true })
+    }
   })
   // 刷新页面后恢复运行中的会话：ticker 不会自动启动，这里补上
   // （含「倒计时早已到点」的情况 —— 首个 tick 会立即触发 completeNatural）

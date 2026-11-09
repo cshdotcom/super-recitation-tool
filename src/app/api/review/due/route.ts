@@ -31,6 +31,7 @@ export async function GET() {
           nextReviewAt: true,
           lastReviewedAt: true,
           interval: true,
+          createdAt: true, // fallback 显示用（lastAction 为空时取创建时间）
         },
       }),
       db.appState.findMany({ where: { key: { startsWith: SNOOZE_PREFIX } } }),
@@ -72,14 +73,21 @@ export async function GET() {
       const isDue = nr === null || nr.getTime() <= nowMs
       if (!isDue) continue
 
+      // 防御：fallback 时间全部可选链 + 兜底 now，绝不再因缺字段崩溃
+      const createdAtMs = c.createdAt ? new Date(c.createdAt).getTime() : nowMs
+      const lastActionAtIso =
+        last?.at?.toISOString?.() ??
+        (c.lastReviewedAt ? new Date(c.lastReviewedAt).toISOString() : new Date(createdAtMs).toISOString())
+      const daysSince = last
+        ? Math.max(0, Math.floor((nowMs - (last.at?.getTime?.() ?? nowMs)) / DAY_MS))
+        : Math.max(0, Math.floor((nowMs - createdAtMs) / DAY_MS))
+
       due.push({
         id: c.id,
         title: c.title,
         lastAction: last?.action ?? 'none',
-        lastActionAt: last?.at.toISOString() ?? c.createdAt.toISOString(),
-        daysSince: last
-          ? Math.max(0, Math.floor((nowMs - last.at.getTime()) / DAY_MS))
-          : Math.max(0, Math.floor((nowMs - c.createdAt.getTime()) / DAY_MS)),
+        lastActionAt: lastActionAtIso,
+        daysSince,
         nextReviewAt: nr ? nr.toISOString() : null,
         isNew: nr === null,
       })

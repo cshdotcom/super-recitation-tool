@@ -129,27 +129,45 @@ export async function POST(req: NextRequest) {
     const buffer = Buffer.from(await file.arrayBuffer())
     let content = ''
 
+    // 解析超时保护：单个解析器最多 25s，超时返回友好提示而非挂死/500
+    const withTimeout = <T>(p: Promise<T>, label: string, ms = 25000): Promise<T> =>
+      Promise.race([
+        p,
+        new Promise<T>((_, reject) =>
+          setTimeout(() => reject(new Error(`${label}解析超时（${ms / 1000}s），文件可能过大或损坏`)), ms),
+        ),
+      ])
+
     if (kind === 'pdf') {
       const parser = new PDFParse({ data: new Uint8Array(buffer) })
       try {
-        // Clean page boundary: no "-- 1 of 1 --" markers, just a blank line.
-        const result = await parser.getText({ pageJoiner: '\n\n' })
-        content = result.text || ''
+        const result = await withTimeout(
+          parser.getText({ pageJoiner: '\n\n' }).catch((e: unknown) => {
+            // 文件损坏 / 加密 PDF / 恶意构造：转成友好错误而不是 500
+            throw new Error(
+              `PDF 解析失败：${e instanceof Error ? e.message : '文件可能已损坏或加密'}`,
+            )
+          }),
+          'PDF',
+        )
+        content = result?.text || ''
       } finally {
         await parser.destroy().catch(() => {})
       }
     } else if (kind === 'docx') {
-      // 同时传 buffer（Node 版 unzip 用）+ arrayBuffer（browser-field 版 unzip 用），
-      // 无论 mammoth 是否被外部化都能正常解析。mammoth 已列入 serverExternalPackages，
-      // 生产环境用 Node 版 lib/unzip.js（认 buffer），此 arrayBuffer 为防御性兜底。
+      // 同时传 buffer（Node 版 unzip 用）+ arrayBuffer（browser-field 版 unzip 用）。
       const arrayBuffer = buffer.buffer.slice(
         buffer.byteOffset,
         buffer.byteOffset + buffer.byteLength,
       )
-      const { value } = await mammoth.extractRawText({
-        buffer,
-        arrayBuffer,
-      })
+      const { value } = await withTimeout(
+        mammoth.extractRawText({ buffer, arrayBuffer }).catch((e: unknown) => {
+          throw new Error(
+            `Word 解析失败：${e instanceof Error ? e.message : '文件可能已损坏或不是有效的 .docx'}`,
+          )
+        }),
+        'Word',
+      )
       content = value || ''
     } else {
       content = decodeText(buffer)
@@ -169,9 +187,13 @@ export async function POST(req: NextRequest) {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error('[POST /api/parse] failed:', err)
+    // 解析类错误（超时/损坏/格式异常）返回 422 友好提示，不炸前端
+    const isParseError = /解析|超时|损坏|提取/.test(msg)
     return NextResponse.json(
-      { error: `文件解析失败：${msg}` },
-      { status: 500 },
+      {
+        error: isParseError ? msg : `文件解析失败：${msg}`,
+      },
+      { status: isParseError ? 422 : 500 },
     )
   }
 }

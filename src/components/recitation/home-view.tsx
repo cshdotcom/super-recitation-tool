@@ -4,7 +4,7 @@
 // - 顶栏：汉堡菜单(侧边栏) / 标题 / 搜索 / 更多(⋯)
 // - 标题行：当前项目名 + 待复习胶囊 + 日历按钮（复习日历）
 // - 卡片列表：文件行（图标 + 标题 + 日期 + ⋯ 菜单），搜索结果高亮标注
-// - 底部 Dock：首页 | 黑色大 +（导入内容）| 复习
+// - 底部 Dock：首页 | 黑色大 +（导入内容）| AI 对话
 // - 排序模式（自定义排序）：长按拖动卡片调整顺序
 // - 侧边栏（截图5）：账号头 + 常用功能 + 项目(全部/未分类/最近/自定义项目, 可折叠/搜索/编辑)
 // - 批量选择模式：全选 + 批量删除/移动
@@ -18,7 +18,6 @@ import {
   ArrowUpDown,
   BarChart3,
   BookX,
-  CalendarCheck,
   CalendarClock,
   CalendarDays,
   ChevronDown,
@@ -31,6 +30,7 @@ import {
   GripVertical,
   LayoutGrid,
   Menu,
+  MessagesSquare,
   Pencil,
   Pin,
   PinOff,
@@ -92,6 +92,8 @@ interface HomeViewProps {
   onOpenReviewDue: () => void
   /** 独立日历按钮：打开复习统计/日历 */
   onOpenCalendar: () => void
+  /** 底部 Dock「对话」按钮：打开根级 AI 对话面板（复习入口仍在顶栏胶囊/日历与侧边栏） */
+  onOpenChat: () => void
   onOpenSettings: () => void
   onOpenAccount: () => void
   onLogout: () => void
@@ -143,6 +145,7 @@ export function HomeView({
   onOpenImport,
   onOpenReviewDue,
   onOpenCalendar,
+  onOpenChat,
   onOpenSettings,
   onOpenAccount,
   onShareCard,
@@ -664,20 +667,15 @@ export function HomeView({
             <Plus className="size-6" strokeWidth={2.25} aria-hidden />
           </button>
 
-          {/* 复习（点击自动显示待复习列表；统计/日历在顶栏日历按钮） */}
+          {/* AI 对话（原「复习」入口保留：顶栏待复习胶囊/日历按钮 + 侧边栏） */}
           <button
             type="button"
-            aria-label={dueCount > 0 ? `复习（待复习 ${formatBadge(dueCount)} 张）` : '复习'}
-            onClick={onOpenReviewDue}
-            className="relative flex min-w-[72px] flex-col items-center justify-center gap-0.5 rounded-full px-4 py-1.5 text-foreground transition-transform active:scale-95"
+            aria-label="AI 对话"
+            onClick={onOpenChat}
+            className="flex min-w-[72px] flex-col items-center justify-center gap-0.5 rounded-full px-4 py-1.5 text-foreground transition-transform active:scale-95"
           >
-            <CalendarCheck className="size-5" strokeWidth={2} aria-hidden />
-            <span className="text-[10px] font-medium leading-none">复习</span>
-            {dueCount > 0 && (
-              <span className="absolute right-2 top-0.5 flex min-w-[16px] h-4 items-center justify-center rounded-full bg-emerald-600 px-1 text-[9px] font-bold leading-none text-white ring-2 ring-background">
-                {formatBadge(dueCount)}
-              </span>
-            )}
+            <MessagesSquare className="size-5" strokeWidth={2} aria-hidden />
+            <span className="text-[10px] font-medium leading-none">对话</span>
           </button>
         </nav>
       </div>
@@ -883,7 +881,7 @@ export function HomeView({
       {/* ================= 弹窗集合 ================= */}
       {/* 新建项目 */}
       <Dialog open={newProjOpen} onOpenChange={setNewProjOpen}>
-        <DialogContent className="rounded-2xl sm:max-w-sm">
+        <DialogContent className="rounded-2xl sm:max-w-sm" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>新建项目</DialogTitle>
           </DialogHeader>
@@ -913,7 +911,7 @@ export function HomeView({
 
       {/* 重命名项目 */}
       <Dialog open={!!renameProj} onOpenChange={(v) => !v && setRenameProj(null)}>
-        <DialogContent className="rounded-2xl sm:max-w-sm">
+        <DialogContent className="rounded-2xl sm:max-w-sm" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>重命名项目</DialogTitle>
           </DialogHeader>
@@ -986,7 +984,7 @@ export function HomeView({
 
       {/* 移动卡片到项目 */}
       <Dialog open={!!moveToProj} onOpenChange={(v) => !v && setMoveToProj(null)}>
-        <DialogContent className="rounded-2xl sm:max-w-sm">
+        <DialogContent className="rounded-2xl sm:max-w-sm" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>移动 {moveToProj?.ids.length ?? 0} 张卡片到…</DialogTitle>
           </DialogHeader>
@@ -1023,7 +1021,7 @@ export function HomeView({
 
       {/* 创建副本到项目 */}
       <Dialog open={!!duplicateCard} onOpenChange={(v) => !v && setDuplicateCard(null)}>
-        <DialogContent className="rounded-2xl sm:max-w-sm">
+        <DialogContent className="rounded-2xl sm:max-w-sm" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>创建副本</DialogTitle>
           </DialogHeader>
@@ -1061,7 +1059,7 @@ export function HomeView({
 
       {/* 重命名卡片 */}
       <Dialog open={!!renameCard} onOpenChange={(v) => !v && setRenameCard(null)}>
-        <DialogContent className="rounded-2xl sm:max-w-sm">
+        <DialogContent className="rounded-2xl sm:max-w-sm" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>重命名卡片</DialogTitle>
           </DialogHeader>
@@ -1093,7 +1091,7 @@ export function HomeView({
 
       {/* 批量移动 */}
       <Dialog open={batchMoveOpen} onOpenChange={setBatchMoveOpen}>
-        <DialogContent className="rounded-2xl sm:max-w-sm">
+        <DialogContent className="rounded-2xl sm:max-w-sm" aria-describedby={undefined}>
           <DialogHeader>
             <DialogTitle>移动 {selected.size} 张卡片到…</DialogTitle>
           </DialogHeader>

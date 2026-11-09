@@ -104,6 +104,11 @@ const TtsPlayerGlobal = NextDynamic(
   () => import('@/components/recitation/tts-player').then((m) => m.TtsPlayer),
   { ssr: false, loading: () => null },
 )
+// 根级 AI 对话面板（主页底部 Dock「对话」按钮）：复用 ChatTool（AI问问 ask 模式）
+const ChatToolGlobal = NextDynamic(
+  () => import('@/components/recitation/chat-tool').then((m) => m.ChatTool),
+  { ssr: false, loading: () => <div className="h-[60vh] animate-pulse rounded-xl bg-muted" /> },
+)
 
 function PageSkeleton() {
   return (
@@ -186,6 +191,8 @@ export default function Page() {
   // 全局朗读播放器：ttsCard 非空即挂载；收起后 ttsCollapsed=true，迷你条跨视图常驻
   const [ttsCard, setTtsCard] = React.useState<CardData | null>(null)
   const [ttsCollapsed, setTtsCollapsed] = React.useState(false)
+  // 根级 AI 对话 Sheet（主页底部 Dock「对话」按钮 onOpenChat）
+  const [chatRootOpen, setChatRootOpen] = React.useState(false)
 
   const saveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -800,6 +807,13 @@ export default function Page() {
     updatedAt: new Date().toISOString(),
   }
 
+  // 根级 AI 对话的上下文卡：优先当前卡；返回主页时 handleBack 会清空 currentCard，
+  // 此时回退到列表第一张有内容的卡（/api/chat 要求课文非空，空内容无法发送）。
+  const chatRootCard: CardData | null =
+    currentCard && currentCard.content.trim()
+      ? currentCard
+      : cards.find((c) => c.content.trim()) ?? null
+
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
       {view === 'home' && account ? (
@@ -816,6 +830,7 @@ export default function Page() {
           onOpenImport={() => setImportOpen(true)}
           onOpenReviewDue={() => setView('review-due')}
           onOpenCalendar={() => setView('review-stats')}
+          onOpenChat={() => setChatRootOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onOpenAccount={() => setAccountOpen(true)}
           onLogout={handleLogout}
@@ -993,6 +1008,7 @@ export default function Page() {
           <SheetContentGlobal
             side="bottom"
             forceMount
+            aria-describedby={undefined}
             className="flex h-[94dvh] flex-col rounded-t-3xl bg-background p-0"
           >
             <SheetHeaderGlobal className="sr-only">
@@ -1009,6 +1025,45 @@ export default function Page() {
               onCollapsedChange={setTtsCollapsed}
               onClose={() => { setTtsCard(null); setTtsCollapsed(false) }}
             />
+          </SheetContentGlobal>
+        </SheetGlobal>
+      )}
+
+      {/* 根级 AI 对话（主页 Dock「对话」按钮）：ask 模式复用 ChatTool，
+          上下文卡见 chatRootCard（当前卡 → 第一张有内容的卡）。 */}
+      {chatRootOpen && (
+        <SheetGlobal
+          open={chatRootOpen}
+          onOpenChange={(o) => { if (!o) setChatRootOpen(false) }}
+        >
+          <SheetContentGlobal
+            side="bottom"
+            aria-describedby={undefined}
+            className="mx-auto max-w-2xl gap-0 rounded-t-3xl px-4 pb-[max(1.25rem,env(safe-area-inset-bottom))]"
+          >
+            <SheetHeaderGlobal className="border-b py-3 pr-12">
+              <SheetTitleGlobal className="text-base">
+                AI 对话
+                {chatRootCard ? (
+                  <span className="ml-1.5 text-sm font-normal text-muted-foreground">
+                    · {chatRootCard.title}
+                  </span>
+                ) : null}
+              </SheetTitleGlobal>
+            </SheetHeaderGlobal>
+            {chatRootCard ? (
+              <ChatToolGlobal
+                mode="ask"
+                content={chatRootCard.content}
+                allowImages
+                cardId={chatRootCard.id}
+                settings={settings ?? undefined}
+              />
+            ) : (
+              <div className="flex min-h-[40vh] items-center justify-center px-6 py-10 text-center text-sm text-muted-foreground">
+                还没有可对话的背书卡，先创建一张带内容的卡吧
+              </div>
+            )}
           </SheetContentGlobal>
         </SheetGlobal>
       )}
