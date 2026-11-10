@@ -149,6 +149,10 @@ export async function PATCH(req: NextRequest) {
     if (typeof body?.aiAutoCloze === 'boolean') {
       data.aiAutoCloze = body.aiAutoCloze
     }
+    // AI 出题后自动存入试卷夹
+    if (typeof body?.quizAutoPaper === 'boolean') {
+      data.quizAutoPaper = body.quizAutoPaper
+    }
     // ---- AI 对话全局配置 ----
     if (typeof body?.aiSystemPrompt === 'string') {
       data.aiSystemPrompt = body.aiSystemPrompt.slice(0, 20000)

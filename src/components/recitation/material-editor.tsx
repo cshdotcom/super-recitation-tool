@@ -2682,7 +2682,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
         onChange={(e) => void handleReplaceFile(e)}
       />
 
-      {/* 富媒体详情：放大/缩小/下载保存/复制引用/定位引用 */}
+      {/* 富媒体详情：放大/缩小/下载保存/复制引用/定位引用/朗读/可视化编辑 */}
       <MediaDetailDialog
         mediaRef={mediaDetail}
         contextLabel={mediaDetailCtx}
@@ -2696,6 +2696,14 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
           if (mediaDetailLocate) {
             setMediaDetail(null)
             locateMedia(mediaDetailLocate.index, mediaDetailLocate.field, ref)
+          }
+        }}
+        onEdit={(ref) => {
+          // 可视化编辑快捷入口：复用详情弹窗的定位上下文打开编辑弹窗
+          if (mediaDetailLocate) {
+            setMediaEditTarget(mediaDetailLocate)
+            setMediaEditRef(ref)
+            setMediaDetail(null)
           }
         }}
       />

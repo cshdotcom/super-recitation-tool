@@ -71,10 +71,36 @@ export function MediaRefStrip({
   const [sizeIdx, setSizeIdx] = React.useState(0)
   const [menuFor, setMenuFor] = React.useState<string | null>(null)
   const longPressTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** 长按已触发菜单 → 抑制随后的 click（避免同时打开详情弹窗） */
+  const suppressClickRef = React.useRef(false)
+
+  // 卸载时清理长按计时器（防止组件卸载后 setState）
+  React.useEffect(() => {
+    return () => {
+      if (longPressTimer.current) clearTimeout(longPressTimer.current)
+    }
+  }, [])
+
+  // Esc 关闭菜单
+  React.useEffect(() => {
+    if (!menuFor) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuFor(null)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [menuFor])
 
   if (refs.length === 0) return null
 
-  const openMenu = (key: string) => setMenuFor(key)
+  const openMenu = (key: string) => {
+    suppressClickRef.current = true
+    setMenuFor(key)
+    // 抑制标记在下一个宏任务里复位，仅吞掉本次手势的 click
+    setTimeout(() => {
+      suppressClickRef.current = false
+    }, 350)
+  }
   const clearLongPress = () => {
     if (longPressTimer.current) {
       clearTimeout(longPressTimer.current)
@@ -97,8 +123,9 @@ export function MediaRefStrip({
             key={key}
             className="relative"
             onPointerDown={(e) => {
-              // 长按（触屏 500ms）→ 打开更多菜单
-              if (e.pointerType === 'touch') {
+              // 长按（触屏 500ms）→ 打开更多菜单；
+              // ⚠️ 菜单已打开时不重启计时器（否则点遮罩关闭后 500ms 又自动弹出）
+              if (e.pointerType === 'touch' && !menuOpen) {
                 clearLongPress()
                 longPressTimer.current = setTimeout(() => openMenu(key), 500)
               }
@@ -111,7 +138,10 @@ export function MediaRefStrip({
             <button
               type="button"
               aria-label={`${MEDIA_KIND_LABEL[ref.kind]}引用 ${idx + 1}，点击查看详情`}
-              onClick={() => onAction('detail', ref)}
+              onClick={() => {
+                if (suppressClickRef.current) return
+                onAction('detail', ref)
+              }}
               className={cn(
                 'group relative overflow-hidden rounded-lg border border-border bg-background transition-transform active:scale-95',
                 ref.kind === 'image' ? THUMB_SIZES[sizeIdx] : 'h-16 w-20',
@@ -150,12 +180,14 @@ export function MediaRefStrip({
             <button
               type="button"
               aria-label={`${MEDIA_KIND_LABEL[ref.kind]}更多操作`}
+              aria-expanded={menuOpen}
               onClick={(e) => {
                 e.stopPropagation()
-                openMenu(menuOpen ? '' : key)
+                // 函数式切换：菜单开着再点 ⋮ → 收起（此前被遮罩盖住导致无法收起）
+                setMenuFor((v) => (v === key ? null : key))
               }}
               className={cn(
-                'absolute -right-1 -top-1 z-10 flex size-5 items-center justify-center rounded-full bg-zinc-900/80 text-white shadow transition-transform hover:scale-110',
+                'absolute -right-1 -top-1 z-50 flex size-5 items-center justify-center rounded-full bg-zinc-900/80 text-white shadow transition-transform hover:scale-110',
               )}
             >
               <span className="text-[10px] font-bold leading-none">⋮</span>
@@ -164,10 +196,19 @@ export function MediaRefStrip({
             {/* 菜单 */}
             {menuOpen && (
               <>
+                {/* 全屏点击遮罩：⚠️ 必须阻断冒泡 —— 否则 pointerdown 冒泡到条目容器
+                    会重启 500ms 长按计时器，菜单「关闭后自动复活」*/}
                 <div
                   className="fixed inset-0 z-40"
-                  onClick={() => setMenuFor(null)}
-                  onPointerDown={() => setMenuFor(null)}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    setMenuFor(null)
+                  }}
+                  onPointerDown={(e) => {
+                    e.stopPropagation()
+                    clearLongPress()
+                    setMenuFor(null)
+                  }}
                   aria-hidden
                 />
                 <div

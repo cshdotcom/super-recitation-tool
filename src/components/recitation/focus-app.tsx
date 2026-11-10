@@ -15,6 +15,8 @@ import * as React from 'react'
 import {
   ArrowDown,
   ArrowUp,
+  Bell,
+  BellOff,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -23,12 +25,14 @@ import {
   Clock3,
   Loader2,
   Minus,
+  Music,
   Pause,
   Play,
   Plus,
   Settings2,
   SquarePen,
   Trash2,
+  Upload,
   X,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -55,29 +59,44 @@ import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import type { FocusContentData } from '@/lib/types'
 import {
+  FOCUS_BUILTIN_SOUNDS,
   FOCUS_BUS_EVENTS,
   consumeOpenFocusRequest,
+  describeBellChoice,
   fmtClock,
   fmtDurHuman,
   getDisplaySec,
   getElapsedSec,
+  getFocusSoundPrefs,
   getFocusState,
   fetchTodayFocusLogs,
   deleteFocusLog,
   pauseFocus,
+  previewSessionBell,
+  readAudioFileAsDataUrl,
   resumeFocus,
   setImmersiveOpen,
+  setSessionBell,
   startFocus,
+  stopBellPreview,
   stopFocus,
   syncFocusProgressFromServer,
   useFocusState,
+  validateBellFile,
   type FocusHistoryEntry,
   type FocusMode,
+  type FocusSoundPrefs,
+  type SessionBellOverride,
 } from './focus-bus'
 
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
 
 const DURATIONS = [5, 10, 15, 20, 25, 30, 45, 60]
+
+/** 本次铃声选项 chip（min-h-11 = 44px 最小触摸区） */
+const BELL_CHIP =
+  'flex min-h-11 shrink-0 items-center gap-1.5 rounded-full border bg-white px-4 text-sm transition-colors hover:bg-zinc-50'
+const BELL_CHIP_ON = 'border-zinc-900 bg-zinc-50 font-semibold'
 
 const BG_PRESETS: { key: string; src: string }[] = [
   { key: 'bg-silk', src: '/focus/bg-silk.png' },
@@ -256,6 +275,13 @@ export function FocusApp({ onBack }: FocusAppProps) {
   const [localBg, setLocalBg] = React.useState<string | null>(null)
   const [saving, setSaving] = React.useState(false)
 
+  // ---------- 本次结束铃声（会话级覆盖；null = 跟随默认） ----------
+  const [bellSel, setBellSel] = React.useState<SessionBellOverride | null>(null)
+  /** 默认铃声（浮时钟详情 / 「时间到了」弹窗里可改，SOUND 事件同步刷新） */
+  const [soundPrefs, setSoundPrefs] = React.useState<FocusSoundPrefs | null>(null)
+  /** 最近可用的自定义铃声 dataURL（本次上传 / 默认为自定义时），供「自定义铃声」选项使用 */
+  const [customBellUrl, setCustomBellUrl] = React.useState('')
+
   const fetchList = React.useCallback(async () => {
     try {
       const res = await fetch(`/api/focus?tzOffset=${new Date().getTimezoneOffset()}`)
@@ -284,6 +310,21 @@ export function FocusApp({ onBack }: FocusAppProps) {
     // 与本地冲突时以 updatedAt 较新者为准
     void syncFocusProgressFromServer()
   }, [fetchList, refreshLocal])
+
+  // 默认铃声（挂载时读取；浮时钟里修改后经 SOUND 事件刷新）+ 离开时停掉试听
+  React.useEffect(() => {
+    const loadPrefs = () => {
+      const p = getFocusSoundPrefs()
+      setSoundPrefs(p)
+      setCustomBellUrl((u) => u || p.dataUrl)
+    }
+    loadPrefs()
+    window.addEventListener(FOCUS_BUS_EVENTS.SOUND, loadPrefs)
+    return () => {
+      window.removeEventListener(FOCUS_BUS_EVENTS.SOUND, loadPrefs)
+      stopBellPreview()
+    }
+  }, [])
 
   // 全屏遮罩 ↔ 浮时钟协调（遮罩打开时隐藏右下角圆钮）
   React.useEffect(() => {
@@ -359,6 +400,10 @@ export function FocusApp({ onBack }: FocusAppProps) {
       contentName: selected?.name ?? '自由专注',
       contentId: selected?.id,
     })
+    // 本次结束铃声 → 会话级覆盖（不写入默认设置；null = 跟随默认）
+    setSessionBell(bellSel)
+    setBellSel(null) // 消费后复位：下次开始默认跟随
+    stopBellPreview() // 停掉试听残留，避免与到点铃声叠加
     setOverlay(true)
   }
 
@@ -495,12 +540,45 @@ export function FocusApp({ onBack }: FocusAppProps) {
     }
   }
 
+  /** 上传本次铃声（仅会话级，不改动默认铃声；上传成功即试听） */
+  const onPickBellFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    const err = validateBellFile(file)
+    if (err) {
+      toast.error(err)
+      return
+    }
+    try {
+      const dataUrl = await readAudioFileAsDataUrl(file)
+      setCustomBellUrl(dataUrl)
+      const next: SessionBellOverride = { kind: 'custom', dataUrl }
+      setBellSel(next)
+      previewSessionBell(next) // 上传成功即试听
+      toast.success('已设为本次结束铃声', {
+        description: '如需长期使用，可在专注时的浮时钟里设为默认铃声',
+      })
+    } catch (err2) {
+      toast.error(err2 instanceof Error ? err2.message : '上传音频失败')
+    }
+  }
+
   // ---------- 展示用 ----------
   const displaySec = getDisplaySec(st)
   const elapsedSec = getElapsedSec(st)
   const modeLabel = mode === 'countdown' ? '倒计时' : '正计时'
   const overlayBgUrl = resolveBgUrl(activeContent?.bg ?? '')
   const goalActive = mode === 'countdown' || goalOn
+
+  // 「跟随默认」提示用的当前默认铃声名（soundPrefs 为 null 时避免 SSR 首帧读写 localStorage）
+  const defaultBellName = soundPrefs
+    ? soundPrefs.enabled
+      ? soundPrefs.dataUrl
+        ? '自定义铃声'
+        : (FOCUS_BUILTIN_SOUNDS.find((s) => s.key === soundPrefs.builtin)?.label ?? '琶音')
+      : '已关闭'
+    : ''
 
   // ============================================================
   // 渲染
@@ -514,7 +592,14 @@ export function FocusApp({ onBack }: FocusAppProps) {
           <button
             type="button"
             aria-label="返回"
-            onClick={step === 'mode' ? onBack : () => setStep('mode')}
+            onClick={
+              step === 'mode'
+                ? onBack
+                : () => {
+                    stopBellPreview() // 返回上一步时停掉试听
+                    setStep('mode')
+                  }
+            }
             className="shrink-0 rounded-full p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ChevronLeft className="size-6 text-foreground" strokeWidth={1.75} />
@@ -759,6 +844,101 @@ export function FocusApp({ onBack }: FocusAppProps) {
                     )}
                   </div>
 
+                  {/* 本次结束铃声（会话级覆盖，点选即试听，不写入默认设置） */}
+                  <div className="rounded-2xl border bg-white p-4">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                        <Bell className="size-4 text-zinc-500" strokeWidth={1.75} />
+                        本次结束铃声
+                      </span>
+                      <span className="text-xs text-zinc-400">
+                        {bellSel
+                          ? describeBellChoice(bellSel)
+                          : defaultBellName
+                            ? `跟随默认 · ${defaultBellName}`
+                            : '跟随默认'}
+                      </span>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        aria-pressed={bellSel === null}
+                        onClick={() => {
+                          setBellSel(null)
+                          previewSessionBell(null)
+                        }}
+                        className={cn(BELL_CHIP, bellSel === null && BELL_CHIP_ON)}
+                      >
+                        跟随默认
+                      </button>
+                      {FOCUS_BUILTIN_SOUNDS.map((b) => {
+                        const active = bellSel?.kind === 'builtin' && bellSel.key === b.key
+                        return (
+                          <button
+                            key={b.key}
+                            type="button"
+                            aria-pressed={active}
+                            onClick={() => {
+                              const next: SessionBellOverride = { kind: 'builtin', key: b.key }
+                              setBellSel(next)
+                              previewSessionBell(next)
+                            }}
+                            className={cn(BELL_CHIP, active && BELL_CHIP_ON)}
+                          >
+                            {b.label}
+                          </button>
+                        )
+                      })}
+                      {(customBellUrl || soundPrefs?.dataUrl) && (
+                        <button
+                          type="button"
+                          aria-pressed={bellSel?.kind === 'custom'}
+                          onClick={() => {
+                            const url = customBellUrl || soundPrefs?.dataUrl
+                            if (!url) return
+                            const next: SessionBellOverride = { kind: 'custom', dataUrl: url }
+                            setBellSel(next)
+                            previewSessionBell(next)
+                          }}
+                          className={cn(BELL_CHIP, bellSel?.kind === 'custom' && BELL_CHIP_ON)}
+                        >
+                          <Music className="size-4 text-zinc-500" strokeWidth={1.75} />
+                          自定义铃声
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        aria-pressed={bellSel?.kind === 'silent'}
+                        onClick={() => {
+                          const next: SessionBellOverride = { kind: 'silent' }
+                          setBellSel(next)
+                          previewSessionBell(next)
+                        }}
+                        className={cn(BELL_CHIP, bellSel?.kind === 'silent' && BELL_CHIP_ON)}
+                      >
+                        <BellOff className="size-4 text-zinc-500" strokeWidth={1.75} />
+                        静音
+                      </button>
+                      <label className={cn(BELL_CHIP, 'cursor-pointer border-dashed')}>
+                        <Upload className="size-4 text-zinc-500" strokeWidth={1.75} />
+                        上传
+                        <input
+                          type="file"
+                          accept="audio/*"
+                          className="hidden"
+                          aria-label="上传本次铃声"
+                          onChange={(e) => void onPickBellFile(e)}
+                        />
+                      </label>
+                    </div>
+                    <p className="mt-2 text-xs leading-5 text-zinc-400">
+                      {bellSel === null
+                        ? '不选则跟随默认铃声，点选即试听'
+                        : '仅本次专注生效，不改动默认铃声，点选即试听'}
+                      ；默认铃声可在专注时的右下角浮时钟里修改
+                    </p>
+                  </div>
+
                   {/* 开始按钮：黑色大胶囊 */}
                   <button
                     type="button"
@@ -849,17 +1029,19 @@ export function FocusApp({ onBack }: FocusAppProps) {
           )}
           <div className="absolute inset-0 bg-gradient-to-b from-black/60 via-black/40 to-black/60" />
 
-          {/* 最小化（X 按钮：收起全屏遮罩，计时后台继续） */}
+          {/* 关闭遮罩（X 按钮：收起全屏遮罩，计时后台继续）
+              ⚠️ 层叠修复：此按钮必须高于中央内容层（同 z-index 时 DOM 靠后者拦截点击），
+              且中央内容层需 pointer-events-none，否则 X 可见但点不到 */}
           <button
             type="button"
             onClick={minimize}
-            aria-label="最小化（计时后台继续）"
-            className="absolute left-4 top-4 z-10 flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+            aria-label="关闭全屏计时（后台继续计时）"
+            className="absolute left-4 top-4 z-30 flex size-12 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
           >
             <X className="size-5" strokeWidth={2} />
           </button>
 
-          <div className="relative z-10 flex h-full flex-col items-center justify-center px-6 pb-28">
+          <div className="pointer-events-none relative z-10 flex h-full flex-col items-center justify-center px-6 pb-28">
             <p className="max-w-full truncate text-base font-medium text-white/70">
               {st.contentName || '自由专注'}
             </p>
@@ -877,7 +1059,7 @@ export function FocusApp({ onBack }: FocusAppProps) {
           </div>
 
           {/* 暂停 / 结束 */}
-          <div className="absolute inset-x-0 bottom-12 z-10 flex justify-center gap-3 px-6">
+          <div className="absolute inset-x-0 bottom-12 z-20 flex justify-center gap-3 px-6">
             <button
               type="button"
               onClick={st.paused ? resumeFocus : pauseFocus}
@@ -893,8 +1075,8 @@ export function FocusApp({ onBack }: FocusAppProps) {
               结束并保存
             </button>
           </div>
-          <p className="absolute inset-x-0 bottom-3 z-10 text-center text-xs text-white/40">
-            最小化后计时仍在后台继续
+          <p className="pointer-events-none absolute inset-x-0 bottom-3 z-20 text-center text-xs text-white/40">
+            关闭后计时仍在后台继续，右下角浮时钟可返回
           </p>
         </div>
       )}

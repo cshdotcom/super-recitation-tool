@@ -419,6 +419,8 @@ interface QuizPanelProps {
   cardTitle?: string
   /** 答对后自动移除错题 — 答对N次后 */
   autoRemove?: number
+  /** AI 出题后自动存入试卷夹（未传时挂载自取 /api/settings，默认开） */
+  quizAutoPaper?: boolean
 }
 
 type Step = 'idle' | 'points' | 'types' | 'generating' | 'answering'
@@ -429,7 +431,30 @@ export function QuizPanel({
   cardId,
   cardTitle,
   autoRemove = 2,
+  quizAutoPaper,
 }: QuizPanelProps) {
+  // ---- AI 出题自动存试卷夹（props 未传时挂载自取设置，默认开） ----
+  const [autoPaperSelf, setAutoPaperSelf] = React.useState(true)
+  const autoPaperOn = quizAutoPaper ?? autoPaperSelf
+  React.useEffect(() => {
+    if (quizAutoPaper !== undefined) return
+    let alive = true
+    void (async () => {
+      try {
+        const res = await fetch('/api/settings')
+        if (!res.ok) return
+        const data = (await res.json()) as { quizAutoPaper?: unknown }
+        if (alive && typeof data.quizAutoPaper === 'boolean') {
+          setAutoPaperSelf(data.quizAutoPaper)
+        }
+      } catch {
+        /* 读取失败保持默认（开） */
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [quizAutoPaper])
   // ---- 向导步骤 ----
   // 始终从 idle 开始：必须由用户点「开始出题」显式触发，
   // 不再因背书卡有内容就自动进入 points 步骤（避免每次打开都自动弹题）。
@@ -587,9 +612,16 @@ export function QuizPanel({
   const [papersOpen, setPapersOpen] = React.useState(false)
   const [zoomImg, setZoomImg] = React.useState<string | null>(null)
 
-  /** 把当前题目存为试卷（POST /api/papers，source:'ai'） */
-  const saveAsPaper = async (title?: string) => {
-    if (questions.length === 0) {
+  /** 把当前题目存为试卷（POST /api/papers，source:'ai'）
+   *  opts.auto：出题后自动保存（成功 toast 带「打开试卷夹」入口）
+   *  itemsOverride：生成后立刻保存时传入（此时 setQuestions 尚未提交，闭包里是旧值） */
+  const saveAsPaper = async (
+    title?: string,
+    opts?: { auto?: boolean },
+    itemsOverride?: QuizQuestionX[],
+  ) => {
+    const items = itemsOverride ?? questions
+    if (items.length === 0) {
       toast.warning('当前没有题目，先生成题目再保存')
       return
     }
@@ -605,7 +637,7 @@ export function QuizPanel({
         body: JSON.stringify({
           cardId,
           title: (title ?? '').trim() || defaultPaperTitle(),
-          items: questions,
+          items,
           source: 'ai',
         }),
       })
@@ -614,7 +646,17 @@ export function QuizPanel({
         throw new Error(err.error || '保存失败')
       }
       setSaveOpen(false)
-      toast.success('已存入试卷夹，可随时重练')
+      if (opts?.auto) {
+        toast.success('已生成并自动存入试卷夹', {
+          description: '可在试卷夹中随时重练',
+          action: {
+            label: '打开试卷夹',
+            onClick: () => setPapersOpen(true),
+          },
+        })
+      } else {
+        toast.success('已存入试卷夹，可随时重练')
+      }
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '保存失败')
     } finally {
@@ -934,18 +976,13 @@ export function QuizPanel({
       clearDraftStorage()
       setStep('answering')
       toast.success(`已生成 ${qs.length} 道题`)
-      // 轻提示：一键存入试卷夹（可保存后随时重练）
-      toast('本次题目已生成，存入试卷夹？', {
-        description: '保存后可在试卷夹随时重练',
-        action: {
-          label: '存入',
-          onClick: () => {
-            setPaperTitle(defaultPaperTitle())
-            setSaveOpen(true)
-          },
-        },
-        duration: 10000,
-      })
+      // 出题后存试卷夹：设置开启 → 自动保存（默认）；关闭 → 弹手动保存弹窗
+      if (autoPaperOn) {
+        void saveAsPaper(undefined, { auto: true }, qs)
+      } else {
+        setPaperTitle(defaultPaperTitle())
+        setSaveOpen(true)
+      }
     } catch (err) {
       // 友好中文错误（含服务端消息）留在「出题中」视图，提供重试 / 返回
       setGenError(friendlyQuizError(err))

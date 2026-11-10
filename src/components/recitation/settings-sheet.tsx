@@ -1131,6 +1131,18 @@ export function SettingsSheet({
             <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">点按进入复习计划管理</p>
           </section>
 
+          {/* ---------- 出题设置 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">出题设置</p>
+            <ToggleRow
+              label="AI出题后自动存入试卷夹"
+              desc="生成题目后自动保存到试卷夹；关闭后生成完弹窗手动存入"
+              checked={settings.quizAutoPaper}
+              onCheckedChange={(v) => onChangeSettings({ quizAutoPaper: v })}
+            />
+            <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">已自动保存</p>
+          </section>
+
           {/* ---------- 导入偏好 ---------- */}
           <section>
             <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">导入偏好</p>

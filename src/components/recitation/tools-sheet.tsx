@@ -138,6 +138,7 @@ export function ToolsSheet({
             cardId={card.id}
             cardTitle={card.title}
             autoRemove={settings.quizAutoRemove}
+            quizAutoPaper={settings.quizAutoPaper}
           />
         )
       case 'supervise':

@@ -1,6 +1,9 @@
 'use client'
 
 // 收藏题目（favorite=true 的 QuizItem）+ AI 能力：
+//   • 选择模式（顶栏「选择」+ 长按/右键）：RoundCheckbox 勾选，批量栏
+//     练习所选（复用错题本 PracticeBoard）/ AI 智能勾选（/api/chat mode:'pick'）
+//     / 全选 / 反选；非选择模式保留 举一反三 / AI解析 / 取消收藏
 //   • 举一反三（POST /api/chat mode:'extend'）→ Dialog 富媒体展示（RichContent）
 //     +「存为试卷」（POST /api/papers，解析 ## 第N题 结构，失败兜底整段简答题）
 //   • AI 解析（POST /api/chat mode:'analyze'，课文上下文来自 /api/cards 并缓存）
@@ -11,11 +14,15 @@ import * as React from 'react'
 import { createPortal } from 'react-dom'
 import {
   BookOpen,
+  Check,
   ChevronLeft,
   Lightbulb,
   Loader2,
+  Play,
   Save,
   Search,
+  Sparkles,
+  Square,
   Star,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -25,6 +32,7 @@ import { cn } from '@/lib/utils'
 import RichContent from '@/components/recitation/rich-content'
 import { Button } from '@/components/ui/button'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { PracticeBoard, PracticeDone } from '@/components/recitation/wrong-questions-view'
 
 interface FavoritesViewProps {
   onBack: () => void
@@ -142,11 +150,48 @@ function EmptyFavoritesIllustration() {
 const SCROLLBAR =
   '[scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:min-h-6 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent'
 
-// 收藏题目：列表 + 取消收藏 + AI（举一反三 / 解析 / 选中文本追问）（全屏视图）
+// 黑色圆形勾选框（多选模式，与错题本同款）
+function RoundCheckbox({ checked }: { checked: boolean }) {
+  return (
+    <span
+      className={cn(
+        'mt-0.5 flex size-5 shrink-0 items-center justify-center rounded-full border-2',
+        checked
+          ? 'border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900'
+          : 'border-zinc-400 bg-transparent text-transparent dark:border-zinc-600',
+      )}
+    >
+      <svg
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="3.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        className="size-3"
+        aria-hidden
+      >
+        <path d="M20 6 9 17l-5-5" />
+      </svg>
+    </span>
+  )
+}
+
+type FavMode = 'list' | 'practice' | 'done'
+
+// 收藏题目：列表 + 选择模式（练习所选 / AI 智能勾选）+ 取消收藏 + AI（举一反三 / 解析 / 选中文本追问）（全屏视图）
 export function FavoritesView({ onBack }: FavoritesViewProps) {
   const [items, setItems] = React.useState<QuizItemData[]>([])
   const [loading, setLoading] = React.useState(true)
   const [removingId, setRemovingId] = React.useState<string | null>(null)
+
+  // ---------- 选择模式 / 练习（勾选练习 + AI 智能勾选） ----------
+  const [mode, setMode] = React.useState<FavMode>('list')
+  const [selectMode, setSelectMode] = React.useState(false)
+  const [selected, setSelected] = React.useState<Set<string>>(new Set())
+  const [aiPickBusy, setAiPickBusy] = React.useState(false)
+  const [practiceItems, setPracticeItems] = React.useState<QuizItemData[]>([])
+  const [done, setDone] = React.useState<{ right: number; total: number } | null>(null)
 
   // ---------- AI（举一反三 / 解析） ----------
   const [aiOpen, setAiOpen] = React.useState<'extend' | 'analyze' | null>(null)
@@ -197,6 +242,118 @@ export function FavoritesView({ onBack }: FavoritesViewProps) {
     } finally {
       setRemovingId(null)
     }
+  }
+
+  // ---------- 选择模式（参考错题本：长按 / 右键 / 顶栏入口） ----------
+  const selectedItems = items.filter((i) => selected.has(i.id))
+  const allSelected = items.length > 0 && items.every((i) => selected.has(i.id))
+
+  const toggleSelectItem = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const toggleSelectAll = () => {
+    setSelected(allSelected ? new Set() : new Set(items.map((i) => i.id)))
+  }
+
+  const invertSelect = () => setSelected(new Set(items.filter((i) => !selected.has(i.id)).map((i) => i.id)))
+
+  const exitSelectMode = () => {
+    setSelectMode(false)
+    setSelected(new Set())
+  }
+
+  // ---- 长按进入多选 ----
+  const pressTimer = React.useRef<number | null>(null)
+  const clearPress = React.useCallback(() => {
+    if (pressTimer.current !== null) {
+      window.clearTimeout(pressTimer.current)
+      pressTimer.current = null
+    }
+  }, [])
+  React.useEffect(() => clearPress, [clearPress])
+  const startPress = (id: string) => {
+    clearPress()
+    pressTimer.current = window.setTimeout(() => {
+      pressTimer.current = null
+      if (!selectMode && mode === 'list') {
+        setSelectMode(true)
+        setSelected(new Set([id]))
+      }
+    }, 500)
+  }
+
+  // ---------- AI 智能勾选（/api/chat mode:'pick'，与错题本同款契约） ----------
+  const aiPick = async () => {
+    if (items.length === 0) {
+      toast('还没有收藏题目')
+      return
+    }
+    const count = Math.min(10, items.length)
+    setAiPickBusy(true)
+    const tid = toast.loading(`AI 正在挑选最值得练习的 ${count} 道题…`)
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'pick',
+          questions: items.map((i) => ({ question: i.question, reason: '收藏题' })),
+          count,
+        }),
+      })
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(err.error || 'AI 勾选失败')
+      }
+      const data = (await res.json()) as { indices?: unknown }
+      const idxs = Array.isArray(data.indices)
+        ? data.indices.filter(
+            (n): n is number =>
+              typeof n === 'number' && Number.isInteger(n) && n >= 0 && n < items.length,
+          )
+        : []
+      if (idxs.length === 0) throw new Error('AI 未返回有效选择，请重试')
+      setSelected(new Set(idxs.map((n) => items[n].id)))
+      toast.success(`AI 已勾选 ${idxs.length} 道题`, { id: tid })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'AI 勾选失败', { id: tid })
+    } finally {
+      setAiPickBusy(false)
+    }
+  }
+
+  // ---------- 练习所选（复用错题本 PracticeBoard：作答上报 /api/quiz-items） ----------
+  const startPractice = (list: QuizItemData[]) => {
+    if (list.length === 0) {
+      toast('请先勾选要练习的题目')
+      return
+    }
+    setPracticeItems(list)
+    setMode('practice')
+  }
+
+  const onPracticeDone = (right: number) => {
+    setDone({ right, total: practiceItems.length })
+    setMode('done')
+  }
+
+  // ---------- 顶栏返回 ----------
+  const handleBack = () => {
+    if (selectMode) {
+      exitSelectMode()
+      return
+    }
+    if (mode === 'practice' || mode === 'done') {
+      setMode('list')
+      return
+    }
+    onBack()
   }
 
   // ---------- 课文上下文（缓存，一次拉全量卡） ----------
@@ -390,19 +547,46 @@ export function FavoritesView({ onBack }: FavoritesViewProps) {
           <button
             type="button"
             aria-label="返回"
-            onClick={onBack}
+            onClick={handleBack}
             className="shrink-0 rounded-full p-1 outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <ChevronLeft className="size-6 text-foreground" strokeWidth={2} />
           </button>
           <h1 className="pointer-events-none absolute left-1/2 -translate-x-1/2 text-lg font-bold">
-            收藏题目
+            {mode === 'practice' ? '练习收藏' : selectMode ? `已选 ${selected.size}` : '收藏题目'}
           </h1>
+          {mode === 'list' && !selectMode && (
+            <button
+              type="button"
+              onClick={() => {
+                setSelectMode(true)
+                setSelected(new Set())
+              }}
+              disabled={items.length === 0}
+              className="ml-auto shrink-0 px-1.5 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
+            >
+              选择
+            </button>
+          )}
         </div>
       </header>
 
-      <main className="mx-auto w-full max-w-2xl px-4 pb-16 pt-4">
-        {loading ? (
+      <main
+        className={cn(
+          'mx-auto w-full max-w-2xl px-4 pt-4',
+          selectMode && mode === 'list' ? 'pb-56' : 'pb-16',
+        )}
+      >
+        {mode === 'practice' ? (
+          <PracticeBoard
+            items={practiceItems}
+            autoRemove={2}
+            onDone={onPracticeDone}
+            onExit={() => setMode('list')}
+          />
+        ) : mode === 'done' && done ? (
+          <PracticeDone right={done.right} total={done.total} onBack={() => setMode('list')} />
+        ) : loading ? (
           <div className="flex items-center justify-center gap-2 py-24 text-muted-foreground">
             <Loader2 className="size-5 animate-spin" />
             <span className="text-sm">加载中…</span>
@@ -414,60 +598,146 @@ export function FavoritesView({ onBack }: FavoritesViewProps) {
           </div>
         ) : (
           <div className={cn('flex max-h-[72vh] flex-col gap-3 overflow-y-auto', SCROLLBAR)}>
-            {items.map((item) => (
-              <div key={item.id} className="rounded-2xl bg-card p-4">
-                <div className="flex items-start gap-2">
-                  <span className="shrink-0 rounded-lg bg-muted px-2 py-0.5 text-xs text-muted-foreground">
-                    {TYPE_LABEL[item.type] ?? '题目'}
-                  </span>
-                  <p className="text-[15px] font-medium leading-relaxed">{item.question}</p>
-                </div>
-                <div className="mt-3 rounded-lg bg-muted px-3 py-2">
-                  <p className="text-xs text-muted-foreground">
-                    答案{item.cardTitle ? ` · ${item.cardTitle}` : ''}
-                  </p>
-                  <p className="mt-0.5 whitespace-pre-wrap text-sm leading-relaxed">
-                    {item.answer || '（无标准答案）'}
-                  </p>
-                </div>
-                <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+            {items.map((item) => {
+              const isSel = selected.has(item.id)
+              return (
+                <div
+                  key={item.id}
+                  className={cn(
+                    'rounded-2xl bg-card p-4 transition-shadow',
+                    isSel && 'ring-1 ring-zinc-900 dark:ring-zinc-100/50',
+                  )}
+                  onContextMenu={(e) => {
+                    if (!selectMode && mode === 'list') {
+                      e.preventDefault()
+                      setSelectMode(true)
+                      setSelected(new Set([item.id]))
+                    }
+                  }}
+                  onTouchStart={() => startPress(item.id)}
+                  onTouchEnd={clearPress}
+                  onTouchMove={clearPress}
+                  onMouseDown={() => startPress(item.id)}
+                  onMouseUp={clearPress}
+                  onMouseLeave={clearPress}
+                >
                   <button
                     type="button"
-                    disabled={aiLoading}
-                    onClick={() => void runExtend(item)}
-                    className="flex h-9 items-center gap-1.5 rounded-full border border-border px-4 text-sm text-muted-foreground transition-colors hover:border-emerald-500/40 hover:text-emerald-600 disabled:opacity-50"
+                    className="flex w-full items-start gap-2 text-left"
+                    onClick={() => {
+                      if (selectMode) toggleSelectItem(item.id)
+                    }}
                   >
-                    <Lightbulb className="size-3.5" strokeWidth={2} />
-                    举一反三
+                    {selectMode && <RoundCheckbox checked={isSel} />}
+                    <span className="shrink-0 rounded-lg bg-muted px-2 py-0.5 text-xs text-muted-foreground">
+                      {TYPE_LABEL[item.type] ?? '题目'}
+                    </span>
+                    <p className="text-[15px] font-medium leading-relaxed">{item.question}</p>
                   </button>
-                  <button
-                    type="button"
-                    disabled={aiLoading}
-                    onClick={() => void runAnalyze(item)}
-                    className="flex h-9 items-center gap-1.5 rounded-full border border-border px-4 text-sm text-muted-foreground transition-colors hover:border-emerald-500/40 hover:text-emerald-600 disabled:opacity-50"
-                  >
-                    <BookOpen className="size-3.5" strokeWidth={2} />
-                    AI解析
-                  </button>
-                  <button
-                    type="button"
-                    disabled={removingId === item.id || aiLoading}
-                    onClick={() => unfavorite(item.id)}
-                    className="flex h-9 items-center gap-1.5 rounded-full border border-border px-4 text-sm text-muted-foreground transition-colors hover:border-red-500/40 hover:text-red-500 disabled:opacity-50"
-                  >
-                    {removingId === item.id ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Star className="size-3.5" strokeWidth={2} />
-                    )}
-                    取消收藏
-                  </button>
+                  <div className="mt-3 rounded-lg bg-muted px-3 py-2">
+                    <p className="text-xs text-muted-foreground">
+                      答案{item.cardTitle ? ` · ${item.cardTitle}` : ''}
+                    </p>
+                    <p className="mt-0.5 whitespace-pre-wrap text-sm leading-relaxed">
+                      {item.answer || '（无标准答案）'}
+                    </p>
+                  </div>
+                  {!selectMode && (
+                    <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        disabled={aiLoading}
+                        onClick={() => void runExtend(item)}
+                        className="flex h-9 items-center gap-1.5 rounded-full border border-border px-4 text-sm text-muted-foreground transition-colors hover:border-emerald-500/40 hover:text-emerald-600 disabled:opacity-50"
+                      >
+                        <Lightbulb className="size-3.5" strokeWidth={2} />
+                        举一反三
+                      </button>
+                      <button
+                        type="button"
+                        disabled={aiLoading}
+                        onClick={() => void runAnalyze(item)}
+                        className="flex h-9 items-center gap-1.5 rounded-full border border-border px-4 text-sm text-muted-foreground transition-colors hover:border-emerald-500/40 hover:text-emerald-600 disabled:opacity-50"
+                      >
+                        <BookOpen className="size-3.5" strokeWidth={2} />
+                        AI解析
+                      </button>
+                      <button
+                        type="button"
+                        disabled={removingId === item.id || aiLoading}
+                        onClick={() => unfavorite(item.id)}
+                        className="flex h-9 items-center gap-1.5 rounded-full border border-border px-4 text-sm text-muted-foreground transition-colors hover:border-red-500/40 hover:text-red-500 disabled:opacity-50"
+                      >
+                        {removingId === item.id ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <Star className="size-3.5" strokeWidth={2} />
+                        )}
+                        取消收藏
+                      </button>
+                    </div>
+                  )}
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         )}
       </main>
+
+      {/* 底部：选择模式批量栏（练习所选 / AI 智能勾选 / 全选 / 反选） */}
+      {mode === 'list' && selectMode && (
+        <div className="fixed inset-x-0 bottom-[calc(1.5rem+env(safe-area-inset-bottom))] z-40 flex justify-center px-4">
+          <div className="w-full max-w-2xl rounded-2xl border border-border bg-card/95 p-3 shadow-lg shadow-black/10 backdrop-blur">
+            <p className="pb-2 text-center text-xs text-muted-foreground">
+              已选 {selected.size} 道收藏题
+            </p>
+            <div className="mb-2">
+              <button
+                type="button"
+                disabled={selected.size === 0 || aiPickBusy}
+                onClick={() => startPractice(selectedItems)}
+                className="flex h-11 w-full items-center justify-center gap-1.5 rounded-xl bg-zinc-900 text-sm font-semibold text-white transition-transform hover:scale-[1.01] active:scale-95 disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900"
+              >
+                <Play className="size-4" strokeWidth={2} />
+                练习所选（{selected.size}）
+              </button>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              <button
+                type="button"
+                onClick={toggleSelectAll}
+                disabled={items.length === 0}
+                className="flex h-11 flex-col items-center justify-center gap-0.5 rounded-xl border border-border bg-card text-[11px] font-medium transition-colors hover:bg-accent disabled:opacity-40"
+              >
+                <Check className="size-4" />
+                {allSelected ? '取消全选' : '全选'}
+              </button>
+              <button
+                type="button"
+                onClick={invertSelect}
+                disabled={items.length === 0}
+                className="flex h-11 flex-col items-center justify-center gap-0.5 rounded-xl border border-border bg-card text-[11px] font-medium transition-colors hover:bg-accent disabled:opacity-40"
+              >
+                <Square className="size-4" />
+                反选
+              </button>
+              <button
+                type="button"
+                onClick={() => void aiPick()}
+                disabled={aiPickBusy || items.length === 0}
+                className="flex h-11 flex-col items-center justify-center gap-0.5 rounded-xl border border-purple-500/40 bg-card text-[11px] font-medium text-purple-700 transition-colors hover:bg-purple-500/10 disabled:opacity-40 dark:text-purple-400"
+              >
+                {aiPickBusy ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Sparkles className="size-4" />
+                )}
+                AI 智能勾选
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* AI（举一反三 / 解析）结果 Dialog */}
       <Dialog

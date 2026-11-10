@@ -58,6 +58,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { BottomSheet } from '@/components/recitation/bottom-sheet'
 
 interface WrongQuestionsViewProps {
   onBack: () => void
@@ -229,6 +230,10 @@ export function WrongQuestionsView({
   const [extendError, setExtendError] = React.useState('')
   const [extendSaving, setExtendSaving] = React.useState(false)
   const [extendBase, setExtendBase] = React.useState<QuizItemData[]>([])
+  /** 举一反三方式选择弹层：大按钮/单题行内按钮点击后弹（AI 讲解变式题 / 直接练习相似题）。 */
+  const [extendChoice, setExtendChoice] = React.useState<{ base: QuizItemData[] } | null>(null)
+  /** 勾选练习的错题子集（null = 全部筛选错题）。 */
+  const [practiceItems, setPracticeItems] = React.useState<QuizItemData[] | null>(null)
 
   // ---- AI 解析 ----
   const [explainItem, setExplainItem] = React.useState<QuizItemData | null>(null)
@@ -699,6 +704,34 @@ export function WrongQuestionsView({
     }
   }
 
+  /** 把举一反三讲解直接载入练习：解析变式题后走与「直接练习相似题」相同的作答流。 */
+  const practiceExtend = () => {
+    const parsed = parseExtendPaper(extendText)
+    if (parsed.length === 0) {
+      toast.warning('讲解中没有解析出可练习的变式题，可先「存为试卷」')
+      return
+    }
+    const src = extendBase[0]
+    const mapped: QuizItemData[] = parsed.map((q, i) => ({
+      id: `ext-${Date.now()}-${i}`,
+      cardId: src?.cardId ?? '',
+      cardTitle: extendBase.length === 1 ? src?.cardTitle || '举一反三' : '举一反三',
+      type: 'short',
+      question: q.question,
+      answer: q.answer,
+      options: [],
+      wrongCount: 0,
+      rightCount: 0,
+      favorite: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }))
+    setExtendOpen(false)
+    setSimilarItems(mapped)
+    setMode('similar')
+    toast.success(`已载入 ${mapped.length} 道变式题，开始练习`)
+  }
+
   // ---- 朗读错题：题目（展开态附带正确答案） ----
   const speakItem = (item: QuizItemData, includeAnswer: boolean) => {
     if (tts.speaking) {
@@ -843,23 +876,28 @@ export function WrongQuestionsView({
     }
     if (mode === 'practice' || mode === 'similar' || mode === 'done') {
       setMode('list')
+      setPracticeItems(null)
       return
     }
     onBack()
   }
 
-  const startPractice = () => {
-    if (filteredItems.length === 0) {
+  /** 开始练习：不传 list = 全部筛选错题；传入 = 只练勾选的错题。 */
+  const startPractice = (list?: QuizItemData[]) => {
+    const target = list ?? filteredItems
+    if (target.length === 0) {
       toast('暂无错题')
       return
     }
+    setPracticeItems(list ?? null)
     setMode('practice')
   }
 
   const onPracticeDone = (right: number) => {
-    const total = mode === 'similar' ? similarItems.length : filteredItems.length
+    const total = mode === 'similar' ? similarItems.length : (practiceItems ?? filteredItems).length
     setDone({ right, total })
     setMode('done')
+    setPracticeItems(null)
     void fetchQuizUserAnswers().then(setUserAnswers)
     Promise.all([loadStats(), loadItems()])
   }
@@ -979,10 +1017,13 @@ export function WrongQuestionsView({
       <main className="mx-auto w-full max-w-2xl px-4 pb-32 pt-4">
         {mode === 'practice' ? (
           <PracticeBoard
-            items={filteredItems}
+            items={practiceItems ?? filteredItems}
             autoRemove={removeN}
             onDone={onPracticeDone}
-            onExit={() => setMode('list')}
+            onExit={() => {
+              setMode('list')
+              setPracticeItems(null)
+            }}
           />
         ) : mode === 'similar' ? (
           <PracticeBoard
@@ -1246,11 +1287,11 @@ export function WrongQuestionsView({
                             </button>
                             <button
                               type="button"
-                              disabled={similarBusy}
-                              onClick={() => startSimilar([item])}
+                              disabled={similarBusy || extendBusy}
+                              onClick={() => setExtendChoice({ base: [item] })}
                               className="flex h-9 items-center gap-1.5 rounded-full border border-emerald-600/40 px-3.5 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-500/10 disabled:opacity-50 dark:text-emerald-400"
                             >
-                              {similarBusy ? (
+                              {similarBusy || extendBusy ? (
                                 <Loader2 className="size-3.5 animate-spin" />
                               ) : (
                                 <Sparkles className="size-3.5" />
@@ -1336,45 +1377,49 @@ export function WrongQuestionsView({
               已选 {selected.size} 道错题
             </p>
             <div className="mb-2">
+              {/* 练习所选：只练勾选的错题（全量练习用底部「去练习」） */}
               <button
                 type="button"
                 disabled={selected.size === 0 || batchBusy}
-                onClick={() => exportCSV(selectedItems)}
-                className="flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-border bg-card text-sm font-medium transition-colors hover:bg-accent disabled:opacity-40"
+                onClick={() => startPractice(selectedItems)}
+                className="flex h-11 w-full items-center justify-center gap-1.5 rounded-xl bg-zinc-900 text-sm font-semibold text-white transition-transform hover:scale-[1.01] active:scale-95 disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900"
               >
-                <Download className="size-4" strokeWidth={1.75} />
-                导出选中（{selected.size}）
+                <Play className="size-4" strokeWidth={2} />
+                练习所选（{selected.size}）
               </button>
             </div>
             <div className="mb-2">
-              {/* 批量举一反三：AI 变式题讲解（≤8 道），可一键存入试卷夹 */}
+              {/* 举一反三：弹方式选择（AI 讲解变式题 / 直接练习相似题）；有选中用所选，无选中用全部筛选错题 */}
               <button
                 type="button"
-                disabled={selected.size === 0 || extendBusy || batchBusy || similarBusy}
-                onClick={() => void startExtend(selectedItems)}
+                disabled={filteredItems.length === 0 || extendBusy || batchBusy || similarBusy}
+                onClick={() =>
+                  setExtendChoice({
+                    base: selectedItems.length > 0 ? selectedItems : filteredItems,
+                  })
+                }
                 className="flex h-11 w-full items-center justify-center gap-1.5 rounded-xl bg-emerald-600 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-40"
               >
-                {extendBusy ? (
-                  <Loader2 className="size-4 animate-spin" />
-                ) : (
-                  <Sparkles className="size-4" />
-                )}
-                AI 举一反三（变式题{selected.size > 8 ? ' · 取前8道' : ''}）
-              </button>
-            </div>
-            <div className="grid grid-cols-4 gap-2">
-              <button
-                type="button"
-                disabled={selected.size === 0 || similarBusy || batchBusy}
-                onClick={() => startSimilar(selectedItems)}
-                className="flex h-11 flex-col items-center justify-center gap-0.5 rounded-xl bg-emerald-600 text-[11px] font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-40"
-              >
-                {similarBusy ? (
+                {extendBusy || similarBusy ? (
                   <Loader2 className="size-4 animate-spin" />
                 ) : (
                   <Sparkles className="size-4" />
                 )}
                 举一反三
+                {selectedItems.length > 0
+                  ? `（所选 ${selectedItems.length} 道）`
+                  : `（全部 ${filteredItems.length} 道）`}
+              </button>
+            </div>
+            <div className="grid grid-cols-4 gap-2">
+              <button
+                type="button"
+                disabled={selected.size === 0 || batchBusy}
+                onClick={() => exportCSV(selectedItems)}
+                className="flex h-11 flex-col items-center justify-center gap-0.5 rounded-xl border border-border bg-card text-[11px] font-medium transition-colors hover:bg-accent disabled:opacity-40"
+              >
+                <Download className="size-4" />
+                导出选中
               </button>
               <button
                 type="button"
@@ -1433,7 +1478,7 @@ export function WrongQuestionsView({
         <div className="fixed inset-x-0 bottom-[calc(1.5rem+env(safe-area-inset-bottom))] z-40 flex justify-center px-4">
           <button
             type="button"
-            onClick={startPractice}
+            onClick={() => startPractice()}
             className="flex h-12 w-full max-w-2xl items-center justify-center gap-2 rounded-full bg-zinc-900 text-base font-semibold text-white shadow-lg shadow-black/20 transition-transform hover:scale-[1.02] active:scale-95 dark:bg-zinc-100 dark:text-zinc-900"
           >
             <Play className="size-4.5" strokeWidth={2} aria-hidden />
@@ -1539,11 +1584,19 @@ export function WrongQuestionsView({
           <DialogFooter className="gap-2">
             <Button
               variant="outline"
-              className="flex-1 rounded-full"
+              className="rounded-full"
               onClick={() => setExtendOpen(false)}
               disabled={extendBusy}
             >
               关闭
+            </Button>
+            <Button
+              className="flex-1 rounded-full bg-emerald-600 text-white hover:bg-emerald-700"
+              onClick={practiceExtend}
+              disabled={extendBusy || extendSaving || !extendText.trim()}
+            >
+              <Play className="size-4" strokeWidth={2} />
+              直接练习
             </Button>
             <Button
               className="flex-1 rounded-full bg-zinc-900 text-white hover:bg-zinc-800"
@@ -1560,6 +1613,62 @@ export function WrongQuestionsView({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 举一反三方式选择：AI 讲解变式题 / 直接练习相似题 */}
+      <BottomSheet
+        open={!!extendChoice}
+        onOpenChange={(o) => {
+          if (!o) setExtendChoice(null)
+        }}
+        title="举一反三"
+        className="h-auto"
+      >
+        <div className="mt-4 space-y-2.5 pb-2">
+          <p className="text-center text-xs text-muted-foreground">
+            基于 {extendChoice?.base.length ?? 0} 道题目 · 讲解最多取前 8 道
+          </p>
+          <button
+            type="button"
+            disabled={extendBusy}
+            onClick={() => {
+              const base = extendChoice?.base ?? []
+              setExtendChoice(null)
+              void startExtend(base)
+            }}
+            className="flex w-full items-start gap-3 rounded-2xl border border-border bg-card p-4 text-left transition-colors hover:bg-accent disabled:opacity-40"
+          >
+            <span className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+              <GraduationCap className="size-4.5" strokeWidth={1.75} />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-bold">AI 讲解变式题</span>
+              <span className="mt-0.5 block text-xs leading-relaxed text-muted-foreground">
+                AI 生成变式题并讲解思路，看完可存为试卷或直接练习
+              </span>
+            </span>
+          </button>
+          <button
+            type="button"
+            disabled={similarBusy}
+            onClick={() => {
+              const base = extendChoice?.base ?? []
+              setExtendChoice(null)
+              void startSimilar(base)
+            }}
+            className="flex w-full items-start gap-3 rounded-2xl border border-border bg-card p-4 text-left transition-colors hover:bg-accent disabled:opacity-40"
+          >
+            <span className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-full bg-zinc-900/5 text-foreground dark:bg-zinc-100/10">
+              <Play className="size-4.5" strokeWidth={1.75} />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-bold">直接练习相似题</span>
+              <span className="mt-0.5 block text-xs leading-relaxed text-muted-foreground">
+                立即生成相似新题并进入练习（不讲解）
+              </span>
+            </span>
+          </button>
+        </div>
+      </BottomSheet>
 
       {/* 打印题单（仅打印时显示） */}
       <div id="wrong-print" className="hidden print:block">
@@ -1616,9 +1725,9 @@ function RoundCheckbox({ checked }: { checked: boolean }) {
   )
 }
 
-// ---------- 内嵌练习模式 ----------
+// ---------- 内嵌练习模式（错题本 / 收藏题目 共用） ----------
 
-function PracticeBoard({
+export function PracticeBoard({
   items,
   autoRemove,
   onDone,

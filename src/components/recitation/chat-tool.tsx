@@ -6,9 +6,14 @@
 //     切卡片/刷新/换设备均从服务端加载历史；删除/清空同步服务端。
 //   • 对话模式（conversationId prop，/api/conversations）：侧边栏对话的
 //     载入/发送/批量入库/自动重命名；头部提供侧边栏开关、对话内搜索、
-//     新建对话、更多（分享/导出/重命名/清空）；监听 app:chatSend /
-//     app:newConversation 窗口事件；AI 回复的 <thinking> 块渲染为可折叠
-//     「💭 思考过程」；追问弹层新建对话后自动补一条 AI 回复。
+//     新建对话、全屏、消息多选、更多（分享/导出/重命名/清空）；监听
+//     app:chatSend / app:newConversation 窗口事件；AI 回复的 <thinking> 块
+//     渲染为可折叠「💭 思考过程」；追问弹层新建对话后自动补一条 AI 回复。
+//   • 全屏模式：Maximize2 切换 fixed inset-0 z-[70] 覆盖层（Esc 退出，
+//     消息区充分利用屏幕高度，Safe Area /软键盘适配），三种挂载点通用。
+//   • 消息多选（ListChecks）：复制 / 批量删除（DELETE messages {ids}）/
+//     导出（格式选择弹窗）/ 分享勾选消息（主对话唯一分享途径）。
+//   • 主对话（isMain）：头部菜单隐藏 分享/重命名，仅保留 导出/清空消息。
 //   • 语音输入：输入框与 AI 提问卡的自定义回答均支持麦克风一键转文字。
 //   • per-reply actions: copy (copy icon) and delete (trash icon — also drops
 //     the adjacent user message that this reply answers)
@@ -18,13 +23,14 @@
 //     instead of raw code. Tapping an option (or the custom input) sends that
 //     text as the user message and marks the card as answered.
 //   • long replies render via RichContent (markdown / tables / mermaid /
-//     LaTeX / code) with an internal max-height scroll.
+//     LaTeX / code)，消息区自然滚动（无单条高度限制）。
 //   • TTS 朗读：每条 AI 回复可点击喇叭播放（useQuickTts，按 ask/supervise
 //     上下文取音色）；顶栏可开关「自动朗读」（默认关，/api/state 记忆）与
 //     「音色设置」（引擎/音色/倍速，PATCH /api/settings + sb-voice-prefs-changed）。
 //   • 移动端：visualViewport 感知软键盘并等量收窄面板高度（输入框不被遮挡）；
 //     小图标按钮用 after 伪元素把触控热区扩到 ≥44px（视觉不变）。
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 import {
   Brain,
   Check,
@@ -32,8 +38,11 @@ import {
   Copy,
   Download,
   ImagePlus,
+  ListChecks,
   Loader2,
+  Maximize2,
   MessageCircleQuestion,
+  Minimize2,
   MoreVertical,
   PanelLeft,
   Pause,
@@ -53,10 +62,13 @@ import { toast } from 'sonner'
 import { VoiceInput } from '@/components/recitation/voice-input'
 import {
   convTypeMeta,
-  exportConversation,
   shareConversationLink,
   type ConversationSummary,
 } from '@/components/recitation/chat-sidebar'
+import { ConversationShareDialog } from '@/components/recitation/conversation-share-dialog'
+import { ConversationExportDialog } from '@/components/recitation/conversation-export-dialog'
+import { ImageViewer } from '@/components/recitation/image-viewer'
+import { messagesToMarkdown, type ExportMessage } from '@/lib/conversation-export'
 import { FOLLOWUP_THINKING_KEY } from '@/components/recitation/followup-popover'
 
 import { cn } from '@/lib/utils'
@@ -75,6 +87,7 @@ import {
 } from '@/components/recitation/tts-player'
 import { RichContent } from '@/components/recitation/rich-content'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
@@ -114,9 +127,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 
@@ -124,8 +134,6 @@ const MAX_IMAGES = 4
 /** Files smaller than this keep their original data URL; larger get compressed. */
 const COMPRESS_OVER = 300 * 1024
 const MAX_IMAGE_DIM = 1024
-/** Assistant bubble internal scroll cap (px). */
-const REPLY_MAX_H = 320
 /** 对话模式：传给 /api/chat 的最近消息窗口（含本次提问）。 */
 const CONV_CONTEXT_WINDOW = 12
 /** 对话打开时，末尾未回复的用户消息在多久内才自动补 AI 回复（追问场景）。 */
@@ -589,6 +597,17 @@ export function ChatTool({
   const [confirmClearOpen, setConfirmClearOpen] = React.useState(false)
   /** 自动补回复的一次性开关（防止重复触发）。 */
   const autoRepliedRef = React.useRef<string | null>(null)
+  /** 全屏模式（fixed inset-0 覆盖层，Esc / 按钮退出）。 */
+  const [fullscreen, setFullscreen] = React.useState(false)
+  /** 消息多选模式（复制 / 删除 / 导出 / 分享勾选的消息）。 */
+  const [selectMode, setSelectMode] = React.useState(false)
+  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set())
+  /** 导出对话框（导出列表 = 全部消息或勾选消息）。 */
+  const [exportOpen, setExportOpen] = React.useState(false)
+  const [exportList, setExportList] = React.useState<ExportMessage[]>([])
+  /** 分享对话框：整对话 / 勾选消息。 */
+  const [shareConvOpen, setShareConvOpen] = React.useState(false)
+  const [shareSelOpen, setShareSelOpen] = React.useState(false)
 
   // prop 绑定的对话变化时清除组件内覆盖（避免旧 override 遮蔽新对话）
   React.useEffect(() => {
@@ -622,6 +641,30 @@ export function ChatTool({
       vv.removeEventListener('scroll', update)
     }
   }, [])
+
+  // Esc 退出全屏：document 捕获阶段拦截，阻止外层 Sheet/Dialog 同步响应 Esc；
+  // 有弹层打开时放行（先关弹层，不退出全屏）。
+  React.useEffect(() => {
+    if (!fullscreen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (
+        zoomImage ||
+        renameOpen ||
+        confirmClearOpen ||
+        exportOpen ||
+        shareConvOpen ||
+        shareSelOpen
+      ) {
+        return
+      }
+      e.preventDefault()
+      e.stopPropagation()
+      setFullscreen(false)
+    }
+    document.addEventListener('keydown', onKey, true)
+    return () => document.removeEventListener('keydown', onKey, true)
+  }, [fullscreen, zoomImage, renameOpen, confirmClearOpen, exportOpen, shareConvOpen, shareSelOpen])
 
   const stateKey = React.useMemo(
     () =>
@@ -858,6 +901,7 @@ export function ChatTool({
     async (cid: string, prevCount: number) => {
       const meta = convMetaRef.current
       if (!meta || prevCount >= 2) return
+      if (meta.isMain) return // 主对话不可改名（服务端也会 400 拒绝）
       if (meta.title && meta.title !== '新对话') return
       try {
         const res = await fetch(`/api/conversations/${encodeURIComponent(cid)}`, {
@@ -1085,7 +1129,7 @@ export function ChatTool({
       const imgs = allowImages ? images.filter(Boolean) : []
       // allow sending images without any text
       if (!trimmed && imgs.length > 0) {
-        trimmed = '请看这些图片并结合课文回答'
+        trimmed = '请仔细看这几张图片：先说明你看到了什么，再结合课文进行讲解。'
       }
       if (!trimmed) return
       const cid = convIdRef.current
@@ -1356,19 +1400,15 @@ export function ChatTool({
     // 同步删除服务端记录
     const cid = convIdRef.current
     if (cid) {
-      // 对话消息无单条删除接口 → 清空后批量写回剩余消息（服务端全量重建）
-      void (async () => {
-        try {
-          const res = await fetch(
-            `/api/conversations/${encodeURIComponent(cid)}/messages`,
-            { method: 'DELETE' },
-          )
-          if (!res.ok) return
-          if (remaining.length > 0) await persistConvMessages(cid, remaining)
-        } catch {
-          /* 同步失败静默 */
-        }
-      })()
+      // 批量按 id 删除（DELETE /messages {ids}）
+      const sids = [target.sid, prevUser?.sid].filter((x): x is string => !!x)
+      if (sids.length > 0) {
+        void fetch(`/api/conversations/${encodeURIComponent(cid)}/messages`, {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: sids }),
+        }).catch(() => {})
+      }
       return
     }
     for (const sid of [target.sid, prevUser?.sid]) {
@@ -1378,6 +1418,125 @@ export function ChatTool({
         }).catch(() => {})
       }
     }
+  }
+
+  // ---------- 消息多选（复制 / 删除 / 导出 / 分享） ----------
+
+  const toggleSelected = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const selectedMessages = React.useMemo(
+    () => messages.filter((m) => selectedIds.has(m.id)),
+    [messages, selectedIds],
+  )
+
+  const allMsgsSelected = messages.length > 0 && selectedMessages.length === messages.length
+
+  const toggleSelectAllMessages = () => {
+    setSelectedIds(allMsgsSelected ? new Set() : new Set(messages.map((m) => m.id)))
+  }
+
+  const exitSelectMode = () => {
+    setSelectMode(false)
+    setSelectedIds(new Set())
+  }
+
+  /** 清理被删消息中 ask 卡片的已回答状态。 */
+  const purgeAskAnswered = (deleted: UIMessage[]) => {
+    setAskAnswered((prev) => {
+      const next = { ...prev }
+      let changed = false
+      for (const m of deleted) {
+        for (const seg of splitAskSegments(m.content)) {
+          if (seg.kind === 'ask' && seg.ask.question in next) {
+            delete next[seg.ask.question]
+            changed = true
+          }
+        }
+      }
+      return changed ? next : prev
+    })
+  }
+
+  const copySelectedMessages = async () => {
+    const picked = selectedMessages
+    if (picked.length === 0) return
+    try {
+      const md = messagesToMarkdown(
+        picked.map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          ...(m.images && m.images.length > 0 ? { images: m.images } : {}),
+        })),
+        { includeImages: false, mdMode: 'source' },
+        convMeta?.title || 'AI 对话',
+      )
+      await navigator.clipboard.writeText(md)
+      toast.success(`已复制 ${picked.length} 条消息`)
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  const deleteSelectedMessages = () => {
+    const picked = selectedMessages
+    if (picked.length === 0) return
+    if (picked.some((m) => m.id === speakingId)) tts.stop()
+    setMessages(messages.filter((m) => !selectedIds.has(m.id)))
+    purgeAskAnswered(picked)
+    setSelectedIds(new Set())
+    const cid = convIdRef.current
+    const sids = picked.map((m) => m.sid).filter((x): x is string => !!x)
+    if (cid && sids.length > 0) {
+      void fetch(`/api/conversations/${encodeURIComponent(cid)}/messages`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: sids }),
+      }).catch(() => {})
+    } else if (!cid && cardId) {
+      for (const sid of sids) {
+        void fetch(`/api/chat-log?id=${encodeURIComponent(sid)}`, {
+          method: 'DELETE',
+        }).catch(() => {})
+      }
+    }
+    toast.success(`已删除 ${picked.length} 条消息`)
+  }
+
+  /** 打开导出对话框（导出列表 = 全部消息或勾选消息）。 */
+  const openExportDialog = (list: UIMessage[]) => {
+    if (list.length === 0) {
+      toast.info('没有可导出的消息')
+      return
+    }
+    setExportList(
+      list.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        ...(m.images && m.images.length > 0 ? { images: m.images } : {}),
+      })),
+    )
+    setExportOpen(true)
+  }
+
+  /** 分享勾选消息（有效期确认后创建；主对话唯一分享途径）。 */
+  const shareSelectedMessages = async (days: number) => {
+    const cid = convIdRef.current
+    if (!cid) return
+    const sids = selectedMessages.map((m) => m.sid).filter((x): x is string => !!x)
+    if (sids.length === 0) {
+      toast.error('所选消息尚未同步到服务端，请稍后再试')
+      return
+    }
+    await shareConversationLink(cid, days, sids)
   }
 
   const clearConversation = () => {
@@ -1501,16 +1660,19 @@ export function ChatTool({
     }
   }
 
-  const exportConv = async (format: 'txt' | 'md' | 'json') => {
-    if (!convId || !convMeta) return
-    await exportConversation(convMeta, format)
-  }
+  /** 当前对话是否主对话（AI问问）：隐藏 分享/重命名，仅可清空消息。 */
+  const isMainConv = !!convMeta?.isMain
 
-  return (
+  const chatSurface = (
     <div
-      className="flex h-[60vh] flex-col gap-3"
+      className={cn(
+        'flex flex-col gap-3',
+        fullscreen ? 'h-full' : 'h-[60vh]',
+      )}
       style={
-        kbOffset > 0 ? { height: `calc(60vh - ${kbOffset}px)` } : undefined
+        !fullscreen && kbOffset > 0
+          ? { height: `calc(60vh - ${kbOffset}px)` }
+          : undefined
       }
     >
       {/* 对话头部：侧边栏开关 / 标题 / 搜索 / 新建 / 更多
@@ -1531,8 +1693,20 @@ export function ChatTool({
         <div className="min-w-0 flex-1">
           {inConvMode ? (
             <>
-              <p className="truncate text-sm font-semibold">
-                {convMeta?.title || '新对话'}
+              <p className="flex items-center gap-1 truncate text-sm font-semibold">
+                {convMeta?.isMain && (
+                  <Sparkles
+                    className="size-3.5 shrink-0 text-emerald-500"
+                    strokeWidth={2.25}
+                    aria-label="主对话"
+                  />
+                )}
+                <span className="truncate">{convMeta?.title || '新对话'}</span>
+                {convMeta?.isMain && (
+                  <span className="shrink-0 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-px text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                    主对话
+                  </span>
+                )}
               </p>
               <p className="truncate text-[11px] text-muted-foreground">
                 {convTypeMeta(convMeta?.type ?? '').emoji}{' '}
@@ -1565,6 +1739,44 @@ export function ChatTool({
             <Search className="size-4" strokeWidth={1.75} />
           </button>
         )}
+        {inConvMode && (
+          <button
+            type="button"
+            onClick={() => {
+              setSelectMode((v) => !v)
+              setSelectedIds(new Set())
+            }}
+            aria-pressed={selectMode}
+            aria-label={selectMode ? '退出多选' : '多选消息'}
+            title={selectMode ? '退出多选' : '多选消息'}
+            className={cn(
+              'flex size-8 shrink-0 items-center justify-center rounded-full border transition-colors',
+              HIT_AREA,
+              selectMode
+                ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground',
+            )}
+          >
+            <ListChecks className="size-4" strokeWidth={1.75} />
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => setFullscreen((v) => !v)}
+          aria-pressed={fullscreen}
+          aria-label={fullscreen ? '退出全屏' : '全屏对话'}
+          title={fullscreen ? '退出全屏（Esc）' : '全屏对话'}
+          className={cn(
+            'flex size-8 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+            HIT_AREA,
+          )}
+        >
+          {fullscreen ? (
+            <Minimize2 className="size-4" strokeWidth={1.75} />
+          ) : (
+            <Maximize2 className="size-4" strokeWidth={1.75} />
+          )}
+        </button>
           <button
             type="button"
             onClick={newConversation}
@@ -1592,41 +1804,28 @@ export function ChatTool({
                   <MoreVertical className="size-4" strokeWidth={1.75} />
                 </button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-40">
-                <DropdownMenuItem
-                  onClick={() => {
-                    if (convId) void shareConversationLink(convId)
-                  }}
-                >
-                  <Share2 className="size-4" />
-                  分享
+              <DropdownMenuContent align="end" className="z-[80] w-44">
+                {!isMainConv && (
+                  <DropdownMenuItem onClick={() => setShareConvOpen(true)}>
+                    <Share2 className="size-4" />
+                    分享对话
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem onClick={() => openExportDialog(messages)}>
+                  <Download className="size-4" />
+                  导出对话
                 </DropdownMenuItem>
-                <DropdownMenuSub>
-                  <DropdownMenuSubTrigger>
-                    <Download className="size-4" />
-                    导出
-                  </DropdownMenuSubTrigger>
-                  <DropdownMenuSubContent>
-                    <DropdownMenuItem onClick={() => void exportConv('txt')}>
-                      导出 TXT
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => void exportConv('md')}>
-                      导出 Markdown
-                    </DropdownMenuItem>
-                    <DropdownMenuItem onClick={() => void exportConv('json')}>
-                      导出 JSON
-                    </DropdownMenuItem>
-                  </DropdownMenuSubContent>
-                </DropdownMenuSub>
-                <DropdownMenuItem
-                  onClick={() => {
-                    setRenameValue(convMeta?.title ?? '')
-                    setRenameOpen(true)
-                  }}
-                >
-                  <Pencil className="size-4" />
-                  重命名
-                </DropdownMenuItem>
+                {!isMainConv && (
+                  <DropdownMenuItem
+                    onClick={() => {
+                      setRenameValue(convMeta?.title ?? '')
+                      setRenameOpen(true)
+                    }}
+                  >
+                    <Pencil className="size-4" />
+                    重命名
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem variant="destructive" onClick={() => setConfirmClearOpen(true)}>
                   <Trash2 className="size-4" />
@@ -1692,8 +1891,95 @@ export function ChatTool({
         </div>
       )}
 
-      {/* 顶部工具条：自动朗读开关 + 音色设置 */}
-      <div className="flex items-center justify-end gap-1.5">
+      {/* 消息多选操作条：全选 / 已选 N 条 / 复制 / 删除 / 导出 / 分享 / 完成 */}
+      {selectMode && (
+        <div className="flex flex-wrap items-center gap-1.5 rounded-xl border border-emerald-500/30 bg-emerald-500/5 px-2 py-1.5">
+          <button
+            type="button"
+            onClick={toggleSelectAllMessages}
+            className="flex h-8 shrink-0 items-center rounded-full border border-border bg-background px-2.5 text-xs transition-colors hover:bg-accent"
+          >
+            {allMsgsSelected ? '取消全选' : '全选'}
+          </button>
+          <span className="min-w-0 flex-1 basis-16 truncate text-xs text-muted-foreground">
+            已选 {selectedMessages.length} / {messages.length} 条
+          </span>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 rounded-full text-xs"
+            disabled={selectedMessages.length === 0}
+            onClick={() => void copySelectedMessages()}
+          >
+            <Copy className="size-3.5" />
+            复制
+          </Button>
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={selectedMessages.length === 0}
+                className="h-8 rounded-full border-destructive/40 text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+              >
+                <Trash2 className="size-3.5" />
+                删除
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent className="z-[80]">
+              <AlertDialogHeader>
+                <AlertDialogTitle>删除所选消息</AlertDialogTitle>
+                <AlertDialogDescription>
+                  确定删除已选的 {selectedMessages.length} 条消息吗？此操作无法恢复。
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>取消</AlertDialogCancel>
+                <AlertDialogAction
+                  onClick={deleteSelectedMessages}
+                  className="bg-red-600 text-white hover:bg-red-700"
+                >
+                  删除
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 rounded-full text-xs"
+            disabled={selectedMessages.length === 0}
+            onClick={() => openExportDialog(selectedMessages)}
+          >
+            <Download className="size-3.5" />
+            导出
+          </Button>
+          {inConvMode && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-full text-xs"
+              disabled={selectedMessages.length === 0}
+              onClick={() => setShareSelOpen(true)}
+            >
+              <Share2 className="size-3.5" />
+              分享
+            </Button>
+          )}
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 shrink-0 rounded-full text-xs"
+            onClick={exitSelectMode}
+          >
+            完成
+          </Button>
+        </div>
+      )}
+
+      {/* 顶部工具条：自动朗读开关 + 音色设置（多选模式下隐藏） */}
+      {!selectMode && (
+        <div className="flex items-center justify-end gap-1.5">
         <button
           type="button"
           onClick={toggleAutoSpeak}
@@ -1728,7 +2014,7 @@ export function ChatTool({
               <Settings2 className="size-3.5" />
             </button>
           </PopoverTrigger>
-          <PopoverContent align="end" className="w-72 rounded-2xl">
+          <PopoverContent align="end" className="z-[80] w-72 rounded-2xl">
             <div className="flex flex-col gap-3">
               <p className="text-sm font-semibold">朗读音色</p>
               <div className="flex flex-col gap-1.5">
@@ -1836,6 +2122,7 @@ export function ChatTool({
           </PopoverContent>
         </Popover>
       </div>
+      )}
 
       <div
         ref={scrollRef}
@@ -1857,7 +2144,7 @@ export function ChatTool({
                     清空对话
                   </button>
                 </AlertDialogTrigger>
-                <AlertDialogContent>
+                <AlertDialogContent className="z-[80]">
                   <AlertDialogHeader>
                     <AlertDialogTitle>清空对话</AlertDialogTitle>
                     <AlertDialogDescription>
@@ -1894,18 +2181,36 @@ export function ChatTool({
           {messages.map((m, idx) => {
             const mid = m.sid ?? m.id
             const think = m.role === 'assistant' ? splitThinking(m.content) : null
+            const msgSelected = selectedIds.has(m.id)
             return (
               <div
                 key={m.id}
                 data-mid={mid}
+                onClick={selectMode ? () => toggleSelected(m.id) : undefined}
                 className={cn(
-                  'flex w-full rounded-2xl transition-shadow',
+                  'flex w-full gap-1.5 rounded-2xl transition-shadow',
                   m.role === 'user' ? 'justify-end' : 'justify-start',
                   highlightId === mid && 'ring-2 ring-emerald-500/60 ring-offset-1',
+                  selectMode && 'cursor-pointer',
+                  selectMode && msgSelected && 'bg-emerald-500/5',
                 )}
               >
+                {selectMode && (
+                  <Checkbox
+                    checked={msgSelected}
+                    tabIndex={-1}
+                    aria-label={`选择第 ${idx + 1} 条消息`}
+                    className="mt-1.5 shrink-0 self-start"
+                    onCheckedChange={() => toggleSelected(m.id)}
+                  />
+                )}
                 {m.role === 'user' ? (
-                  <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm bg-primary px-3 py-2 text-sm leading-relaxed text-primary-foreground">
+                  <div
+                    className={cn(
+                      'max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm bg-primary px-3 py-2 text-sm leading-relaxed text-primary-foreground',
+                      selectMode && 'pointer-events-none',
+                    )}
+                  >
                     {m.images && m.images.length > 0 && (
                       <div className="mb-1.5 flex max-w-[200px] flex-wrap gap-1.5">
                         {m.images.map((src, i) => (
@@ -1914,7 +2219,7 @@ export function ChatTool({
                             type="button"
                             onClick={() => setZoomImage(src)}
                             aria-label="放大图片"
-                            className="after:absolute after:-inset-1 after:rounded-lg after:content-['']"
+                            className="relative after:absolute after:-inset-1 after:rounded-lg after:content-['']"
                           >
                             <img
                               src={src}
@@ -1928,7 +2233,12 @@ export function ChatTool({
                     {m.content}
                   </div>
                 ) : (
-                  <div className="flex w-full flex-col items-start gap-1">
+                  <div
+                    className={cn(
+                      'flex w-full flex-col items-start gap-1',
+                      selectMode && 'pointer-events-none',
+                    )}
+                  >
                     {think && think.thinking ? <ThinkingBlock text={think.thinking} /> : null}
                     {splitAskSegments(think ? think.body : m.content).map((seg, i) =>
                       seg.kind === 'ask' ? (
@@ -1944,11 +2254,11 @@ export function ChatTool({
                           key={i}
                           content={seg.value}
                           className="max-w-[85%] rounded-2xl rounded-bl-sm bg-muted px-3 py-2"
-                          maxHeight={REPLY_MAX_H}
                         />
                       ) : null,
                     )}
-                  {/* reply actions: speak / copy / delete */}
+                  {/* reply actions: speak / copy / delete（多选模式下隐藏） */}
+                  {!selectMode && (
                   <div className="ml-1 flex items-center gap-0.5">
                     <button
                       type="button"
@@ -1996,6 +2306,7 @@ export function ChatTool({
                       <Trash2 className="size-3.5" strokeWidth={1.75} />
                     </button>
                   </div>
+                  )}
                 </div>
               )}
               </div>
@@ -2096,32 +2407,18 @@ export function ChatTool({
         </Button>
       </form>
 
-      {/* 图片放大预览 */}
-      <Dialog
+      {/* 图片查看器：缩放（按钮/滚轮/双击/双指）、平移、旋转、下载 */}
+      <ImageViewer
+        src={zoomImage}
         open={!!zoomImage}
         onOpenChange={(o) => {
           if (!o) setZoomImage(null)
         }}
-      >
-        <DialogContent className="max-w-[92vw] rounded-2xl sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>图片预览</DialogTitle>
-          </DialogHeader>
-          {zoomImage && (
-            <div className="overflow-auto rounded-xl [scrollbar-width:thin]">
-              <img
-                src={zoomImage}
-                alt="图片预览"
-                className="max-h-[70vh] w-full max-w-full object-contain"
-              />
-            </div>
-          )}
-        </DialogContent>
-      </Dialog>
+      />
 
       {/* 对话重命名 */}
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
-        <DialogContent className="rounded-2xl">
+        <DialogContent className="z-[80] rounded-2xl">
           <DialogHeader>
             <DialogTitle>重命名对话</DialogTitle>
           </DialogHeader>
@@ -2155,7 +2452,7 @@ export function ChatTool({
 
       {/* 对话模式清空消息确认（更多菜单入口） */}
       <AlertDialog open={confirmClearOpen} onOpenChange={setConfirmClearOpen}>
-        <AlertDialogContent>
+        <AlertDialogContent className="z-[80]">
           <AlertDialogHeader>
             <AlertDialogTitle>清空对话</AlertDialogTitle>
             <AlertDialogDescription>
@@ -2176,8 +2473,64 @@ export function ChatTool({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* 整对话分享：先选有效期（主对话隐藏入口） */}
+      <ConversationShareDialog
+        open={shareConvOpen}
+        onOpenChange={setShareConvOpen}
+        title={`分享对话「${convMeta?.title ?? ''}」`}
+        mode="single"
+        onConfirm={(days) => {
+          const cid = convIdRef.current
+          setShareConvOpen(false)
+          if (cid) void shareConversationLink(cid, days)
+        }}
+      />
+
+      {/* 勾选消息分享：先选有效期（主对话唯一分享途径） */}
+      <ConversationShareDialog
+        open={shareSelOpen}
+        onOpenChange={setShareSelOpen}
+        title={`分享所选 ${selectedMessages.length} 条消息`}
+        description="将只分享勾选的消息（不含未勾选内容），创建只读链接并复制到剪贴板；到期后链接自动失效。"
+        mode="single"
+        onConfirm={(days) => {
+          setShareSelOpen(false)
+          void shareSelectedMessages(days)
+        }}
+      />
+
+      {/* 导出对话 / 导出所选消息（格式选择 + 包含图片 + MD 形式 + 消息勾选） */}
+      <ConversationExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        sections={[
+          {
+            title: convMeta?.title || 'AI 对话',
+            type: convMeta?.type,
+            messages: exportList,
+          },
+        ]}
+        contentClassName="z-[80]"
+      />
     </div>
   )
+
+  // 全屏模式：portal 到 body 的 fixed inset-0 z-[70] 覆盖层（自带头部/消息区/
+  // 底部输入区，Safe Area 与软键盘适配；三种挂载点（根级 Sheet / tools-sheet
+  // /其它）自包含可用，Esc 或按钮退出）。
+  if (fullscreen) {
+    return createPortal(
+      <div
+        className="fixed inset-0 z-[70] flex flex-col bg-background px-3 pb-[env(safe-area-inset-bottom)] pt-[max(0.5rem,env(safe-area-inset-top))]"
+        style={kbOffset > 0 ? { height: `calc(100dvh - ${kbOffset}px)` } : undefined}
+      >
+        {chatSurface}
+      </div>,
+      document.body,
+    )
+  }
+  return chatSurface
 }
 
 function Dot({ delay }: { delay: string }) {

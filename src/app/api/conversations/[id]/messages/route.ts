@@ -1,7 +1,8 @@
-// 对话消息追加 / 清空。
+// 对话消息追加 / 清空 / 批量删除。
 // POST   /api/conversations/:id/messages { role, content, images? } -> { message }
 //        （支持批量 { messages: [{role,content,images}] }，AI 问答一问一答成对入库）
-// DELETE /api/conversations/:id/messages -> 清空当前对话全部消息
+// DELETE /api/conversations/:id/messages              -> 清空当前对话全部消息
+// DELETE /api/conversations/:id/messages { ids: [] }  -> 只删除指定 id 的消息（批量管理）
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAccount } from '@/lib/auth'
@@ -59,18 +60,31 @@ export async function POST(
 }
 
 export async function DELETE(
-  _req: NextRequest,
+  req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const account = await requireAccount()
   if (!account) return NextResponse.json({ error: '未登录' }, { status: 401 })
   try {
     const { id } = await params
+    // body 可选：{ ids: string[] } → 只删指定消息；否则清空全部
+    const body = await req.json().catch(() => null)
+    const ids: string[] =
+      body && Array.isArray(body.ids)
+        ? body.ids.filter((x: unknown): x is string => typeof x === 'string' && x.length > 0)
+        : []
+    if (ids.length > 0) {
+      const res = await db.chatMessage.deleteMany({
+        where: { conversationId: id, id: { in: ids } },
+      })
+      await db.conversation.update({ where: { id }, data: { updatedAt: new Date() } })
+      return NextResponse.json({ deleted: res.count })
+    }
     const res = await db.chatMessage.deleteMany({ where: { conversationId: id } })
     await db.conversation.update({ where: { id }, data: { updatedAt: new Date() } })
     return NextResponse.json({ deleted: res.count })
   } catch (err) {
     console.error('[DELETE /api/conversations/:id/messages] failed:', err)
-    return NextResponse.json({ error: '清空消息失败' }, { status: 500 })
+    return NextResponse.json({ error: '删除消息失败' }, { status: 500 })
   }
 }

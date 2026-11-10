@@ -4,21 +4,29 @@
 // Sheet side="left" 或全屏覆盖挂载，open/onOpenChange 控制显隐与数据加载）。
 //
 // 功能：
-//   • 对话列表：置顶分组 + 更新时间倒序；每行含类型徽章 / 标题 / 最后消息
-//     摘要 / 时间 / 消息数；活动对话高亮。
+//   • 对话列表：主对话「AI问问」永远置顶第一位（Sparkles 图标 + 主对话徽标 +
+//     置顶钉；长按/右键/⋮ 菜单仅「清空消息」）+ 置顶分组 + 排序。
+//   • 排序（头部控件，偏好存 localStorage）：
+//     自定义拖动（@dnd-kit 触摸拖动，PATCH /api/conversations reorder 持久化）
+//     / 最近更新 / 创建时间 / 标题 × 正序/倒序；主对话不参与排序。
 //   • 每行更多菜单：置顶、重命名、AI 智能重命名（PATCH autoRename）、分享
-//     （先选有效期 → POST /api/shares → 复制链接）、导出（TXT/MD/JSON）、删除（确认）。
+//     （先选有效期 → POST /api/shares → 复制链接）、导出（格式选择弹窗）、
+//     删除（确认）。主对话仅「清空消息」。
 //   • 顶部新建对话（类型：自由对话/题目解析/收藏解析/追问）。
 //   • 一级全局搜索：GET /api/conversations?q= →「标题命中」对话列表 +
 //     「内容命中」消息列表（关键词高亮，点击跳转该对话）。
-//   • 批量管理：复选框模式，全选 / 批量删除（确认）/ 批量导出合并 MD /
-//     批量分享（先选有效期，逐个创建并列出链接）。
+//   • 批量管理：复选框模式，全选 / 批量删除（确认，主对话跳过）/
+//     批量导出（conversation-export 引擎，格式选择弹窗）/ 批量分享
+//     （先选有效期，逐个创建并列出链接；主对话跳过）。
 //
-// 本文件同时导出对话相关的共享工具（类型 / 导出 / 分享），ChatTool 复用。
+// 本文件同时导出对话相关的共享工具（类型 / 分享），ChatTool 复用。
 import * as React from 'react'
 import {
+  ArrowUpDown,
+  Check,
   CheckSquare,
   Download,
+  GripVertical,
   Loader2,
   MoreVertical,
   MessageSquarePlus,
@@ -33,11 +41,30 @@ import {
   X,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import {
+  DndContext,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core'
+import {
+  SortableContext,
+  arrayMove,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 
 import { cn } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import type { ExportSection } from '@/lib/conversation-export'
+import { ConversationShareDialog } from '@/components/recitation/conversation-share-dialog'
+import { ConversationExportDialog } from '@/components/recitation/conversation-export-dialog'
+import { LongPressMenu } from '@/components/recitation/long-press-menu'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -52,7 +79,6 @@ import {
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -62,13 +88,8 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { Label } from '@/components/ui/label'
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 
 // ---------- 共享类型 / 工具（ChatTool 也使用） ----------
 
@@ -78,6 +99,10 @@ export interface ConversationSummary {
   type: string
   pinned: boolean
   cardId: string
+  /** 自定义排序序号（主对话恒 -1000000）。 */
+  ord?: number
+  /** 主对话「AI问问」：不可删除/改名/整对话分享，仅可清空消息。 */
+  isMain?: boolean
   messageCount: number
   lastMessage: string
   lastAt: string
@@ -139,112 +164,14 @@ export async function fetchConversation(
   }
 }
 
-export type ExportFormat = 'txt' | 'md' | 'json'
-
-/** 对话 → 文本内容（TXT / MD / JSON；JSON 不含 dataURL 图片本体，仅记录张数）。 */
-export function conversationToText(
-  conv: ConversationSummary,
-  messages: ConversationMessage[],
-  format: ExportFormat,
-): string {
-  const ts = (iso: string) =>
-    new Date(iso).toLocaleString('zh-CN', { hour12: false })
-  if (format === 'json') {
-    return JSON.stringify(
-      {
-        title: conv.title,
-        type: conv.type,
-        cardId: conv.cardId,
-        createdAt: conv.createdAt,
-        exportedAt: new Date().toISOString(),
-        messages: messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-          ...(m.images && m.images.length > 0
-            ? { imageCount: m.images.length }
-            : {}),
-          createdAt: m.createdAt,
-        })),
-      },
-      null,
-      2,
-    )
-  }
-  if (format === 'md') {
-    const lines: string[] = [
-      `# ${conv.title}`,
-      '',
-      `- 类型：${convTypeMeta(conv.type).label}`,
-      `- 创建时间：${ts(conv.createdAt)}`,
-      '',
-      '---',
-      '',
-    ]
-    for (const m of messages) {
-      lines.push(`**${m.role === 'user' ? '🧑 我' : '🤖 AI'}**（${ts(m.createdAt)}）`)
-      lines.push('')
-      lines.push(m.content)
-      lines.push('')
-    }
-    return lines.join('\n')
-  }
-  const lines: string[] = [
-    conv.title,
-    `类型：${convTypeMeta(conv.type).label} · 导出时间：${ts(new Date().toISOString())}`,
-    '',
-  ]
-  for (const m of messages) {
-    lines.push(`【${m.role === 'user' ? '我' : 'AI'}】`)
-    lines.push(m.content)
-    lines.push('')
-  }
-  return lines.join('\n')
-}
-
-/** 文件名安全化（去非法字符，限长）。 */
-export function safeFileName(t: string): string {
-  const s = (t || '对话').replace(/[\\/:*?"<>|\n\r\t]/g, '_').trim()
-  return s.slice(0, 50) || '对话'
-}
-
-/** 触发浏览器下载文本文件。 */
-export function downloadTextFile(
-  filename: string,
-  text: string,
-  mime = 'text/plain',
-): void {
-  const blob = new Blob([text], { type: `${mime};charset=utf-8` })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-/** 导出单个对话（拉取最新详情后按格式下载）。 */
-export async function exportConversation(
-  conv: ConversationSummary,
-  format: ExportFormat,
-): Promise<void> {
-  const detail = await fetchConversation(conv.id)
-  if (!detail) {
-    toast.error('导出失败：对话加载失败')
-    return
-  }
-  const ext = format === 'md' ? 'md' : format
-  downloadTextFile(
-    `${safeFileName(conv.title)}.${ext}`,
-    conversationToText(detail.conversation, detail.messages, format),
-    format === 'json' ? 'application/json' : 'text/plain',
-  )
-  toast.success(`已导出 ${format.toUpperCase()}`)
-}
-
-/** 创建对话分享并复制链接（与卡片分享一致的 /share/<token> 格式）。 */
+/**
+ * 创建对话分享并复制链接（与卡片分享一致的 /share/<token> 格式）。
+ * @param messageIds 可选：只分享勾选的消息（服务端复制为快照对话）。
+ */
 export async function shareConversationLink(
   id: string,
   days = 0,
+  messageIds?: string[],
 ): Promise<string | null> {
   try {
     const res = await fetch('/api/shares', {
@@ -255,6 +182,7 @@ export async function shareConversationLink(
         kind: 'conversation',
         conversationId: id,
         days,
+        ...(messageIds && messageIds.length > 0 ? { messageIds } : {}),
       }),
     })
     if (!res.ok) {
@@ -275,6 +203,93 @@ export async function shareConversationLink(
   } catch (err) {
     toast.error(err instanceof Error ? err.message : '分享失败')
     return null
+  }
+}
+
+/** 确保主对话存在（POST /api/conversations ensure-main），返回主对话或 null。 */
+export async function ensureMainConversation(): Promise<ConversationSummary | null> {
+  try {
+    const res = await fetch('/api/conversations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'ensure-main' }),
+    })
+    if (!res.ok) return null
+    const data = (await res.json()) as { conversation?: ConversationSummary }
+    return data.conversation ?? null
+  } catch {
+    return null
+  }
+}
+
+// ---------- 排序偏好 ----------
+
+type SortKey = 'custom' | 'updated' | 'created' | 'title'
+type SortDir = 'asc' | 'desc'
+
+interface SortPref {
+  key: SortKey
+  dir: SortDir
+}
+
+const SORT_PREF_KEY = 'bs:conv-sort'
+/** 默认：最近更新 + 倒序（与历史行为一致）。 */
+const DEFAULT_SORT: SortPref = { key: 'updated', dir: 'desc' }
+
+const SORT_KEY_OPTIONS: { value: SortKey; label: string }[] = [
+  { value: 'custom', label: '自定义拖动' },
+  { value: 'updated', label: '最近更新' },
+  { value: 'created', label: '创建时间' },
+  { value: 'title', label: '标题' },
+]
+
+function loadSortPref(): SortPref {
+  try {
+    const raw = window.localStorage.getItem(SORT_PREF_KEY)
+    if (raw) {
+      const p = JSON.parse(raw) as Partial<SortPref>
+      if (
+        (p.key === 'custom' || p.key === 'updated' || p.key === 'created' || p.key === 'title') &&
+        (p.dir === 'asc' || p.dir === 'desc')
+      ) {
+        return { key: p.key, dir: p.dir }
+      }
+    }
+  } catch {
+    /* 损坏则用默认 */
+  }
+  return DEFAULT_SORT
+}
+
+/** 非主对话排序（custom=ord 顺序；其余按 key+dir，ord 相同回退更新时间倒序）。 */
+function sortRestConvs(
+  list: ConversationSummary[],
+  pref: SortPref,
+): ConversationSummary[] {
+  const rest = [...list]
+  switch (pref.key) {
+    case 'custom':
+      rest.sort((a, b) => (a.ord ?? 0) - (b.ord ?? 0) || b.updatedAt.localeCompare(a.updatedAt))
+      return pref.dir === 'desc' ? rest.reverse() : rest
+    case 'created': {
+      const cmp = (a: ConversationSummary, b: ConversationSummary) =>
+        a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
+      rest.sort(cmp)
+      return pref.dir === 'desc' ? rest.reverse() : rest
+    }
+    case 'title': {
+      const cmp = (a: ConversationSummary, b: ConversationSummary) =>
+        a.title.localeCompare(b.title, 'zh-Hans-CN') || a.id.localeCompare(b.id)
+      rest.sort(cmp)
+      return pref.dir === 'desc' ? rest.reverse() : rest
+    }
+    case 'updated':
+    default: {
+      const cmp = (a: ConversationSummary, b: ConversationSummary) =>
+        a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id)
+      rest.sort(cmp)
+      return pref.dir === 'desc' ? rest.reverse() : rest
+    }
   }
 }
 
@@ -339,135 +354,39 @@ function Highlight({ text, kw }: { text: string; kw: string }) {
 const SCROLLBAR =
   '[scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:min-h-6 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent'
 
-// ---------- 对话分享对话框（单条 / 批量共用：先选有效期再创建） ----------
+// ---------- 可排序行包装（自定义拖动模式） ----------
 
-type ShareExpiry = 'inf' | '1' | '7' | '30' | 'custom'
-
-const SHARE_EXPIRY_OPTIONS: { value: ShareExpiry; label: string }[] = [
-  { value: 'inf', label: '永久有效' },
-  { value: '1', label: '1 天' },
-  { value: '7', label: '7 天' },
-  { value: '30', label: '30 天' },
-  { value: 'custom', label: '自定义' },
-]
-
-/**
- * 分享对话前的有效期选择对话框（与卡片/书籍分享一致）。
- * - mode 'single'：分享单个对话（title 如「分享对话「xxx」」）。
- * - mode 'batch'：批量分享（title 如「批量分享 N 个对话」）。
- * 确认后回调 onConfirm(days)：0 = 永久，N = N 天有效；由调用方执行
- * shareConversationLink(id, days)。自定义天数需为 1-3650 的整数。
- */
-function ConversationShareDialog({
-  open,
-  onOpenChange,
-  title,
-  mode,
-  onConfirm,
+function SortableRow({
+  id,
+  disabled,
+  children,
 }: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  title: string
-  mode: 'single' | 'batch'
-  onConfirm: (days: number) => void
+  id: string
+  disabled?: boolean
+  children: React.ReactNode
 }) {
-  const [expiry, setExpiry] = React.useState<ShareExpiry>('7')
-  const [customDays, setCustomDays] = React.useState('7')
-
-  // 每次打开重置（默认 7 天，与卡片分享默认一致）
-  React.useEffect(() => {
-    if (open) {
-      setExpiry('7')
-      setCustomDays('7')
-    }
-  }, [open])
-
-  const handleConfirm = () => {
-    if (expiry === 'inf') {
-      onConfirm(0)
-      return
-    }
-    if (expiry === 'custom') {
-      const v = customDays.trim()
-      const n = Number(v)
-      if (!/^\d+$/.test(v) || !Number.isInteger(n) || n < 1 || n > 3650) {
-        toast.error('自定义有效期需为 1-3650 的整数（天）')
-        return
-      }
-      onConfirm(n)
-      return
-    }
-    onConfirm(Number(expiry))
-  }
-
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id, disabled })
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="rounded-2xl">
-        <DialogHeader>
-          <DialogTitle>{title}</DialogTitle>
-          <DialogDescription>
-            {mode === 'batch'
-              ? '将为所选对话分别创建只读分享链接，并逐个复制到剪贴板；到期后链接自动失效。'
-              : '将创建只读分享链接并复制到剪贴板；到期后链接自动失效。'}
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-3">
-          <p className="text-sm font-medium">有效期</p>
-          <RadioGroup
-            value={expiry}
-            onValueChange={(v) => setExpiry(v as ShareExpiry)}
-            className="gap-2.5"
-          >
-            {SHARE_EXPIRY_OPTIONS.map((opt) => (
-              <div
-                key={opt.value}
-                className={cn(
-                  'flex items-center gap-2.5 rounded-xl border px-3 py-2.5 transition-colors',
-                  expiry === opt.value
-                    ? 'border-primary/40 bg-primary/5'
-                    : 'border-border',
-                )}
-              >
-                <RadioGroupItem value={opt.value} id={`conv-share-expiry-${opt.value}`} />
-                <Label
-                  htmlFor={`conv-share-expiry-${opt.value}`}
-                  className="flex-1 cursor-pointer text-sm font-medium"
-                >
-                  {opt.label}
-                </Label>
-              </div>
-            ))}
-          </RadioGroup>
-
-          {expiry === 'custom' && (
-            <div className="flex items-center gap-2">
-              <Input
-                type="number"
-                min={1}
-                max={3650}
-                value={customDays}
-                onChange={(e) => setCustomDays(e.target.value)}
-                placeholder="1-3650"
-                aria-label="自定义天数"
-                className="h-10 w-28 rounded-xl"
-              />
-              <span className="text-sm text-muted-foreground">天（1-3650）</span>
-            </div>
-          )}
-        </div>
-
-        <DialogFooter>
-          <Button variant="outline" className="rounded-full" onClick={() => onOpenChange(false)}>
-            取消
-          </Button>
-          <Button className="rounded-full" onClick={handleConfirm}>
-            <Share2 className="size-4" />
-            确认分享
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
+      className={cn('relative', isDragging && 'z-20 opacity-90')}
+    >
+      {children}
+      {!disabled && (
+        <button
+          type="button"
+          aria-label="拖动排序"
+          title="拖动排序"
+          className="absolute left-0 top-1/2 z-10 flex size-8 -translate-y-1/2 touch-none items-center justify-center rounded-md text-muted-foreground/60 transition-colors hover:text-foreground"
+          {...attributes}
+          {...listeners}
+        >
+          <GripVertical className="size-4" />
+        </button>
+      )}
+    </div>
   )
 }
 
@@ -481,6 +400,8 @@ export function ChatSidebar({
 }: ChatSidebarProps) {
   const [convs, setConvs] = React.useState<ConversationSummary[]>([])
   const [loading, setLoading] = React.useState(false)
+  // ---- 排序偏好（localStorage 记忆） ----
+  const [sortPref, setSortPref] = React.useState<SortPref>(DEFAULT_SORT)
   // ---- 搜索（一级全局搜索） ----
   const [searchQ, setSearchQ] = React.useState('')
   const [searching, setSearching] = React.useState(false)
@@ -496,6 +417,9 @@ export function ChatSidebar({
   const [aiRenamingId, setAiRenamingId] = React.useState<string | null>(null)
   const [deleteTarget, setDeleteTarget] = React.useState<ConversationSummary | null>(null)
   const [deleting, setDeleting] = React.useState(false)
+  // ---- 主对话清空消息 ----
+  const [clearMainTarget, setClearMainTarget] = React.useState<ConversationSummary | null>(null)
+  const [clearingMain, setClearingMain] = React.useState(false)
   // ---- 批量分享结果 ----
   const [shareLinks, setShareLinks] = React.useState<
     { title: string; link: string }[] | null
@@ -503,6 +427,23 @@ export function ChatSidebar({
   // ---- 分享有效期对话框（单条 shareTarget / 批量 batchShareOpen） ----
   const [shareTarget, setShareTarget] = React.useState<ConversationSummary | null>(null)
   const [batchShareOpen, setBatchShareOpen] = React.useState(false)
+  // ---- 导出（单条 / 批量，走 conversation-export 引擎） ----
+  const [exportOpen, setExportOpen] = React.useState(false)
+  const [exportSections, setExportSections] = React.useState<ExportSection[]>([])
+  const [exportAllowImage, setExportAllowImage] = React.useState(true)
+  const [exportBusyTip, setExportBusyTip] = React.useState(false)
+
+  // 排序偏好：挂载读取 localStorage，变化时写回
+  React.useEffect(() => {
+    setSortPref(loadSortPref())
+  }, [])
+  React.useEffect(() => {
+    try {
+      window.localStorage.setItem(SORT_PREF_KEY, JSON.stringify(sortPref))
+    } catch {
+      /* 隐私模式忽略 */
+    }
+  }, [sortPref])
 
   const loadConversations = React.useCallback(async () => {
     setLoading(true)
@@ -510,7 +451,20 @@ export function ChatSidebar({
       const res = await fetch('/api/conversations')
       if (!res.ok) return
       const data = (await res.json()) as { conversations?: ConversationSummary[] }
-      setConvs(data.conversations ?? [])
+      const list = data.conversations ?? []
+      // 兜底：主对话缺失（极端时序）→ ensure-main 后重拉一次
+      if (!list.some((c) => c.isMain)) {
+        const main = await ensureMainConversation()
+        if (main) {
+          const res2 = await fetch('/api/conversations')
+          if (res2.ok) {
+            const data2 = (await res2.json()) as { conversations?: ConversationSummary[] }
+            setConvs(data2.conversations ?? [])
+            return
+          }
+        }
+      }
+      setConvs(list)
     } catch {
       /* 静默失败，保留现有列表 */
     } finally {
@@ -570,8 +524,61 @@ export function ChatSidebar({
     return m
   }, [convs])
 
-  const pinned = React.useMemo(() => convs.filter((c) => c.pinned), [convs])
-  const others = React.useMemo(() => convs.filter((c) => !c.pinned), [convs])
+  // 主对话永远第一；其余按排序偏好（custom 模式支持拖动）
+  const mainConv = React.useMemo(() => convs.find((c) => c.isMain), [convs])
+  const sortedRest = React.useMemo(
+    () => sortRestConvs(convs.filter((c) => !c.isMain), sortPref),
+    [convs, sortPref],
+  )
+  const pinnedRest = React.useMemo(
+    () => sortedRest.filter((c) => c.pinned),
+    [sortedRest],
+  )
+  const othersRest = React.useMemo(
+    () => sortedRest.filter((c) => !c.pinned),
+    [sortedRest],
+  )
+  const isCustomSort = sortPref.key === 'custom'
+
+  // ---------- 拖动排序（自定义模式） ----------
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+  )
+
+  const handleDragEnd = (e: DragEndEvent) => {
+    const { active, over } = e
+    if (!over || active.id === over.id) return
+    const oldIndex = sortedRest.findIndex((c) => c.id === active.id)
+    const newIndex = sortedRest.findIndex((c) => c.id === over.id)
+    if (oldIndex < 0 || newIndex < 0) return
+    const next = arrayMove(sortedRest, oldIndex, newIndex)
+    const orderedIds = next.map((c) => c.id)
+    // 本地立即生效（主对话保持在最前）
+    setConvs((prev) => {
+      const main = prev.find((c) => c.isMain)
+      const restNext = orderedIds
+        .map((id) => prev.find((c) => c.id === id))
+        .filter((c): c is ConversationSummary => !!c)
+      const restIds = new Set(orderedIds)
+      const leftover = prev.filter((c) => !c.isMain && !restIds.has(c.id))
+      return main ? [main, ...restNext, ...leftover] : [...restNext, ...leftover]
+    })
+    // 持久化 ord（0,1,2…）
+    void (async () => {
+      try {
+        const res = await fetch('/api/conversations', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'reorder', ids: orderedIds }),
+        })
+        if (!res.ok) throw new Error('保存失败')
+        toast.success('排序已保存')
+      } catch {
+        toast.error('排序保存失败')
+      }
+    })()
+  }
 
   // ---------- 操作 ----------
 
@@ -592,15 +599,8 @@ export function ChatSidebar({
       const data = (await res.json()) as { conversation?: ConversationSummary }
       if (!data.conversation) return null
       const updated = data.conversation
-      setConvs((prev) => {
-        const next = prev.map((c) => (c.id === id ? updated : c))
-        // 置顶优先 + 更新时间倒序（与服务端排序一致，置顶后立即归位）
-        next.sort((a, b) => {
-          if (a.pinned !== b.pinned) return a.pinned ? -1 : 1
-          return b.updatedAt.localeCompare(a.updatedAt)
-        })
-        return next
-      })
+      // 仅替换条目；显示顺序由 sortedRest 排序逻辑自动接管
+      setConvs((prev) => prev.map((c) => (c.id === id ? updated : c)))
       return data.conversation
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '操作失败')
@@ -641,7 +641,10 @@ export function ChatSidebar({
         `/api/conversations/${encodeURIComponent(deleteTarget.id)}`,
         { method: 'DELETE' },
       )
-      if (!res.ok) throw new Error('删除失败')
+      if (!res.ok) {
+        const e = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(e.error || '删除失败')
+      }
       setConvs((prev) => prev.filter((c) => c.id !== deleteTarget.id))
       setSelected((prev) => {
         const next = new Set(prev)
@@ -654,6 +657,32 @@ export function ChatSidebar({
       toast.error(err instanceof Error ? err.message : '删除失败')
     } finally {
       setDeleting(false)
+    }
+  }
+
+  /** 主对话清空消息（唯一允许的破坏性操作）。 */
+  const handleClearMain = async () => {
+    if (!clearMainTarget) return
+    setClearingMain(true)
+    try {
+      const res = await fetch(
+        `/api/conversations/${encodeURIComponent(clearMainTarget.id)}/messages`,
+        { method: 'DELETE' },
+      )
+      if (!res.ok) throw new Error('清空失败')
+      setConvs((prev) =>
+        prev.map((c) =>
+          c.id === clearMainTarget.id
+            ? { ...c, messageCount: 0, lastMessage: '', lastAt: new Date().toISOString() }
+            : c,
+        ),
+      )
+      toast.success('已清空 AI问问 的消息')
+      setClearMainTarget(null)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '清空失败')
+    } finally {
+      setClearingMain(false)
     }
   }
 
@@ -683,6 +712,42 @@ export function ChatSidebar({
     }
   }
 
+  // ---------- 导出（单条 / 批量，conversation-export 引擎 + 格式弹窗） ----------
+
+  const openExportDialog = async (targets: ConversationSummary[]) => {
+    if (targets.length === 0) return
+    setExportBusyTip(true)
+    const tid = toast.loading('正在加载对话内容…')
+    try {
+      const sections: ExportSection[] = []
+      for (const c of targets) {
+        const detail = await fetchConversation(c.id)
+        if (!detail) continue
+        sections.push({
+          title: detail.conversation.title,
+          type: detail.conversation.type,
+          messages: detail.messages.map((m) => ({
+            id: m.id,
+            role: m.role,
+            content: m.content,
+            ...(m.images && m.images.length > 0 ? { images: m.images } : {}),
+            createdAt: m.createdAt,
+          })),
+        })
+      }
+      if (sections.length === 0) {
+        toast.error('导出失败：对话加载失败', { id: tid })
+        return
+      }
+      toast.dismiss(tid)
+      setExportAllowImage(targets.length === 1)
+      setExportSections(sections)
+      setExportOpen(true)
+    } finally {
+      setExportBusyTip(false)
+    }
+  }
+
   // ---------- 批量操作 ----------
 
   const toggleSelect = (id: string) => {
@@ -704,12 +769,20 @@ export function ChatSidebar({
     () => convs.filter((c) => selected.has(c.id)),
     [convs, selected],
   )
+  /** 批量删除/分享跳过主对话（可勾选导出）。 */
+  const selectedActionable = React.useMemo(
+    () => selectedConvs.filter((c) => !c.isMain),
+    [selectedConvs],
+  )
 
   const handleBatchDelete = async () => {
-    if (selectedConvs.length === 0) return
+    if (selectedActionable.length === 0) {
+      toast.info('主对话不参与删除')
+      return
+    }
     setBatchBusy(true)
     let ok = 0
-    for (const c of selectedConvs) {
+    for (const c of selectedActionable) {
       try {
         const res = await fetch(`/api/conversations/${encodeURIComponent(c.id)}`, {
           method: 'DELETE',
@@ -720,42 +793,21 @@ export function ChatSidebar({
       }
     }
     setBatchBusy(false)
-    setConvs((prev) => prev.filter((c) => !selected.has(c.id)))
+    const deletedIds = new Set(selectedActionable.map((c) => c.id))
+    setConvs((prev) => prev.filter((c) => !deletedIds.has(c.id)))
     setSelected(new Set())
     toast.success(`已删除 ${ok} 个对话`)
   }
 
-  const handleBatchExport = async () => {
-    if (selectedConvs.length === 0) return
-    setBatchBusy(true)
-    const tid = toast.loading('正在导出所选对话…')
-    try {
-      const parts: string[] = [`# AI 对话导出（${selectedConvs.length} 个）`, '']
-      for (const c of selectedConvs) {
-        const detail = await fetchConversation(c.id)
-        if (!detail) continue
-        parts.push(conversationToText(detail.conversation, detail.messages, 'md'))
-        parts.push('\n---\n')
-      }
-      downloadTextFile(
-        `AI对话导出-${new Date().toISOString().slice(0, 10)}.md`,
-        parts.join('\n'),
-        'text/markdown',
-      )
-      toast.success('已导出所选对话', { id: tid })
-    } catch {
-      toast.error('导出失败', { id: tid })
-    } finally {
-      setBatchBusy(false)
-    }
-  }
-
   const handleBatchShare = async (days: number) => {
-    if (selectedConvs.length === 0) return
+    if (selectedActionable.length === 0) {
+      toast.info('主对话不参与分享，请勾选消息后分享')
+      return
+    }
     setBatchBusy(true)
     const tid = toast.loading('正在创建分享…')
     const links: { title: string; link: string }[] = []
-    for (const c of selectedConvs) {
+    for (const c of selectedActionable) {
       const link = await shareConversationLink(c.id, days)
       if (link) links.push({ title: c.title, link })
     }
@@ -780,27 +832,124 @@ export function ChatSidebar({
 
   // ---------- 行渲染 ----------
 
-  const renderRow = (c: ConversationSummary) => {
-    const meta = convTypeMeta(c.type)
+  /** 主对话行：Sparkles 图标 + 主对话徽标 + 置顶钉；长按/右键仅「清空消息」。 */
+  const renderMainRow = (c: ConversationSummary) => {
     const active = activeConversationId === c.id
     const checked = selected.has(c.id)
     return (
-      <div
+      <LongPressMenu
         key={c.id}
+        className="block w-full"
+        actions={[
+          { key: 'clear', label: '清空消息', icon: <Trash2 className="size-4" />, danger: true },
+        ]}
+        onAction={() => setClearMainTarget(c)}
+      >
+        <div
+          className={cn(
+            'flex items-center gap-1.5 rounded-xl border px-2 py-2 transition-colors',
+            active
+              ? 'border-emerald-500/40 bg-gradient-to-r from-emerald-500/15 to-sky-500/10'
+              : 'border-emerald-500/25 bg-emerald-500/5 hover:bg-emerald-500/10',
+            checked && 'ring-1 ring-primary/30',
+          )}
+        >
+          {manageMode && (
+            <Checkbox
+              checked={checked}
+              onCheckedChange={() => toggleSelect(c.id)}
+              aria-label={`选择 ${c.title}（仅导出）`}
+              className="shrink-0"
+            />
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              if (manageMode) {
+                toggleSelect(c.id)
+                return
+              }
+              onSelect(c.id)
+              onOpenChange(false)
+            }}
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            <span
+              className="flex size-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-500 to-sky-500 text-white"
+              aria-hidden
+            >
+              <Sparkles className="size-4" strokeWidth={2.25} />
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="flex items-center gap-1.5">
+                <span className="truncate text-sm font-semibold">{c.title}</span>
+                <span className="shrink-0 rounded-full bg-emerald-500/15 px-1.5 py-px text-[10px] font-medium text-emerald-700 dark:text-emerald-300">
+                  主对话
+                </span>
+                <Pin className="size-3 shrink-0 text-amber-500" strokeWidth={2.25} />
+              </span>
+              <span className="mt-0.5 flex items-center gap-1.5">
+                <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+                  {c.lastMessage || '（空对话）'}
+                </span>
+                <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground/70">
+                  {formatConvTime(c.lastAt)} · {c.messageCount}条
+                </span>
+              </span>
+            </span>
+          </button>
+          {!manageMode && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`更多操作：${c.title}`}
+                  className="flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <MoreVertical className="size-4" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-40">
+                <DropdownMenuItem
+                  variant="destructive"
+                  onClick={() => setClearMainTarget(c)}
+                >
+                  <Trash2 className="size-4" />
+                  清空消息
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
+      </LongPressMenu>
+    )
+  }
+
+  const renderRow = (c: ConversationSummary, dragHandle?: boolean) => {
+    if (c.isMain) return renderMainRow(c)
+    const meta = convTypeMeta(c.type)
+    const active = activeConversationId === c.id
+    const checked = selected.has(c.id)
+    const sortable = isCustomSort && !manageMode && !searchQ.trim()
+    const inner = (
+      <div
         className={cn(
           'flex items-center gap-1.5 rounded-xl border border-transparent px-2 py-2 transition-colors',
           active ? 'border-emerald-500/30 bg-emerald-500/10' : 'hover:bg-accent/60',
           checked && 'bg-primary/5',
         )}
       >
-        {manageMode && (
+        {manageMode ? (
           <Checkbox
             checked={checked}
             onCheckedChange={() => toggleSelect(c.id)}
             aria-label={`选择 ${c.title}`}
             className="shrink-0"
           />
-        )}
+        ) : dragHandle ? (
+          /* 拖动把手占位（可拖图标由 SortableRow 的绝对定位把手渲染） */
+          <span className="w-6 shrink-0 self-center" aria-hidden />
+        ) : null}
         <button
           type="button"
           onClick={() => {
@@ -876,23 +1025,10 @@ export function ChatSidebar({
                 <Share2 className="size-4" />
                 分享
               </DropdownMenuItem>
-              <DropdownMenuSub>
-                <DropdownMenuSubTrigger>
-                  <Download className="size-4" />
-                  导出
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent>
-                  <DropdownMenuItem onClick={() => void exportConversation(c, 'txt')}>
-                    导出 TXT
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => void exportConversation(c, 'md')}>
-                    导出 Markdown
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => void exportConversation(c, 'json')}>
-                    导出 JSON
-                  </DropdownMenuItem>
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
+              <DropdownMenuItem onClick={() => void openExportDialog([c])}>
+                <Download className="size-4" />
+                导出
+              </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 variant="destructive"
@@ -906,6 +1042,13 @@ export function ChatSidebar({
         )}
       </div>
     )
+    return sortable ? (
+      <SortableRow key={c.id} id={c.id} disabled={manageMode}>
+        {inner}
+      </SortableRow>
+    ) : (
+      <React.Fragment key={c.id}>{inner}</React.Fragment>
+    )
   }
 
   // ---------- 渲染 ----------
@@ -913,12 +1056,73 @@ export function ChatSidebar({
   if (!open) return null
 
   const q = searchQ.trim()
+  const searchMode = !!q || !!searchResult
 
   return (
     <div className="flex h-full min-h-0 flex-col">
       {/* 顶栏 */}
       <div className="flex items-center gap-1.5 px-3 pt-1">
         <p className="min-w-0 flex-1 truncate text-sm font-bold">AI 对话</p>
+        {/* 排序控件：自定义拖动 / 最近更新 / 创建时间 / 标题 × 正序/倒序 */}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="排序方式"
+              title="排序方式"
+              className={cn(
+                'flex size-8 items-center justify-center rounded-full border transition-colors',
+                isCustomSort
+                  ? 'border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                  : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground',
+              )}
+            >
+              <ArrowUpDown className="size-4" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-44">
+            {SORT_KEY_OPTIONS.map((opt) => (
+              <DropdownMenuItem
+                key={opt.value}
+                onClick={() => setSortPref((p) => ({ ...p, key: opt.value }))}
+              >
+                <span className="flex size-4 items-center justify-center">
+                  {sortPref.key === opt.value ? (
+                    <Check className="size-4 text-emerald-600" />
+                  ) : null}
+                </span>
+                {opt.label}
+              </DropdownMenuItem>
+            ))}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onClick={() => setSortPref((p) => ({ ...p, dir: 'asc' }))}
+            >
+              <span className="flex size-4 items-center justify-center">
+                {sortPref.dir === 'asc' ? (
+                  <Check className="size-4 text-emerald-600" />
+                ) : null}
+              </span>
+              正序
+              <span className="ml-auto text-[10px] text-muted-foreground">
+                {sortPref.key === 'title' ? 'A→Z' : sortPref.key === 'custom' ? '拖动↑' : '旧→新'}
+              </span>
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => setSortPref((p) => ({ ...p, dir: 'desc' }))}
+            >
+              <span className="flex size-4 items-center justify-center">
+                {sortPref.dir === 'desc' ? (
+                  <Check className="size-4 text-emerald-600" />
+                ) : null}
+              </span>
+              倒序
+              <span className="ml-auto text-[10px] text-muted-foreground">
+                {sortPref.key === 'title' ? 'Z→A' : sortPref.key === 'custom' ? '拖动↓' : '新→旧'}
+              </span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
         <button
           type="button"
           onClick={() => setManageMode((v) => !v)}
@@ -1015,8 +1219,8 @@ export function ChatSidebar({
             variant="outline"
             size="sm"
             className="h-8 rounded-full text-xs"
-            disabled={batchBusy || selected.size === 0}
-            onClick={() => void handleBatchExport()}
+            disabled={batchBusy || exportBusyTip || selected.size === 0}
+            onClick={() => void openExportDialog(selectedConvs)}
           >
             <Download className="size-3.5" />
             导出
@@ -1047,7 +1251,7 @@ export function ChatSidebar({
               <AlertDialogHeader>
                 <AlertDialogTitle>批量删除对话</AlertDialogTitle>
                 <AlertDialogDescription>
-                  将删除所选 {selected.size} 个对话及其全部消息，此操作无法恢复。
+                  将删除所选 {selected.size} 个对话及其全部消息（主对话会自动跳过），此操作无法恢复。
                 </AlertDialogDescription>
               </AlertDialogHeader>
               <AlertDialogFooter>
@@ -1066,7 +1270,7 @@ export function ChatSidebar({
 
       {/* 列表 / 搜索结果 */}
       <div className={cn('min-h-0 flex-1 overflow-y-auto px-2 pb-4', SCROLLBAR)}>
-        {q || searchResult ? (
+        {searchMode ? (
           /* ---- 搜索结果 ---- */
           <div className="flex flex-col gap-1">
             {searching && (
@@ -1158,22 +1362,46 @@ export function ChatSidebar({
             </DropdownMenu>
           </div>
         ) : (
-          /* ---- 普通列表（置顶分组 + 更新倒序） ---- */
+          /* ---- 普通列表：主对话置顶 → 拖动排序 或 置顶分组 ---- */
           <div className="flex flex-col gap-1">
-            {pinned.length > 0 && (
+            {mainConv && renderMainRow(mainConv)}
+            {isCustomSort ? (
               <>
-                <p className="px-2 pb-1 pt-1 text-[11px] font-medium text-muted-foreground">
-                  置顶 · {pinned.length}
+                <p className="px-2 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
+                  自定义顺序 · {sortedRest.length}
+                  <span className="ml-1 font-normal">（按 ≡ 拖动调整）</span>
                 </p>
-                {pinned.map(renderRow)}
-                {others.length > 0 && (
-                  <p className="px-2 pb-1 pt-2.5 text-[11px] font-medium text-muted-foreground">
-                    全部 · {others.length}
-                  </p>
+                <DndContext
+                  sensors={sensors}
+                  collisionDetection={closestCenter}
+                  onDragEnd={handleDragEnd}
+                >
+                  <SortableContext
+                    items={sortedRest.map((c) => c.id)}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    {sortedRest.map((c) => renderRow(c, true))}
+                  </SortableContext>
+                </DndContext>
+              </>
+            ) : (
+              <>
+                {pinnedRest.length > 0 && (
+                  <>
+                    <p className="px-2 pb-1 pt-2 text-[11px] font-medium text-muted-foreground">
+                      置顶 · {pinnedRest.length}
+                    </p>
+                    {pinnedRest.map((c) => renderRow(c))}
+                    {othersRest.length > 0 && (
+                      <p className="px-2 pb-1 pt-2.5 text-[11px] font-medium text-muted-foreground">
+                        全部 · {othersRest.length}
+                      </p>
+                    )}
+                  </>
                 )}
+                {othersRest.map((c) => renderRow(c))}
               </>
             )}
-            {others.map(renderRow)}
           </div>
         )}
       </div>
@@ -1242,6 +1470,31 @@ export function ChatSidebar({
         </DialogContent>
       </Dialog>
 
+      {/* 主对话清空消息确认 */}
+      <AlertDialog open={!!clearMainTarget} onOpenChange={(o) => {
+        if (!o) setClearMainTarget(null)
+      }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>清空 AI问问 的消息</AlertDialogTitle>
+            <AlertDialogDescription>
+              将清空主对话「{clearMainTarget?.title ?? 'AI问问'}」的全部消息（对话本身保留），此操作无法恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={clearingMain}
+              className="bg-red-600 text-white hover:bg-red-700"
+              onClick={() => void handleClearMain()}
+            >
+              {clearingMain && <Loader2 className="size-4 animate-spin" />}
+              清空
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* 批量分享结果 */}
       <Dialog open={!!shareLinks} onOpenChange={(o) => {
         if (!o) setShareLinks(null)
@@ -1295,6 +1548,14 @@ export function ChatSidebar({
           setBatchShareOpen(false)
           void handleBatchShare(days)
         }}
+      />
+
+      {/* 导出（单条 / 批量）：conversation-export 引擎 + 格式选择 */}
+      <ConversationExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        sections={exportSections}
+        allowImage={exportAllowImage}
       />
     </div>
   )

@@ -16,7 +16,11 @@
 //              getElapsedSec / getDisplaySec / useFocusState / focusBus
 //   UI 协调    setImmersiveOpen / isImmersiveOpen（focus-app 全屏计时时隐藏浮时钟圆钮）
 //   铃声       getFocusSoundPrefs / saveFocusSoundPrefs / playFocusBell / playBuiltin
-//             FOCUS_BUILTIN_SOUNDS（内置铃声清单）
+//             FOCUS_BUILTIN_SOUNDS（内置铃声清单）；会话级覆盖 setSessionBell /
+//             getSessionBell（本次专注的结束铃声，null = 跟随默认，随会话生灭，
+//             经 localStorage 跨标签页同步）；previewSessionBell / stopBellPreview
+//             （试听 + 防抖）；playEndBell（到点响铃统一入口）；validateBellFile /
+//             readAudioFileAsDataUrl（上传校验与读取）
 //   历史       今日会话记录已全部服务端持久化（/api/focus/log GET/POST/DELETE，
 //             多设备可见）；本机仅保留运行中会话状态（跨标签页同步需要）
 //   云端进度   运行中每 30s 心跳 + 切后台/离开页面前，把进度推到 /api/state 的
@@ -27,7 +31,7 @@
 //   组件       FocusFloatingClock（全局挂载一次；圆钮可拖动，位置持久化 ui:focusClockPos）
 
 import * as React from 'react'
-import { Clock3, Maximize2, Pause, Play, Upload, Volume2 } from 'lucide-react'
+import { Bell, Clock3, Maximize2, Pause, Play, Upload, Volume2 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
   Dialog,
@@ -74,6 +78,8 @@ export interface FocusStopInfo {
   save?: boolean
   /** COMPLETE 事件：是否已实际记录（有 contentId 且时长 ≥1s） */
   saved?: boolean
+  /** 到点时的会话级铃声覆盖（「时间到了」弹窗重播本次铃声用；STOP 事件无此字段） */
+  bell?: SessionBellOverride | null
   /** 最近一次到点的 epoch 毫秒（内部用） */
   at?: number
 }
@@ -99,6 +105,8 @@ export interface FocusProgress {
 
 export const FOCUS_BUS_STATE_KEY = 'focus-bus-state-v1'
 export const FOCUS_BUS_SOUND_KEY = 'focus-bus-sound-v1'
+/** 会话级铃声覆盖的 localStorage 镜像（{ bell, startedAt }，随会话生灭，内部用） */
+const FOCUS_SESSION_BELL_KEY = 'focus-bus-session-bell-v1'
 
 /** 服务端进度 KV key（/api/state）—— 换设备/清存储后恢复进行中的会话 */
 export const FOCUS_PROGRESS_KEY = 'focus:progress'
@@ -126,6 +134,8 @@ export const FOCUS_BUS_EVENTS = {
   LOGGED: 'focusbus-logged',
   /** focus-app 全屏计时遮罩开关（浮时钟据此隐藏圆钮） */
   IMMERSIVE: 'focusbus-immersive',
+  /** 默认铃声设置变更（saveFocusSoundPrefs 后派发；focus-app 据此刷新「跟随默认」标签） */
+  SOUND: 'focusbus-sound',
 } as const
 
 const IDLE: FocusBusState = {
@@ -144,6 +154,11 @@ let state: FocusBusState = loadState()
 let timerId: number | null = null
 let titlePrev: string | null = null
 let immersiveOpen = false
+/** 会话级铃声覆盖（本次专注的结束铃声；null = 跟随默认）—— 模块级变量，
+ *  另镜像到 localStorage：多个标签页都可能在到点时结束会话，谁先到点都响同一铃声 */
+let sessionBell: SessionBellOverride | null = null
+// 模块加载：恢复属于当前进行中会话的铃声覆盖（页面刷新 / 其他标签页写入），否则清理残留
+adoptSessionBellFromStorage()
 
 export interface FocusSnapshot {
   state: FocusBusState
@@ -385,6 +400,9 @@ export function startFocus(opts: {
   contentId?: string
 }): void {
   const now = Date.now()
+  // 新会话开始：清掉上一会话可能残留的铃声覆盖（focus-app 会在 start 之后 set 本次选择；
+  // 其他入口直接 startFocus 的会话则自然回到「跟随默认」）
+  clearSessionBell()
   state = {
     running: true,
     mode: opts.mode,
@@ -435,6 +453,9 @@ export function getFocusState(): FocusBusState {
 
 function setIdle(): void {
   state = { ...IDLE }
+  // 会话结束（到点自动结束 / 手动结束并保存 / 放弃退出，其他标签页结束则经 storage 同步）：
+  // 清空会话级铃声覆盖，下次专注默认跟随
+  clearSessionBell()
   publish()
   ensureTicker()
 }
@@ -498,13 +519,18 @@ async function completeNatural(): Promise<void> {
     state.mode === 'countdown' && state.targetSec ? state.targetSec : getElapsedSec(state)
   const name = state.contentName || '自由专注'
   const contentId = state.contentId
+  // 先捕获本次会话的铃声覆盖（setIdle 会将其清空），到点后立即响铃
+  const bell = sessionBell
   setIdle()
-  lastComplete = { seconds, name, contentId, saved: true, at: Date.now() }
+  lastComplete = { seconds, name, contentId, saved: true, at: Date.now(), bell }
   dispatchEv(FOCUS_BUS_EVENTS.COMPLETE, lastComplete satisfies FocusStopInfo)
+  // 时间到了直接响铃：会话级覆盖优先（silent = 不响），否则默认铃声逻辑；
+  // 不等日志上报返回（后台标签页受浏览器自动播放策略限制时可能静默失败，
+  // 用户可在「时间到了」弹窗里手动重播本次铃声）
+  playEndBell(bell)
   if (seconds >= 1) {
     await logToServer(contentId ?? null, seconds, true, name)
   }
-  if (getFocusSoundPrefs().enabled) playFocusBell()
 }
 
 // ---------- 全局 ticker + 标签页标题 ----------
@@ -549,6 +575,11 @@ function updateTitle(): void {
 // 跨标签页同步 + 回到标签页时立刻补一次 tick（后台定时器被节流，靠时间戳纠偏）
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (e: StorageEvent) => {
+    if (e.key === FOCUS_SESSION_BELL_KEY) {
+      // 其他标签页设置 / 清除了会话铃声覆盖（到点结束的可能正是那个标签页）
+      adoptSessionBellFromStorage()
+      return
+    }
     if (e.key !== FOCUS_BUS_STATE_KEY) return
     state = loadState()
     publish(false) // 状态来自其他标签页的写入，不回写 localStorage（避免回声循环）
@@ -739,23 +770,252 @@ export function saveFocusSoundPrefs(patch: Partial<FocusSoundPrefs>): FocusSound
     }
     // 实时同步服务端
     void putState(FOCUS_BUS_SOUND_KEY, JSON.stringify(next))
+    // 通知页面上的相关 UI（focus-app 第二步「跟随默认」的默认值标签等）刷新
+    dispatchEv(FOCUS_BUS_EVENTS.SOUND, next)
   }
   return next
 }
 
-/** 播放结束铃声：自定义音频优先，否则播放选中的内置铃声 */
+// ---------- 会话级铃声覆盖（本次专注的结束铃声；null = 跟随默认） ----------
+
+/** 本次专注的结束铃声选择：内置 / 自定义 dataURL / 静音；null = 跟随默认铃声 */
+export type SessionBellOverride =
+  | { kind: 'builtin'; key: FocusBuiltinSound }
+  | { kind: 'custom'; dataUrl: string }
+  | { kind: 'silent' }
+
+/** 自定义铃声大小上限（dataURL 要进 localStorage 与云端 KV，过大易写满） */
+export const FOCUS_BELL_MAX_UPLOAD_BYTES = 1.5 * 1024 * 1024
+
+function isValidSessionBell(v: unknown): v is SessionBellOverride {
+  if (!v || typeof v !== 'object') return false
+  const b = v as { kind?: unknown; key?: unknown; dataUrl?: unknown }
+  if (b.kind === 'silent') return true
+  if (b.kind === 'builtin') return b.key === 'chime' || b.key === 'ding' || b.key === 'beep'
+  if (b.kind === 'custom') return typeof b.dataUrl === 'string' && b.dataUrl.startsWith('data:')
+  return false
+}
+
+/** localStorage 记录：{ bell, startedAt } —— startedAt 防串场（仅对当前会话生效） */
+function parseSessionBellRecord(
+  raw: string | null,
+): { bell: SessionBellOverride; startedAt: number } | null {
+  if (!raw) return null
+  try {
+    const p = JSON.parse(raw) as { bell?: unknown; startedAt?: unknown }
+    if (!isValidSessionBell(p.bell)) return null
+    const startedAt = Number(p.startedAt)
+    if (!Number.isFinite(startedAt) || startedAt <= 0) return null
+    return { bell: p.bell, startedAt }
+  } catch {
+    return null
+  }
+}
+
+/** 采纳 localStorage 里的会话铃声覆盖（模块加载 / 跨标签页 storage 事件时调用）：
+ *  记录属于当前运行中的会话才生效，否则视为残留并清理。 */
+function adoptSessionBellFromStorage(): void {
+  if (typeof window === 'undefined') return
+  let rec: { bell: SessionBellOverride; startedAt: number } | null = null
+  try {
+    rec = parseSessionBellRecord(window.localStorage.getItem(FOCUS_SESSION_BELL_KEY))
+  } catch {
+    rec = null
+  }
+  if (rec && state.running && rec.startedAt === state.startedAt) {
+    sessionBell = rec.bell
+    return
+  }
+  sessionBell = null
+  if (rec) {
+    try {
+      window.localStorage.removeItem(FOCUS_SESSION_BELL_KEY)
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** 设置本次专注的结束铃声（focus-app 开始专注时调用；null = 跟随默认）。
+ *  会话进行中会镜像到 localStorage：多个标签页都能在到点结束时响同一铃声。 */
+export function setSessionBell(bell: SessionBellOverride | null): void {
+  sessionBell = bell
+  if (typeof window === 'undefined') return
+  try {
+    if (bell && state.running) {
+      window.localStorage.setItem(
+        FOCUS_SESSION_BELL_KEY,
+        JSON.stringify({ bell, startedAt: state.startedAt }),
+      )
+    } else {
+      window.localStorage.removeItem(FOCUS_SESSION_BELL_KEY)
+    }
+  } catch {
+    // localStorage 不可用 / 写满：仅本标签页生效（跨标签页到点时回退默认铃声）
+  }
+}
+
+/** 当前会话的铃声覆盖（null = 跟随默认） */
+export function getSessionBell(): SessionBellOverride | null {
+  return sessionBell
+}
+
+/** 会话结束路径统一清空（startFocus 换新会话 / stopFocus / completeNatural → setIdle） */
+function clearSessionBell(): void {
+  sessionBell = null
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.removeItem(FOCUS_SESSION_BELL_KEY)
+    } catch {
+      // ignore
+    }
+  }
+}
+
+/** 铃声选择的显示名（null = 跟随默认时展开当前默认：已关闭 / 自定义铃声 / 内置名） */
+export function describeBellChoice(
+  bell: SessionBellOverride | null | undefined,
+  prefs?: FocusSoundPrefs,
+): string {
+  if (bell) {
+    if (bell.kind === 'silent') return '静音'
+    if (bell.kind === 'custom') return '自定义铃声'
+    return FOCUS_BUILTIN_SOUNDS.find((s) => s.key === bell.key)?.label ?? '内置铃声'
+  }
+  const p = prefs ?? getFocusSoundPrefs()
+  if (!p.enabled) return '默认（已关闭）'
+  if (p.dataUrl) return '默认 · 自定义铃声'
+  return `默认 · ${FOCUS_BUILTIN_SOUNDS.find((s) => s.key === p.builtin)?.label ?? '琶音'}`
+}
+
+/** 校验上传的铃声文件，返回错误文案（'' = 通过）。mp3/wav/ogg/m4a 等常见格式均可。 */
+export function validateBellFile(file: File): string {
+  // 部分浏览器/系统对 m4a、ogg 等给出的 file.type 可能为空，用扩展名兜底
+  const extOk = /\.(mp3|wav|ogg|oga|m4a|aac|flac|webm|opus|mp4)$/i.test(file.name)
+  const looksAudio = file.type.startsWith('audio/') || extOk
+  if (!looksAudio) return '仅支持音频文件（mp3 / wav / ogg / m4a 等）'
+  if (file.size > FOCUS_BELL_MAX_UPLOAD_BYTES) {
+    return `音频过大（${(file.size / 1024 / 1024).toFixed(1)}MB），请上传 1.5MB 以内的片段`
+  }
+  return ''
+}
+
+/** 读取音频文件为 dataURL（上传自定义铃声用） */
+export function readAudioFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const s = String(reader.result ?? '')
+      if (s) resolve(s)
+      else reject(new Error('读取音频文件失败'))
+    }
+    reader.onerror = () => reject(new Error('读取音频文件失败'))
+    reader.readAsDataURL(file)
+  })
+}
+
+// ---------- 铃声播放（全局单例：新的播放自动打断上一个 —— 试听防抖） ----------
+
+/** 正在播放的自定义铃声（dataURL <audio>） */
+let bellAudio: HTMLAudioElement | null = null
+/** 正在播放的内置合成音（WebAudio，播完自动关闭） */
+let tonePlayer: { ctx: AudioContext; timer: number } | null = null
+
+function stopBellAudio(): void {
+  if (!bellAudio) return
+  try {
+    bellAudio.pause()
+  } catch {
+    // ignore
+  }
+  bellAudio = null
+}
+
+function stopTonePlayer(): void {
+  if (!tonePlayer) return
+  window.clearTimeout(tonePlayer.timer)
+  try {
+    void tonePlayer.ctx.close().catch(() => {})
+  } catch {
+    // ignore
+  }
+  tonePlayer = null
+}
+
+/** 停止当前正在响的铃声 / 试听（自定义音频 + 内置合成音一并停止） */
+export function stopBellPreview(): void {
+  if (typeof window === 'undefined') return
+  stopBellAudio()
+  stopTonePlayer()
+}
+
+/** 播放 dataURL 音频（先停上一个）；onFail 在浏览器拒绝自动播放时回调。
+ *  返回 false = 无法创建播放（调用方自行回退）。 */
+function playDataUrlSound(dataUrl: string, onFail?: () => void): boolean {
+  if (typeof window === 'undefined' || !dataUrl) return false
+  stopBellPreview()
+  const audio = new Audio(dataUrl)
+  bellAudio = audio
+  audio.addEventListener('ended', () => {
+    if (bellAudio === audio) bellAudio = null
+  })
+  try {
+    void audio.play().catch(() => {
+      if (bellAudio === audio) bellAudio = null
+      onFail?.()
+    })
+    return true
+  } catch {
+    if (bellAudio === audio) bellAudio = null
+    return false
+  }
+}
+
+/** 到点响铃统一入口：会话级覆盖优先（silent = 不响；builtin/custom 响对应铃声），
+ *  null / 自定义播放失败 → 默认铃声逻辑（受「到点响铃」开关控制）。 */
+export function playEndBell(bell: SessionBellOverride | null | undefined): void {
+  const b = bell ?? getSessionBell()
+  if (b) {
+    if (b.kind === 'silent') return
+    if (b.kind === 'builtin') {
+      playBuiltin(b.key)
+      return
+    }
+    if (b.kind === 'custom' && b.dataUrl) {
+      if (playDataUrlSound(b.dataUrl, () => playDefaultEndBell())) return
+    }
+  }
+  playDefaultEndBell()
+}
+
+function playDefaultEndBell(): void {
+  const prefs = getFocusSoundPrefs()
+  if (!prefs.enabled) return
+  playFocusBell()
+}
+
+/** 试听某个铃声选择（点选即试听，先停上一个）；null = 试听当前默认铃声。 */
+export function previewSessionBell(bell: SessionBellOverride | null): void {
+  if (!bell) {
+    playFocusBell()
+    return
+  }
+  if (bell.kind === 'silent') {
+    stopBellPreview() // 选静音：顺手停掉正在试听的
+    return
+  }
+  if (bell.kind === 'builtin') {
+    playBuiltin(bell.key)
+    return
+  }
+  if (!playDataUrlSound(bell.dataUrl)) stopBellPreview()
+}
+
+/** 播放结束铃声（默认逻辑）：自定义音频优先，否则播放选中的内置铃声 */
 export function playFocusBell(): void {
   if (typeof window === 'undefined') return
   const prefs = getFocusSoundPrefs()
-  if (prefs.dataUrl) {
-    try {
-      const audio = new Audio(prefs.dataUrl)
-      void audio.play().catch(() => playBuiltin(prefs.builtin))
-      return
-    } catch {
-      // fall through to builtin
-    }
-  }
+  if (prefs.dataUrl && playDataUrlSound(prefs.dataUrl, () => playBuiltin(prefs.builtin))) return
   playBuiltin(prefs.builtin)
 }
 
@@ -784,7 +1044,11 @@ export function playBuiltin(sound: FocusBuiltinSound): void {
 }
 
 function playTones(notes: { freq: number; at: number; dur: number; type?: OscillatorType }[]): void {
+  if (typeof window === 'undefined') return
   try {
+    // 试听防抖：新一段合成音开始前，先停掉正在响的（合成音 + 自定义音频）
+    stopBellAudio()
+    stopTonePlayer()
     const w = window as unknown as {
       AudioContext?: typeof AudioContext
       webkitAudioContext?: typeof AudioContext
@@ -809,9 +1073,15 @@ function playTones(notes: { freq: number; at: number; dur: number; type?: Oscill
       osc.stop(start + n.dur + 0.1)
       last = Math.max(last, n.at + n.dur)
     }
-    window.setTimeout(() => {
-      void ctx.close().catch(() => {})
+    const timer = window.setTimeout(() => {
+      try {
+        void ctx.close().catch(() => {})
+      } catch {
+        // ignore
+      }
+      if (tonePlayer && tonePlayer.ctx === ctx) tonePlayer = null
     }, Math.ceil(last * 1000) + 500)
+    tonePlayer = { ctx, timer }
   } catch {
     // ignore
   }
@@ -923,7 +1193,7 @@ function saveClockPos(p: FocusClockPos): void {
 // ============================================================
 // FocusFloatingClock — 全局浮时钟（主线程挂载一次即可）
 //   运行中：可拖动小圆钮（mm:ss，长按拖拽换位置并持久化），点击弹详情 Dialog
-//   详情：当前会话（内容名 / 已专注 / 全屏计时 / 暂停继续 / 结束）+ 今日&累计统计 + 结束铃声设置
+//   详情：当前会话（内容名 / 已专注 / 全屏计时 / 暂停继续 / 结束）+ 今日&累计统计 + 默认铃声设置
 //   到点：自动弹「时间到了」Dialog（可手动播放铃声）
 // ============================================================
 
@@ -1038,7 +1308,13 @@ export function FocusFloatingClock() {
     const offDone = onEvent(FOCUS_BUS_EVENTS.COMPLETE, (e) => {
       const d = (e as CustomEvent<FocusStopInfo>).detail
       setSound(getFocusSoundPrefs())
-      setTimeUp({ seconds: d.seconds, name: d.name, contentId: d.contentId, saved: d.saved })
+      setTimeUp({
+        seconds: d.seconds,
+        name: d.name,
+        contentId: d.contentId,
+        saved: d.saved,
+        bell: d.bell,
+      })
     })
     return () => {
       offImm()
@@ -1079,26 +1355,30 @@ export function FocusFloatingClock() {
     }
   }, [detailOpen])
 
-  const onSoundFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onSoundFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     e.target.value = ''
     if (!file) return
-    if (file.size > 2 * 1024 * 1024) {
-      toast.error('铃声文件需小于 2MB')
+    const err = validateBellFile(file)
+    if (err) {
+      toast.error(err)
       return
     }
-    const reader = new FileReader()
-    reader.onload = () => {
-      setSound(saveFocusSoundPrefs({ dataUrl: String(reader.result) }))
-      toast.success('铃声已更新')
+    try {
+      const dataUrl = await readAudioFileAsDataUrl(file)
+      setSound(saveFocusSoundPrefs({ dataUrl }))
+      toast.success('默认铃声已更新')
+      previewSessionBell({ kind: 'custom', dataUrl }) // 上传成功即试听
+    } catch (err2) {
+      toast.error(err2 instanceof Error ? err2.message : '读取铃声文件失败')
     }
-    reader.onerror = () => toast.error('读取铃声文件失败')
-    reader.readAsDataURL(file)
   }
 
-  /** 铃声设置区（详情 / 时间到了 两个弹窗共用）：开关 + 内置铃声选择 + 上传自定义 */
-  const soundSection = (key: string) =>
-    h(
+  /** 默认铃声设置区（详情 / 时间到了 两个弹窗共用）：开关 + 内置选择 + 上传自定义 + 试听。
+   *  本次专注单独选了铃声（会话级覆盖）时，顶部提示「本次: xxx · 优先于默认」。 */
+  const soundSection = (key: string) => {
+    const sessionBellNow = st.running ? getSessionBell() : null
+    return h(
       'div',
       { key, className: 'flex flex-col gap-3 rounded-2xl border p-3' },
       h(
@@ -1108,7 +1388,7 @@ export function FocusFloatingClock() {
           'div',
           { className: 'flex items-center gap-2' },
           h(Volume2, { className: 'size-4 text-zinc-500' }),
-          h('span', { className: 'text-sm font-medium' }, '结束铃声'),
+          h('span', { className: 'text-sm font-medium' }, '默认铃声'),
           h('span', { className: 'text-xs text-zinc-400' }, sound.dataUrl ? '自定义' : '内置铃声'),
         ),
         h(Switch, {
@@ -1116,8 +1396,22 @@ export function FocusFloatingClock() {
           onCheckedChange: (v: boolean) => {
             setSound(saveFocusSoundPrefs({ enabled: v }))
           },
+          'aria-label': '到点响铃开关',
         }),
       ),
+      sessionBellNow
+        ? h(
+            'div',
+            {
+              key: 'session-bell',
+              className:
+                'flex items-center gap-1.5 rounded-xl bg-zinc-100 px-2.5 py-1.5 text-xs text-zinc-600',
+            },
+            h(Bell, { className: 'size-3.5 shrink-0 text-zinc-500' }),
+            h('span', { className: 'font-medium' }, `本次: ${describeBellChoice(sessionBellNow)}`),
+            h('span', { className: 'text-zinc-400' }, '· 优先于默认'),
+          )
+        : null,
       h(
         'div',
         { className: 'flex flex-wrap items-center gap-2' },
@@ -1131,11 +1425,11 @@ export function FocusFloatingClock() {
               'aria-pressed': active,
               onClick: () => {
                 setSound(saveFocusSoundPrefs({ builtin: b.key, dataUrl: '' }))
-                playBuiltin(b.key) // 选择即试听
+                playBuiltin(b.key) // 选择即试听（playBuiltin 内部会先停上一个）
               },
               className: cn(
-                'shrink-0 rounded-full border px-3 py-1.5 text-xs transition-colors hover:bg-zinc-50',
-                active && 'border-zinc-900 font-semibold',
+                'flex min-h-11 shrink-0 items-center rounded-full border px-4 text-sm transition-colors hover:bg-zinc-50',
+                active && 'border-zinc-900 bg-zinc-50 font-semibold',
               ),
             },
             b.label,
@@ -1145,8 +1439,8 @@ export function FocusFloatingClock() {
           'label',
           {
             className: cn(
-              'flex h-8 cursor-pointer items-center gap-1.5 rounded-full border px-3 text-xs font-medium transition-colors hover:bg-zinc-50',
-              sound.dataUrl && 'border-zinc-900 font-semibold',
+              'flex min-h-11 cursor-pointer items-center gap-1.5 rounded-full border px-4 text-sm font-medium transition-colors hover:bg-zinc-50',
+              sound.dataUrl && 'border-zinc-900 bg-zinc-50 font-semibold',
             ),
           },
           h(Upload, { className: 'size-3.5 text-zinc-500' }),
@@ -1164,7 +1458,7 @@ export function FocusFloatingClock() {
             type: 'button',
             onClick: () => playFocusBell(),
             className:
-              'flex h-8 items-center rounded-full border px-3 text-xs font-medium transition-colors hover:bg-zinc-50',
+              'flex min-h-11 items-center rounded-full border px-4 text-sm font-medium transition-colors hover:bg-zinc-50',
           },
           '试听',
         ),
@@ -1178,12 +1472,18 @@ export function FocusFloatingClock() {
                 toast.success('已恢复内置铃声')
               },
               className:
-                'flex h-8 items-center rounded-full border px-3 text-xs font-medium transition-colors hover:bg-zinc-50',
+                'flex min-h-11 items-center rounded-full border px-4 text-sm font-medium transition-colors hover:bg-zinc-50',
             },
             '恢复默认',
           ),
       ),
+      h(
+        'p',
+        { className: 'text-xs text-zinc-400' },
+        '专注到点时默认播放；开始专注前也可单独选择本次铃声',
+      ),
     )
+  }
 
   // 空闲且无弹窗时完全不渲染（服务端首帧也返回 null，避免 hydration 不匹配）
   if (!st.running && !detailOpen && !timeUp) return null
@@ -1233,7 +1533,14 @@ export function FocusFloatingClock() {
 
   const detailDialog = h(
     Dialog,
-    { key: 'detail', open: detailOpen, onOpenChange: (o: boolean) => setDetailOpen(o) },
+    {
+      key: 'detail',
+      open: detailOpen,
+      onOpenChange: (o: boolean) => {
+        setDetailOpen(o)
+        if (!o) stopBellPreview() // 关弹窗即停试听
+      },
+    },
     h(
       DialogContent,
       { className: 'max-w-sm rounded-2xl' },
@@ -1355,7 +1662,10 @@ export function FocusFloatingClock() {
       key: 'timeup',
       open: timeUp !== null,
       onOpenChange: (o: boolean) => {
-        if (!o) setTimeUp(null)
+        if (!o) {
+          setTimeUp(null)
+          stopBellPreview()
+        }
       },
     },
     h(
@@ -1381,7 +1691,8 @@ export function FocusFloatingClock() {
           'button',
           {
             type: 'button',
-            onClick: () => playFocusBell(),
+            // 重播本次会话实际响的铃声（无会话覆盖时与原行为一致：播默认铃声）
+            onClick: () => previewSessionBell(timeUp ? (timeUp.bell ?? null) : null),
             className:
               'flex h-11 items-center justify-center gap-2 rounded-full bg-zinc-900 text-sm font-medium text-white transition-colors hover:bg-zinc-800',
           },

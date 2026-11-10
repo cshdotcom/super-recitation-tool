@@ -226,6 +226,48 @@ export default function Page() {
   const [chatSidebarOpen, setChatSidebarOpen] = React.useState(false)
   const [activeConvId, setActiveConvId] = React.useState<string | null>(null)
 
+  // 主对话「AI问问」：登录后 ensure-main（不存在则创建，isMain/pinned/ord=-1000000），
+  // activeConvId 为空时默认绑定主对话 —— 用户未选其他对话时，主页 AI问问 发出的
+  // 消息进入主对话（仅可清空消息，不可删除/改名/整对话分享）。
+  const mainConvEnsuredRef = React.useRef(false)
+  React.useEffect(() => {
+    if (!authed || mainConvEnsuredRef.current) return
+    mainConvEnsuredRef.current = true
+    void (async () => {
+      try {
+        const res = await fetch('/api/conversations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'ensure-main' }),
+        })
+        if (!res.ok) return
+        const data = (await res.json()) as { conversation?: { id?: string } }
+        const id = data.conversation?.id
+        if (id) setActiveConvId((prev) => prev ?? id)
+      } catch {
+        /* 静默：主对话创建失败不影响其他功能 */
+      }
+    })()
+  }, [authed])
+
+  // 分享页「追问」跳转：/?conv=<id> → 打开该对话（地址栏参数消费后清除）
+  React.useEffect(() => {
+    try {
+      const u = new URL(window.location.href)
+      const convId = u.searchParams.get('conv')
+      if (convId) {
+        setActiveConvId(convId)
+        setChatSidebarOpen(false)
+        setChatRootOpen(true)
+        u.searchParams.delete('conv')
+        const qs = u.searchParams.toString()
+        window.history.replaceState(null, '', u.pathname + (qs ? `?${qs}` : ''))
+      }
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
   const saveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // ---------- initial data load (cards + settings + projects) ----------

@@ -347,3 +347,126 @@ export function extractQuestionObjects(raw: string): unknown[] {
   }
   return out
 }
+
+// ---------- 富媒体代码生成（/api/media-ai：编辑器 AI 助理 / AI 修复） ----------
+
+export type MediaCodegenKind = 'mermaid' | 'svg' | 'table' | 'formula' | 'code'
+
+export interface MediaCodegenHistoryItem {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+export interface MediaCodegenParams {
+  kind: MediaCodegenKind
+  /** 现有代码：空 = 从零生成；非空 = 在其基础上按指令修改 */
+  currentCode: string
+  instruction: string
+  /** 最近对话（用户指令 + AI 代码），最多 20 条 */
+  history?: MediaCodegenHistoryItem[]
+}
+
+const MEDIA_KIND_DESC: Record<MediaCodegenKind, string> = {
+  mermaid: 'mermaid 图表源码（mindmap 思维导图 或 graph/flowchart 流程图/树状图）',
+  svg: 'SVG 图形源码（单个 <svg>…</svg>，禁止 <script> 与 on* 事件）',
+  table: 'markdown 表格源码（| 表头 | … |，含 |---| 分隔行）',
+  formula: 'LaTeX 公式源码（不含 $$ / $ 定界符，可用 \\ce{} 化学式）',
+  code: '纯代码内容（不带 markdown 围栏）',
+}
+
+/** 剥掉 LLM 回复中常见的 markdown 围栏（```lang\n…```），返回纯代码。 */
+export function stripCodeFence(text: string): string {
+  let t = (text || '').trim()
+  if (!t) return ''
+  // 1) 完整围栏整体包裹：```lang\n…\n``` → 直接取内容
+  const full = t.match(/^```[A-Za-z0-9_-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```[ \t]*$/)
+  if (full) return full[1].replace(/\s+$/, '')
+  // 2) 前后带解释文字、代码在围栏里：取第一个围栏块的内容
+  const anyFence = t.match(/```[A-Za-z0-9_-]*[ \t]*\r?\n([\s\S]*?)\r?\n?```/)
+  if (anyFence && anyFence[1].trim() !== '') return anyFence[1].replace(/\s+$/, '')
+  // 3) 只开不闭：```lang\n…
+  const open = t.match(/^```[A-Za-z0-9_-]*[ \t]*\r?\n([\s\S]*)$/)
+  if (open) t = open[1]
+  // 4) 散落的首尾围栏行
+  t = t.replace(/^```[A-Za-z0-9_-]*[ \t]*\r?\n?/, '').replace(/\r?\n?```[ \t]*$/, '')
+  return t.trim() !== '' ? t : (text || '').trim()
+}
+
+/**
+ * 富媒体代码生成/修改（供 /api/media-ai 调用）。
+ * 提示词强制「只返回完整最终代码」，服务端再剥一次围栏兜底；
+ * 超时控制由调用方（route）用 Promise.race 实现。
+ */
+export async function mediaCodegen(
+  params: MediaCodegenParams,
+  config?: AIConfig,
+): Promise<string> {
+  const kind = params.kind
+  const currentCode = (params.currentCode || '').trim()
+  const instruction = (params.instruction || '').trim() || '生成一段示例代码'
+  const history = (params.history || [])
+    .filter(
+      (m) =>
+        !!m &&
+        (m.role === 'user' || m.role === 'assistant') &&
+        typeof m.content === 'string' &&
+        m.content.trim() !== '',
+    )
+    .slice(-20)
+    .map((m) => ({ role: m.role, content: m.content.slice(0, 12000) }))
+  const isEdit = currentCode !== ''
+
+  const sys = `你是背诵学习应用的富媒体代码助手，当前任务类型：${MEDIA_KIND_DESC[kind]}。
+要求：
+- ${
+    isEdit
+      ? '用户给出了现有代码：在保留其主体结构与内容的前提下，按用户指令做最小必要修改，不要大幅重写。'
+      : '用户没有现成代码：按用户指令从零生成完整代码。'
+  }
+- 只返回最终的完整代码本身：不要任何解释、说明、前后缀文字，不要用代码围栏（\`\`\`）包裹。${
+    kind === 'mermaid'
+      ? '\n- 输出合法 mermaid 源码，第一行必须是 mindmap 或 graph TD/TB/LR/RL/BT 或 flowchart TD/TB/LR/RL/BT 声明。'
+      : ''
+  }${
+    kind === 'svg'
+      ? '\n- 输出单个完整 <svg xmlns="http://www.w3.org/2000/svg" viewBox="…" …>…</svg>，图形布局清晰、大小适中（viewBox 约 600x400）。'
+      : ''
+  }${
+    kind === 'table'
+      ? '\n- 输出 markdown 表格：首行表头、第二行 | --- | 分隔行，之后每行一个数据行。'
+      : ''
+  }${
+    kind === 'formula'
+      ? '\n- 输出纯 LaTeX 公式源码，绝不包含 $$ 或 $ 定界符。'
+      : ''
+  }${
+    kind === 'code'
+      ? '\n- 输出纯代码内容本身（不带围栏、不带语言标注）。'
+      : ''
+  }
+- 内容文字使用中文（代码关键字除外）。`
+
+  const userMsg = `${isEdit ? `【现有代码】\n${currentCode.slice(0, 12000)}\n\n` : ''}【指令】\n${instruction.slice(0, 4000)}`
+
+  const reply = await chatComplete(
+    [
+      { role: 'system', content: sys },
+      ...history,
+      { role: 'user', content: userMsg },
+    ],
+    config,
+  )
+
+  let code = stripCodeFence(reply || '')
+  if (kind === 'formula') {
+    code = code
+      .replace(/^\$\$([\s\S]*?)\$\$\s*$/, '$1')
+      .replace(/^\$([\s\S]*?)\$\s*$/, '$1')
+      .trim()
+  }
+  if (kind === 'svg') {
+    const m = code.match(/<svg[\s\S]*<\/svg\s*>/i)
+    if (m) code = m[0]
+  }
+  return code
+}

@@ -2,7 +2,8 @@
 // GET    /api/conversations/:id -> { conversation, messages }
 // PATCH  /api/conversations/:id { title?, pinned?, type?, autoRename?: true }
 //        autoRename=true 时由服务端调用 AI 依据首条用户消息生成标题
-// DELETE /api/conversations/:id （连同消息级联删除）
+//        主对话（isMain）不可改名（title / autoRename 返回 400）
+// DELETE /api/conversations/:id （连同消息级联删除；主对话返回 400）
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAccount } from '@/lib/auth'
@@ -54,6 +55,10 @@ export async function PATCH(
     const conv = await db.conversation.findUnique({ where: { id } })
     if (!conv) return NextResponse.json({ error: '对话不存在' }, { status: 404 })
     const body = await req.json().catch(() => ({}))
+    // 主对话不可改名（含 AI 智能重命名；仅允许置顶/类型调整）
+    if (conv.isMain && (typeof body?.title === 'string' || body?.autoRename === true)) {
+      return NextResponse.json({ error: '主对话不可改名' }, { status: 400 })
+    }
     const data: { title?: string; pinned?: boolean; type?: string; updatedAt: Date } = {
       updatedAt: new Date(),
     }
@@ -104,6 +109,10 @@ export async function DELETE(
   if (!account) return NextResponse.json({ error: '未登录' }, { status: 401 })
   try {
     const { id } = await params
+    const conv = await db.conversation.findUnique({ where: { id }, select: { isMain: true } })
+    if (conv?.isMain) {
+      return NextResponse.json({ error: '主对话不可删除' }, { status: 400 })
+    }
     await db.chatMessage.deleteMany({ where: { conversationId: id } })
     await db.conversation.delete({ where: { id } })
     return NextResponse.json({ ok: true })

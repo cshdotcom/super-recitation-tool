@@ -274,6 +274,8 @@ export interface SettingsData {
   quizAutoRemove: 1 | 2 | 3 | 5
   /** 导入时是否开启 AI 自动挖空 */
   aiAutoCloze: boolean
+  /** AI 出题完成后自动存入试卷夹（默认开） */
+  quizAutoPaper: boolean
   /** AI 对话全局配置（服务端持久化，多端同步） */
   aiSystemPrompt: string
   aiRules: string

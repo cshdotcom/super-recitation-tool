@@ -266,3 +266,289 @@ export function downloadMedia(ref: MediaRef): void {
   a.click()
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
+
+// ---------- 下载（无完整 MediaRef 场景：RichContent 详情态等） ----------
+
+/** 触发下载（按类型 + 源码直出；RichContent 内嵌媒体块没有完整 MediaRef，用此入口）。 */
+export function downloadMediaSrc(kind: MediaKind, src: string, lang = ''): void {
+  downloadMedia({ kind, raw: '', src, alt: '', lang, start: 0, end: 0 })
+}
+
+// ---------- mermaid flowchart（graph / flowchart）⇄ 节点/连线 ----------
+
+export type FlowDir = 'TD' | 'TB' | 'LR' | 'RL' | 'BT'
+export type FlowShape = 'rect' | 'round' | 'diamond' | 'circle'
+/** 连线样式（重建时保留；缺省 '-->'） */
+export type FlowLinkStyle = '-->' | '---' | '-.->' | '==>'
+
+export interface FlowNode {
+  id: string
+  label: string
+  /** 节点形状（重建时保留；缺省 rect 方块） */
+  shape?: FlowShape
+}
+
+export interface FlowEdge {
+  from: string
+  to: string
+  /** 连线文字（可省略） */
+  label?: string
+  /** 连线样式（可省略，默认 '-->'） */
+  style?: FlowLinkStyle
+}
+
+export interface FlowGraph {
+  nodes: FlowNode[]
+  edges: FlowEdge[]
+  dir: FlowDir
+}
+
+/** 拆节点 token（如 `A[开始]` / `B{判断}` / `C`）→ id + 标签 + 形状；不认识返回 null。 */
+function parseFlowNodeToken(tok: string): { id: string; label: string; shape: FlowShape } | null {
+  let i = 0
+  while (i < tok.length && /[\w\u4e00-\u9fff]/.test(tok[i])) i++
+  const id = tok.slice(0, i)
+  if (!id) return null
+  const rest = tok.slice(i)
+  const inner = (s: string) => s.replace(/\s+/g, ' ').trim() || id
+  if (rest.startsWith('((')) {
+    const m = rest.match(/^\(\(([\s\S]*)\)\)$/)
+    if (m) return { id, label: inner(m[1]), shape: 'circle' }
+  }
+  if (rest.startsWith('[')) {
+    const m = rest.match(/^\[([\s\S]*)\]$/)
+    if (m) return { id, label: inner(m[1]), shape: 'rect' }
+  }
+  if (rest.startsWith('(')) {
+    const m = rest.match(/^\(([\s\S]*)\)$/)
+    if (m) return { id, label: inner(m[1]), shape: 'round' }
+  }
+  if (rest.startsWith('{')) {
+    const m = rest.match(/^\{([\s\S]*)\}$/)
+    if (m) return { id, label: inner(m[1]), shape: 'diamond' }
+  }
+  if (rest === '') return { id, label: id, shape: 'rect' }
+  return null
+}
+
+interface FlowToken {
+  node?: string
+  edge?: { label?: string; style: FlowLinkStyle }
+}
+
+/** 箭头收尾形式（长在前短在后，保证贪心匹配） */
+const FLOW_CLOSER_RE =
+  /^(?:-{2,}>|-\.+->|-\.->|={2,}>|-->|==>|\.->|-{3,}|-{2,}|-\.-|-\.|={2,}|\.-)/
+
+/** 把箭头片段归类为 4 种受支持样式；无法归类返回 null。 */
+function flowLinkStyle(arrowText: string): FlowLinkStyle | null {
+  if (!arrowText || !/^[-=.]/
+    .test(arrowText)) return null
+  if (/^=/.test(arrowText)) return '==>'
+  if (/\./.test(arrowText)) return '-.->'
+  if (/>$/.test(arrowText.trim())) return '-->'
+  return '---'
+}
+
+/**
+ * 扫描一行 flowchart 语句，切成 节点 / 连线 交替的 token 序列。
+ * 支持：A-->B、A--文字-->B、A---B、A-->|文字|B、A-.->B、A==>B、链式 A-->B-->C。
+ * 不认识的语法返回 null（上层退回源码模式，绝不丢内容）。
+ */
+function scanFlowLine(line: string): FlowToken[] | null {
+  const toks: FlowToken[] = []
+  let i = 0
+  const n = line.length
+  let expectNode = true
+  while (i < n) {
+    const ch = line[i]
+    if (ch === ' ' || ch === '\t') {
+      i++
+      continue
+    }
+    if (expectNode) {
+      let j = i
+      while (j < n && /[\w\u4e00-\u9fff]/.test(line[j])) j++
+      if (j === i) return null
+      const open = line[j]
+      if (open === '[' || open === '(' || open === '{') {
+        const close = open === '[' ? ']' : open === '(' ? ')' : '}'
+        let depth = 0
+        let end = -1
+        for (let k = j; k < n; k++) {
+          if (line[k] === open) depth++
+          else if (line[k] === close) {
+            depth--
+            if (depth === 0) {
+              end = k
+              break
+            }
+          }
+        }
+        if (end === -1) return null
+        j = end + 1
+      }
+      toks.push({ node: line.slice(i, j) })
+      i = j
+      expectNode = false
+      continue
+    }
+    // ---- 连线段：[-=.] 开头的箭头序列 ----
+    let j = i
+    while (j < n && (line[j] === '-' || line[j] === '=' || line[j] === '.')) j++
+    let seg = line.slice(i, j)
+    if (!seg) return null
+    if (j < n && line[j] === '>') {
+      seg += '>'
+      j++
+    }
+    let label: string | undefined
+    // 形如 `-- 文字 -->` / `== 文字 ==>` / `-. 文字 .->`：开头是无 > 的箭头、后面跟文字再接收尾箭头
+    const opener = seg.replace(/>$/, '')
+    if (!seg.endsWith('>') && /^(-{2,}|={2,}|-\.+)$/.test(opener)) {
+      const rest = line.slice(j)
+      const m = rest.match(/^([^-=|>.]*?)\s*(-{2,}>|-\.+->|-\.->|={2,}>|-->|==>|\.->|-{3,}|-{2,}|-\.-|-\.|={2,}|\.-)/)
+      if (m && m[2]) {
+        label = m[1].trim() || undefined
+        j += m[0].length
+        seg = line.slice(i, j)
+      }
+    }
+    // `-->|文字|` / `---|文字|` 形式
+    if (j < n && line[j] === '|') {
+      const close = line.indexOf('|', j + 1)
+      if (close === -1) return null
+      label = line.slice(j + 1, close).trim() || undefined
+      j = close + 1
+    }
+    const style = flowLinkStyle(seg)
+    if (!style) return null
+    toks.push({ edge: { label, style } })
+    i = j
+    expectNode = true
+  }
+  if (expectNode) return null // 行尾必须落在节点上
+  return toks
+}
+
+/**
+ * mermaid graph/flowchart 源码 → 节点 + 连线（解析失败返回 null → 编辑器退回源码模式）。
+ * 遇到 subgraph / classDef / style 等无法结构化表达的指令时保守返回 null。
+ */
+export function parseFlow(raw: string): FlowGraph | null {
+  if (!raw) return null
+  const lines = raw.split(/\r?\n/)
+  let declIdx = -1
+  let dir: FlowDir = 'TD'
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim()
+    if (!t || t.startsWith('%%')) continue
+    const m = t.match(/^(?:graph|flowchart)[ \t]+(TD|TB|LR|RL|BT)\s*$/i)
+    if (m) {
+      declIdx = i
+      dir = m[1].toUpperCase() as FlowDir
+      break
+    }
+    return null // 首个有效行不是 graph/flowchart 声明 → 不是流程图
+  }
+  if (declIdx === -1) return null
+
+  const nodes = new Map<string, FlowNode>()
+  const edges: FlowEdge[] = []
+  const register = (tok: string): FlowNode | null => {
+    const p = parseFlowNodeToken(tok)
+    if (!p) return null
+    const existing = nodes.get(p.id)
+    if (existing) {
+      // 首次出现的形状标签优先；后续裸 id 复用首见信息
+      if (p.label !== p.id && existing.label === existing.id) {
+        const merged = { ...existing, label: p.label, shape: p.shape }
+        nodes.set(p.id, merged)
+        return merged
+      }
+      return existing
+    }
+    const node: FlowNode = { id: p.id, label: p.label, shape: p.shape }
+    nodes.set(p.id, node)
+    return node
+  }
+
+  for (let i = declIdx + 1; i < lines.length; i++) {
+    const t = lines[i].trim()
+    if (!t || t.startsWith('%%')) continue
+    if (/^(subgraph|end|classDef|class|style|linkStyle|click|direction)\b/i.test(t)) return null
+    const toks = scanFlowLine(t)
+    if (!toks) return null
+    const nodeToks: string[] = []
+    const edgeToks: NonNullable<FlowToken['edge']>[] = []
+    for (const tok of toks) {
+      if (tok.node) nodeToks.push(tok.node)
+      else if (tok.edge) edgeToks.push(tok.edge)
+    }
+    if (nodeToks.length === 0) return null
+    if (edgeToks.length !== nodeToks.length - 1) return null
+    if (edgeToks.length === 0) {
+      if (!register(nodeToks[0])) return null
+      continue
+    }
+    for (let k = 0; k < edgeToks.length; k++) {
+      const a = register(nodeToks[k])
+      const b = register(nodeToks[k + 1])
+      if (!a || !b) return null
+      edges.push({ from: a.id, to: b.id, label: edgeToks[k].label, style: edgeToks[k].style })
+    }
+  }
+  if (nodes.size === 0) return null
+  return { nodes: Array.from(nodes.values()), edges, dir }
+}
+
+/** 节点/连线 → 合法 mermaid graph 源码（标签中的括号/竖线转全角，保证语法合法）。 */
+export function buildFlow(nodes: FlowNode[], edges: FlowEdge[], dir: FlowDir = 'TD'): string {
+  const FULLWIDTH: Record<string, string> = {
+    '|': '｜',
+    '[': '［',
+    ']': '］',
+    '{': '｛',
+    '}': '｝',
+    '(': '（',
+    ')': '）',
+  }
+  const esc = (s: string) =>
+    (s || '')
+      .replace(/[|[\]{}()]/g, (c) => FULLWIDTH[c] ?? c)
+      .replace(/\s+/g, ' ')
+      .trim()
+  const wrap = (n: FlowNode) => {
+    const label = esc(n.label) || n.id
+    switch (n.shape) {
+      case 'round':
+        return `${n.id}(${label})`
+      case 'diamond':
+        return `${n.id}{${label}}`
+      case 'circle':
+        return `${n.id}((${label}))`
+      default:
+        return `${n.id}[${label}]`
+    }
+  }
+  const nodeById = new Map(nodes.map((n) => [n.id, n]))
+  const arrow = (e: FlowEdge) => {
+    const style = e.style ?? '-->'
+    const label = e.label ? esc(e.label) : ''
+    return label ? `${style}|${label}|` : style
+  }
+  const lines = [`graph ${dir}`]
+  const used = new Set<string>()
+  for (const e of edges) {
+    const a = nodeById.get(e.from)
+    const b = nodeById.get(e.to)
+    if (!a || !b) continue
+    used.add(a.id)
+    used.add(b.id)
+    lines.push(`  ${wrap(a)} ${arrow(e)} ${wrap(b)}`)
+  }
+  for (const n of nodes) {
+    if (!used.has(n.id)) lines.push(`  ${wrap(n)}`)
+  }
+  return lines.join('\n')
+}

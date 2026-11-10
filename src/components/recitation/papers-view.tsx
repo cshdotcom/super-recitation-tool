@@ -6,10 +6,11 @@
 //   • 按书本独立：顶部书本切换（当前书 / 全部书 / 其他书 — cards prop 或 GET /api/cards）
 //   • 时间轴浏览：按日期分组（今天 / 昨天 / 本周 / 更早）
 //   • 搜索：过滤试卷标题 + items[].question 题目内容
-//   • 排序：最新创建 / 最早创建 / 题数最多
+//   • 排序：创建时间 / 标题 / 题数 × 正序/倒序（偏好存 localStorage）
 //   • 日期筛选：全部 / 近7天 / 近30天 / 近90天
 //   • 批量管理：复选框模式 — 全选 / 批量删除（确认）/ 批量导出（合并 Markdown）
 //   • 试卷详情：内联展开，RichContent 渲染每题（题干+选项+答案，富媒体绝不溢出）
+//     每题可勾选；全选/反选 + AI 智能勾选（/api/chat mode:'pick'）+ 练习所选；
 //     「开始练习」→ onPractice(items, title) 由宿主接入答题流程；导出单份 MD / TXT
 //
 // API（src/app/api/papers/route.ts）：
@@ -30,6 +31,7 @@ import {
   Pencil,
   Play,
   Search,
+  Sparkles,
   Square,
   Trash2,
 } from 'lucide-react'
@@ -61,6 +63,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import {
@@ -126,12 +129,48 @@ function sourceLabel(s: string): string {
   return SOURCE_LABEL[s] ?? '手动'
 }
 
-const SORT_OPTIONS = [
-  { key: 'new', label: '最新创建' },
-  { key: 'old', label: '最早创建' },
-  { key: 'count', label: '题数最多' },
-] as const
-type SortKey = (typeof SORT_OPTIONS)[number]['key']
+// ---------- 排序偏好（与 chat-sidebar 同款：key × 正序/倒序，存 localStorage） ----------
+type SortKey = 'created' | 'title' | 'count'
+type SortDir = 'asc' | 'desc'
+
+interface SortPref {
+  key: SortKey
+  dir: SortDir
+}
+
+const SORT_PREF_KEY = 'bs:papers-sort'
+/** 默认：创建时间 + 倒序（与历史「最新创建」行为一致）。 */
+const DEFAULT_SORT: SortPref = { key: 'created', dir: 'desc' }
+
+const SORT_KEY_OPTIONS: { value: SortKey; label: string }[] = [
+  { value: 'created', label: '创建时间' },
+  { value: 'title', label: '标题' },
+  { value: 'count', label: '题数' },
+]
+
+const SORT_DIR_HINT: Record<SortKey, { asc: string; desc: string }> = {
+  created: { asc: '旧→新', desc: '新→旧' },
+  title: { asc: 'A→Z', desc: 'Z→A' },
+  count: { asc: '少→多', desc: '多→少' },
+}
+
+function loadSortPref(): SortPref {
+  try {
+    const raw = window.localStorage.getItem(SORT_PREF_KEY)
+    if (raw) {
+      const p = JSON.parse(raw) as Partial<SortPref>
+      if (
+        (p.key === 'created' || p.key === 'title' || p.key === 'count') &&
+        (p.dir === 'asc' || p.dir === 'desc')
+      ) {
+        return { key: p.key, dir: p.dir }
+      }
+    }
+  } catch {
+    /* 损坏则用默认 */
+  }
+  return DEFAULT_SORT
+}
 
 const DATE_OPTIONS = [
   { key: 'all', label: '全部时间' },
@@ -243,7 +282,7 @@ export function PapersView({
   // ---- 视图状态 ----
   const [bookId, setBookId] = React.useState<string>(cardId || 'all')
   const [search, setSearch] = React.useState('')
-  const [sortBy, setSortBy] = React.useState<SortKey>('new')
+  const [sortPref, setSortPref] = React.useState<SortPref>(DEFAULT_SORT)
   const [dateRange, setDateRange] = React.useState<DateKey>('all')
   const [manageMode, setManageMode] = React.useState(false)
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
@@ -259,6 +298,18 @@ export function PapersView({
   React.useEffect(() => {
     setBookId(cardId || 'all')
   }, [cardId])
+
+  // 排序偏好：挂载读取 localStorage，变化时写回（先读后写，避免默认值覆盖存量）
+  React.useEffect(() => {
+    setSortPref(loadSortPref())
+  }, [])
+  React.useEffect(() => {
+    try {
+      window.localStorage.setItem(SORT_PREF_KEY, JSON.stringify(sortPref))
+    } catch {
+      /* 隐私模式忽略 */
+    }
+  }, [sortPref])
 
   React.useEffect(() => {
     if (cardsProp) setCardList(cardsProp)
@@ -323,15 +374,37 @@ export function PapersView({
       return (p.items ?? []).some((it) => (it?.question ?? '').toLowerCase().includes(q))
     })
     list = [...list]
-    if (sortBy === 'old') list.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-    else if (sortBy === 'count') list.sort((a, b) => b.count - a.count)
-    else list.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    switch (sortPref.key) {
+      case 'title': {
+        const cmp = (a: PaperData, b: PaperData) =>
+          a.title.localeCompare(b.title, 'zh-Hans-CN') || a.createdAt.localeCompare(b.createdAt)
+        list.sort(cmp)
+        if (sortPref.dir === 'desc') list.reverse()
+        break
+      }
+      case 'count': {
+        const cmp = (a: PaperData, b: PaperData) =>
+          a.count - b.count || b.createdAt.localeCompare(a.createdAt)
+        list.sort(cmp)
+        if (sortPref.dir === 'desc') list.reverse()
+        break
+      }
+      case 'created':
+      default: {
+        const cmp = (a: PaperData, b: PaperData) =>
+          a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)
+        list.sort(cmp)
+        if (sortPref.dir === 'desc') list.reverse()
+        break
+      }
+    }
     return list
-  }, [papers, search, sortBy, dateRange])
+  }, [papers, search, sortPref, dateRange])
 
-  // 时间轴分组（仅「最新创建」排序时分组展示，其他排序平铺）
+  // 时间轴分组（仅「创建时间·倒序」时分组展示，其他排序平铺）
   const groups = React.useMemo(() => {
-    if (sortBy !== 'new') return [{ bucket: null as Bucket | null, list: filtered }]
+    if (!(sortPref.key === 'created' && sortPref.dir === 'desc'))
+      return [{ bucket: null as Bucket | null, list: filtered }]
     const map = new Map<Bucket, PaperData[]>()
     for (const p of filtered) {
       const b = dateBucket(p.createdAt)
@@ -339,7 +412,7 @@ export function PapersView({
       map.get(b)!.push(p)
     }
     return BUCKET_ORDER.filter((b) => map.has(b)).map((b) => ({ bucket: b, list: map.get(b)! }))
-  }, [filtered, sortBy])
+  }, [filtered, sortPref])
 
   // ---- 批量 ----
   const allSelected = filtered.length > 0 && filtered.every((p) => selected.has(p.id))
@@ -465,7 +538,9 @@ export function PapersView({
       : (cardList.find((c) => c.id === bookId)?.title ?? (bookId === cardId ? cardTitle : '未知书本'))
   const otherBooks = cardList.filter((c) => c.id !== bookId && c.id !== cardId)
 
-  const sortLabel = SORT_OPTIONS.find((s) => s.key === sortBy)?.label ?? '最新创建'
+  const sortLabel = `${SORT_KEY_OPTIONS.find((s) => s.value === sortPref.key)?.label ?? '创建时间'} · ${
+    sortPref.dir === 'asc' ? '正序' : '倒序'
+  }`
   const dateLabel = DATE_OPTIONS.find((d) => d.key === dateRange)?.label ?? '全部时间'
 
   return (
@@ -549,16 +624,47 @@ export function PapersView({
                   <span>{sortLabel}</span>
                 </button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent align="start">
-                {SORT_OPTIONS.map((s) => (
+              <DropdownMenuContent align="start" className="w-44">
+                {SORT_KEY_OPTIONS.map((opt) => (
                   <DropdownMenuItem
-                    key={s.key}
-                    onClick={() => setSortBy(s.key)}
-                    className={cn(sortBy === s.key && 'font-bold text-red-500')}
+                    key={opt.value}
+                    onClick={() => setSortPref((p) => ({ ...p, key: opt.value }))}
                   >
-                    {s.label}
+                    <span className="flex size-4 items-center justify-center">
+                      {sortPref.key === opt.value ? (
+                        <Check className="size-4 text-emerald-600" />
+                      ) : null}
+                    </span>
+                    {opt.label}
                   </DropdownMenuItem>
                 ))}
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={() => setSortPref((p) => ({ ...p, dir: 'asc' }))}
+                >
+                  <span className="flex size-4 items-center justify-center">
+                    {sortPref.dir === 'asc' ? (
+                      <Check className="size-4 text-emerald-600" />
+                    ) : null}
+                  </span>
+                  正序
+                  <span className="ml-auto text-[10px] text-muted-foreground">
+                    {SORT_DIR_HINT[sortPref.key].asc}
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setSortPref((p) => ({ ...p, dir: 'desc' }))}
+                >
+                  <span className="flex size-4 items-center justify-center">
+                    {sortPref.dir === 'desc' ? (
+                      <Check className="size-4 text-emerald-600" />
+                    ) : null}
+                  </span>
+                  倒序
+                  <span className="ml-auto text-[10px] text-muted-foreground">
+                    {SORT_DIR_HINT[sortPref.key].desc}
+                  </span>
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
             <DropdownMenu>
@@ -636,7 +742,7 @@ export function PapersView({
                       canPractice={!!onPractice}
                       onToggleSelect={() => toggleSelect(p.id)}
                       onToggleExpand={() => setExpandedId(expandedId === p.id ? null : p.id)}
-                      onPractice={() => onPractice?.(p.items, p.title)}
+                      onPractice={(items) => onPractice?.(items ?? p.items, p.title)}
                       onExport={(fmt) => exportOne(p, fmt)}
                       onRename={() => setRenaming({ id: p.id, title: p.title })}
                       onDelete={() => setDeleteId(p.id)}
@@ -795,11 +901,69 @@ function PaperCard({
   canPractice: boolean
   onToggleSelect: () => void
   onToggleExpand: () => void
-  onPractice: () => void
+  /** 开始练习：不传 items = 全部题目；传入 = 只练勾选的题 */
+  onPractice: (items?: PaperItem[]) => void
   onExport: (fmt: 'md' | 'txt') => void
   onRename: () => void
   onDelete: () => void
 }) {
+  // ---- 题目勾选（练习所选 / AI 智能勾选；随试卷卡片 key 重建自动清空） ----
+  const items = paper.items ?? []
+  const [sel, setSel] = React.useState<Set<number>>(new Set())
+  const [aiPickBusy, setAiPickBusy] = React.useState(false)
+  const allSel = items.length > 0 && items.every((_, i) => sel.has(i))
+
+  const toggleSel = (i: number) => {
+    setSel((prev) => {
+      const next = new Set(prev)
+      if (next.has(i)) next.delete(i)
+      else next.add(i)
+      return next
+    })
+  }
+
+  const invertSel = () => setSel(new Set(items.map((_, i) => i).filter((i) => !sel.has(i))))
+
+  /** AI 智能勾选：把试卷题目发给 /api/chat mode:'pick'，挑最值得练的题（与错题本同款契约） */
+  const aiPick = async () => {
+    if (items.length === 0 || aiPickBusy) return
+    const count = Math.min(10, items.length)
+    setAiPickBusy(true)
+    const tid = toast.loading(`AI 正在挑选最值得练习的 ${count} 道题…`)
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'pick',
+          questions: items.map((it, i) => ({
+            question: it.question ?? '',
+            reason: `《${paper.title}》第${i + 1}题`,
+          })),
+          count,
+        }),
+      })
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(err.error || 'AI 勾选失败')
+      }
+      const data = (await res.json()) as { indices?: unknown }
+      const idxs = Array.isArray(data.indices)
+        ? data.indices.filter(
+            (n): n is number =>
+              typeof n === 'number' && Number.isInteger(n) && n >= 0 && n < items.length,
+          )
+        : []
+      if (idxs.length === 0) throw new Error('AI 未返回有效选择，请重试')
+      setSel(new Set(idxs))
+      toast.success(`AI 已勾选 ${idxs.length} 道题`, { id: tid })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'AI 勾选失败', { id: tid })
+    } finally {
+      setAiPickBusy(false)
+    }
+  }
+
   return (
     <div
       className={cn(
@@ -884,16 +1048,61 @@ function PaperCard({
         )}
       </div>
 
-      {/* 详情（内联展开）：题目列表 + 开始练习 + 导出 */}
+      {/* 详情（内联展开）：题目勾选 + 题目列表 + 练习/导出 */}
       {expanded && (
         <div className="border-t border-border px-4 py-3">
+          {/* 工具行：全选/反选 + AI 智能勾选 + 已选计数（有题时显示） */}
+          {items.length > 0 && (
+            <div className="mb-2 flex flex-wrap items-center gap-1.5 text-xs">
+              <button
+                type="button"
+                onClick={() => setSel(allSel ? new Set() : new Set(items.map((_, i) => i)))}
+                className="h-8 rounded-full border border-border bg-card px-3 font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                {allSel ? '取消全选' : '全选'}
+              </button>
+              <button
+                type="button"
+                onClick={invertSel}
+                className="h-8 rounded-full border border-border bg-card px-3 font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+              >
+                反选
+              </button>
+              <button
+                type="button"
+                onClick={() => void aiPick()}
+                disabled={aiPickBusy}
+                className="flex h-8 items-center gap-1 rounded-full border border-purple-500/40 px-3 font-medium text-purple-700 transition-colors hover:bg-purple-500/10 disabled:opacity-50 dark:text-purple-400"
+              >
+                {aiPickBusy ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <Sparkles className="size-3.5" />
+                )}
+                AI 智能勾选
+              </button>
+              <span className="ml-auto shrink-0 text-muted-foreground">
+                已选 {sel.size} / {items.length} 题
+              </span>
+            </div>
+          )}
           <div className="max-h-96 space-y-2.5 overflow-y-auto overscroll-contain">
-            {(paper.items ?? []).length === 0 ? (
+            {items.length === 0 ? (
               <p className="py-6 text-center text-sm text-muted-foreground">这份试卷没有题目</p>
             ) : (
-              paper.items.map((it, i) => (
+              items.map((it, i) => (
                 <div key={i} className="rounded-xl bg-muted/40 p-3">
                   <div className="mb-1.5 flex min-w-0 flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      role="checkbox"
+                      aria-checked={sel.has(i)}
+                      aria-label={`选择第${i + 1}题`}
+                      onClick={() => toggleSel(i)}
+                      className="-ml-1 flex size-8 shrink-0 items-center justify-center rounded-full transition-transform active:scale-90"
+                    >
+                      <RoundCheckbox checked={sel.has(i)} />
+                    </button>
                     <span className="text-xs font-semibold text-muted-foreground">第{i + 1}题</span>
                     <Badge variant="secondary" className="px-1.5 text-[10px]">
                       {TYPE_LABEL[it.type] ?? it.type ?? '题目'}
@@ -927,11 +1136,20 @@ function PaperCard({
           <div className="mt-3 flex flex-wrap gap-2">
             {canPractice && (
               <Button
-                onClick={onPractice}
-                disabled={(paper.items ?? []).length === 0}
+                onClick={() => onPractice()}
+                disabled={items.length === 0}
                 className="h-11 flex-1 rounded-full bg-zinc-900 text-sm font-semibold text-white hover:bg-zinc-800 disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900"
               >
                 <Play className="size-4" strokeWidth={2} /> 开始练习
+              </Button>
+            )}
+            {canPractice && (
+              <Button
+                onClick={() => onPractice(items.filter((_, i) => sel.has(i)))}
+                disabled={sel.size === 0}
+                className="h-11 flex-1 rounded-full bg-emerald-600 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-40"
+              >
+                <Play className="size-4" strokeWidth={2} /> 练习所选（{sel.size}）
               </Button>
             )}
             <Button
@@ -952,6 +1170,24 @@ function PaperCard({
         </div>
       )}
     </div>
+  )
+}
+
+// ---------- 黑色圆形勾选框（题目勾选，与错题本同款） ----------
+function RoundCheckbox({ checked }: { checked: boolean }) {
+  return (
+    <span
+      className={cn(
+        'flex size-5 shrink-0 items-center justify-center rounded-full border-2',
+        checked
+          ? 'border-zinc-900 bg-zinc-900 text-white dark:border-zinc-100 dark:bg-zinc-100 dark:text-zinc-900'
+          : 'border-zinc-400 bg-transparent text-transparent dark:border-zinc-600',
+      )}
+    >
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round" className="size-3" aria-hidden>
+        <path d="M20 6 9 17l-5-5" />
+      </svg>
+    </span>
   )
 }
 

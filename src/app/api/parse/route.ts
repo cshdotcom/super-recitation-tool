@@ -605,6 +605,8 @@ export async function POST(req: NextRequest) {
 
     const buffer = Buffer.from(await file.arrayBuffer())
     let content = ''
+    /** PDF 多引擎均失败时的真实报错（回传前端展示，不再吞掉） */
+    let pdfEngineErrors: string[] = []
 
     // 解析超时保护：文档类 25s / 图片 OCR 60s / 音频 ASR 120s，
     // 超时返回友好提示而非挂死/500
@@ -628,18 +630,37 @@ export async function POST(req: NextRequest) {
         return typeof text === 'string' ? text : String(text ?? '')
       }
       const tryPdfParse = async (): Promise<string> => {
-        const parser = new PDFParse({ data: new Uint8Array(buffer) })
+        // ⚠️ pdfjs 跨引擎全局 worker 隔离（两层问题）：
+        // 1) unpdf 内置 pdfjs 6.x，模块加载时无条件写 globalThis.pdfjsWorker；
+        //    pdf-parse（pdfjs-dist 5.x）优先读该全局 → 版本不匹配必然抛
+        //    "The API version 5.4.296 does not match the Worker version 6.4.299"。
+        // 2) 打包器（Turbopack/webpack）把 pdfjs-dist 打进 chunk 后，其内部
+        //    相对路径 import('pdf.worker.mjs') 兜底无法解析（chunk 目录下不存在）
+        //    → "Setting up fake worker failed: Cannot find module"。
+        // 修复：显式导入与 pdf-parse 配套的 pdfjs-dist 5.x worker 模块 ——
+        // 该模块求值时的顶层副作用会把 globalThis.pdfjsWorker 设为正确的
+        // 5.4.296 handler，pdf-parse 因此既不受 unpdf 污染、也不走坏掉的兜底。
+        // 结束后恢复原全局，保证 unpdf（6.x）继续正常工作。
+        const g = globalThis as { pdfjsWorker?: unknown }
+        const savedWorker = g.pdfjsWorker
+        let parser: InstanceType<typeof PDFParse> | null = null
         try {
+          // pdfjs-dist worker 模块（求值副作用即设置 globalThis.pdfjsWorker）
+          await import('pdfjs-dist/legacy/build/pdf.worker.mjs')
+          parser = new PDFParse({ data: new Uint8Array(buffer) })
           const result = await parser.getText({ pageJoiner: '\n\n' })
           return result?.text || ''
         } finally {
-          await parser.destroy().catch(() => {})
+          await parser?.destroy().catch(() => {})
+          if (savedWorker !== undefined) g.pdfjsWorker = savedWorker
+          else delete g.pdfjsWorker
         }
       }
-      // 质量检查：提取结果过短或乱码占比过高视为失败，继续下一个引擎
+      // 质量检查：提取结果过短或乱码占比过高视为失败，继续下一个引擎。
+      // \uFFFD（替换符）与 \u0000（NUL，部分 pdfjs 版本对 CJK 文档的假阳性输出）均计入乱码。
       const looksGood = (t: string): boolean => {
-        if (!t || t.trim().length < 8) return false
-        const bad = (t.match(/\uFFFD/g) || []).length
+        if (!t || t.trim().length < 2) return false
+        const bad = (t.match(/[\uFFFD\u0000]/g) || []).length
         return bad / t.length < 0.05
       }
 
@@ -674,6 +695,9 @@ export async function POST(req: NextRequest) {
       }
       if (!content && errors.length > 0) {
         console.error('[POST /api/parse] pdf engines failed:', errors.join(' | '))
+        // 错误不再只进服务端日志：把引擎真实报错回传给前端（截断防膨胀），
+        // 避免一律误导为「扫描版 PDF」
+        pdfEngineErrors = errors.map((e) => e.slice(0, 160))
       }
     } else if (kind === 'docx') {
       // 同时传 buffer（Node 版 unzip 用）+ arrayBuffer（browser-field 版 unzip 用）。
@@ -731,7 +755,16 @@ export async function POST(req: NextRequest) {
     content = tidyText(content)
     if (!content) {
       const hint = EMPTY_HINTS[kind] ?? '未能从文件中提取到文字（可能是空文档）'
-      return NextResponse.json({ error: hint }, { status: 422 })
+      return NextResponse.json(
+        {
+          error:
+            pdfEngineErrors.length > 0
+              ? `${hint}。引擎详情：${pdfEngineErrors.join('；').slice(0, 300)}`
+              : hint,
+          engineErrors: pdfEngineErrors.length > 0 ? pdfEngineErrors : undefined,
+        },
+        { status: 422 },
+      )
     }
 
     const title = deriveTitle(filename, content, kind)

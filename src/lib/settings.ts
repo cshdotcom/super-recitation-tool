@@ -38,6 +38,7 @@ export function parseSettings(row: {
   asrModel?: string | null
   quizAutoRemove?: number | null
   aiAutoCloze?: boolean | null
+  quizAutoPaper?: boolean | null
   aiSystemPrompt?: string | null
   aiRules?: string | null
   aiSelfThinking?: boolean | null
@@ -109,6 +110,8 @@ export function parseSettings(row: {
         ? (row.quizAutoRemove as 1 | 2 | 3 | 5)
         : 2,
     aiAutoCloze: !!row?.aiAutoCloze,
+    // AI 出题后自动存入试卷夹（默认开）
+    quizAutoPaper: row?.quizAutoPaper === undefined ? true : !!row.quizAutoPaper,
     aiSystemPrompt: row?.aiSystemPrompt ?? '',
     aiRules: row?.aiRules ?? '',
     aiSelfThinking: !!row?.aiSelfThinking,
