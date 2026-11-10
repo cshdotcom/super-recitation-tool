@@ -20,6 +20,7 @@ import {
   Repeat,
   Repeat1,
   Rewind,
+  Square,
   Star,
   Trash2,
   Volume2,
@@ -33,6 +34,7 @@ import { clampSpeed, SPEED_OPTIONS, saveVoicePref } from '@/lib/voice-prefs'
 import { splitSentences } from '@/lib/sentences'
 import { useLocalStorage } from '@/lib/use-local-storage'
 import { getState, putState } from '@/lib/server-state'
+import { getPlayback, hasMiniFab, reportProgress } from '@/lib/playback'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -174,6 +176,15 @@ export interface TtsPlayerProps {
   cardId?: string
   /** 关闭播放器：停止播放并清理后回调父级卸载本组件。 */
   onClose?: () => void
+  /** 受控收起态：true = 收起（迷你悬浮条/全局 MiniPlayerFab 接管，音频不中断）。
+   * 与外部 Sheet 的 open 联动（page 传入），修复收起后白色残块。 */
+  collapsed?: boolean
+  /** 收起态变化回调（内置收起/展开按钮触发，同步外部 Sheet 开合）。 */
+  onCollapsedChange?: (v: boolean) => void
+  /** 片段播放文本：提供时替代 text 作为朗读内容（待播放列表片段模式）。 */
+  fragmentText?: string
+  /** 全部分段播完（顺序模式到达末尾）时触发（自动连播用）。 */
+  onFinished?: () => void
 }
 
 /**
@@ -364,6 +375,10 @@ export function TtsPlayer({
   favoritesKey,
   cardId,
   onClose,
+  collapsed: collapsedProp,
+  onCollapsedChange,
+  fragmentText,
+  onFinished,
 }: TtsPlayerProps) {
   // Voice defaults for this context, captured once on mount.
   const [seeded] = React.useState(() => settings.voicePrefs?.[context]?.tts)
@@ -421,12 +436,16 @@ export function TtsPlayer({
   const voicesRef = React.useRef(voices)
 
   // ---- 句子与播放 ----
-  const sentences = React.useMemo(() => splitSentences(text), [text])
+  /** 实际朗读文本：片段播放（fragmentText）优先，否则整篇 text */
+  const sourceText = fragmentText ?? text
+  const sentences = React.useMemo(() => splitSentences(sourceText), [sourceText])
   const len = sentences.length
   const [sentenceIdx, setSentenceIdx] = React.useState(0)
   const sentenceIdxRef = React.useRef(0)
   /** 当前 <audio> 里加载的是第几句（-1 = 已播完/未加载，播放键需重新开始） */
   const loadedIdxRef = React.useRef(-1)
+  /** 本会话是否已真正开始过播放（避免挂载瞬间的空闲上报扑灭云端 playing 态） */
+  const hasPlayedRef = React.useRef(false)
   const [playMode, setPlayMode] = React.useState<PlayMode>('order')
   const playModeRef = React.useRef<PlayMode>('order')
   const itemRefs = React.useRef<Array<HTMLDivElement | null>>([])
@@ -497,10 +516,22 @@ export function TtsPlayer({
   React.useEffect(() => {
     onTimerEndRef.current = onTimerEnd
   }, [onTimerEnd])
+  const onFinishedRef = React.useRef(onFinished)
+  React.useEffect(() => {
+    onFinishedRef.current = onFinished
+  }, [onFinished])
 
   // ---- UI 状态 ----
   const [tab, setTab] = React.useState<'full' | 'hard'>('full')
-  const [collapsed, setCollapsed] = React.useState(false)
+  // 收起态：外部受控（page 传 collapsed 联动 Sheet 开合）优先，否则内部自管理。
+  // 修复「收起后白色残块」：内置收起按钮必须通过 onCollapsedChange 同步外部
+  // Sheet 的 open 状态，否则 Sheet 仍展开而内容只剩迷你条 → 空白面板。
+  const [collapsedInternal, setCollapsedInternal] = React.useState(false)
+  const collapsed = collapsedProp ?? collapsedInternal
+  const setCollapsedState = (v: boolean) => {
+    setCollapsedInternal(v)
+    onCollapsedChange?.(v)
+  }
   const [tocOpen, setTocOpen] = React.useState(false)
   const [mounted, setMounted] = React.useState(false)
   const [dragIdx, setDragIdx] = React.useState<number | null>(null)
@@ -538,7 +569,7 @@ export function TtsPlayer({
     voicesRef.current = voices
   }, [voices])
 
-  // Reset pointer & per-text audio cache when the text changes.
+  // Reset pointer & per-text audio cache when the effective text changes.
   React.useEffect(() => {
     // 作废在途合成请求，避免旧文本的音频回填到新文本会话
     genRef.current += 1
@@ -554,7 +585,7 @@ export function TtsPlayer({
     itemRefs.current = []
     for (const url of cacheRef.current.values()) URL.revokeObjectURL(url)
     cacheRef.current.clear()
-  }, [text])
+  }, [sourceText])
 
   const clearTimerIv = React.useCallback(() => {
     if (timerIvRef.current) {
@@ -610,6 +641,12 @@ export function TtsPlayer({
     if (typeof timerMinutes === 'number' && timerMinutes > 0) startTimer(timerMinutes)
   }, [timerMinutes, startTimer])
 
+  // cardId 的最新值引用（卸载清理闭包里读取，避免陈旧）
+  const cardIdRef = React.useRef(cardId)
+  React.useEffect(() => {
+    cardIdRef.current = cardId
+  }, [cardId])
+
   // Cleanup timers / speech / audio blob URLs on unmount.
   React.useEffect(() => {
     return () => {
@@ -619,6 +656,13 @@ export function TtsPlayer({
       window.speechSynthesis?.cancel()
       for (const url of cacheRef.current.values()) URL.revokeObjectURL(url)
       cacheRef.current.clear()
+      // 卸载时若本播放器就是全局会话且仍在播放 → 标记为暂停
+      //（fab 显示暂停态，而不是「假播放中」；fab 的 X 停止路径会先 playbackStop，不经过这里）
+      const st = getPlayback()
+      const cid = cardIdRef.current
+      if (st && cid && st.cardId === cid && st.playing) {
+        reportProgress({ cardId: cid, playing: false })
+      }
     }
   }, [clearTimerIv])
 
@@ -672,6 +716,20 @@ export function TtsPlayer({
   const moveTo = (idx: number) => {
     sentenceIdxRef.current = idx
     setSentenceIdx(idx)
+  }
+
+  /** 顺序模式播完整本：onFinished 回调 + 'app:ttsEnded' 广播（MiniPlayerFab 自动连播）。 */
+  const notifyFinished = () => {
+    onFinishedRef.current?.()
+    try {
+      window.dispatchEvent(
+        new CustomEvent('app:ttsEnded', {
+          detail: { cardId: cardId ?? '', segIndex: sentenceIdxRef.current },
+        }),
+      )
+    } catch {
+      /* ignore */
+    }
   }
 
   const cachePut = (key: string, url: string) => {
@@ -742,6 +800,9 @@ export function TtsPlayer({
             if (playModeRef.current === 'loop-all') {
               moveTo(0)
               speakSentenceBrowser(0)
+            } else {
+              // 顺序模式播完整本 → 通知自动连播
+              notifyFinished()
             }
             return
           }
@@ -771,6 +832,7 @@ export function TtsPlayer({
       return
     }
     moveTo(idx)
+    hasPlayedRef.current = true
     if (providerRef.current === 'browser') {
       speakSentenceBrowser(idx)
       return
@@ -844,6 +906,8 @@ export function TtsPlayer({
         playSentenceAt(0)
       } else {
         loadedIdxRef.current = -1
+        // 顺序模式播完整本 → 通知自动连播
+        notifyFinished()
       }
       return
     }
@@ -964,6 +1028,83 @@ export function TtsPlayer({
     onClose?.()
   }
 
+  // ---- 全局事件（MiniPlayerFab 迷你条控制） ----
+  const onCloseRef = React.useRef(onClose)
+  React.useEffect(() => {
+    onCloseRef.current = onClose
+  }, [onClose])
+  const mainToggleRef = React.useRef(handleMainToggle)
+  React.useEffect(() => {
+    mainToggleRef.current = handleMainToggle
+  })
+  React.useEffect(() => {
+    // fab 的 X：完全停止播放并关闭播放器（fab 侧已先 playbackStop 清全局会话）
+    const onStop = () => {
+      stopAllPlayback()
+      cancelTimer()
+      onCloseRef.current?.()
+    }
+    // fab 的 播放/暂停：仅当本播放器就是全局会话（或无全局会话）时响应
+    const onToggle = () => {
+      const st = getPlayback()
+      if (st && cardId && st.cardId !== cardId) return
+      mainToggleRef.current()
+    }
+    window.addEventListener('app:ttsStop', onStop)
+    window.addEventListener('app:ttsToggle', onToggle)
+    return () => {
+      window.removeEventListener('app:ttsStop', onStop)
+      window.removeEventListener('app:ttsToggle', onToggle)
+    }
+  }, [cardId, stopAllPlayback, cancelTimer])
+
+  // ---- 全局播放状态中心：恢复/接管 + 进度上报 ----
+  // 挂载或换内容时：若全局会话就是本书（fab 打开 / 自动连播换书 / 云端恢复），
+  // 跳到上次 segIndex；会话 playing 时 400ms 后自动续播。
+  React.useEffect(() => {
+    const st = getPlayback()
+    if (!st || !cardId || st.cardId !== cardId) return
+    const target = Math.min(Math.max(st.segIndex, 0), Math.max(len - 1, 0))
+    if (target > 0) moveTo(target)
+    if (st.playing) {
+      const t = setTimeout(() => {
+        hasPlayedRef.current = true
+        playSentenceAt(target)
+      }, 400)
+      return () => clearTimeout(t)
+    }
+  }, [cardId, sourceText])
+
+  // 切段/播放/暂停/换速/换音色 → 上报全局 store（云端推送由 playback.ts 节流处理）
+  React.useEffect(() => {
+    if (!cardId) return
+    // 挂载后尚未开始播放时不覆盖会话（避免把 fab 刚开启的 playing 态扑灭）
+    if (!hasPlayedRef.current && !isPlaying && !loading) return
+    reportProgress({
+      cardId,
+      cardTitle,
+      content: sourceText,
+      segIndex: sentenceIdx,
+      segTotal: len,
+      playing: isPlaying || loading,
+      speed,
+      voice: provider === 'browser' ? voiceURI : provider === 'custom' ? customVoice : voice,
+    })
+  }, [
+    cardId,
+    cardTitle,
+    sourceText,
+    sentenceIdx,
+    len,
+    isPlaying,
+    loading,
+    speed,
+    voice,
+    voiceURI,
+    customVoice,
+    provider,
+  ])
+
   const voiceShortLabel =
     provider === 'zai'
       ? TTS_VOICES.find((v) => v.value === voice)?.label.split('·')[0]?.trim() ?? '童童'
@@ -978,8 +1119,9 @@ export function TtsPlayer({
   const ModeIcon = PLAY_MODES.find((m) => m.value === playMode)?.icon ?? List
 
   // ---- 迷你悬浮条（收起态；portal 到 body，播放不中断） ----
+  // 全局 MiniPlayerFab 已挂载时由 fab 接管（避免双悬浮条），此处不再渲染。
   const miniBar =
-    collapsed && mounted ? (
+    collapsed && mounted && !hasMiniFab() ? (
       createPortal(
         <div className="fixed inset-x-3 bottom-[calc(0.75rem+env(safe-area-inset-bottom))] z-[70]">
           <style>{`@keyframes tts-marquee { 0% { transform: translateX(0); } 100% { transform: translateX(-50%); } }`}</style>
@@ -1004,7 +1146,7 @@ export function TtsPlayer({
             <button
               type="button"
               aria-label="展开播放器"
-              onClick={() => setCollapsed(false)}
+              onClick={() => setCollapsedState(false)}
               className="min-w-0 flex-1 overflow-hidden text-left"
             >
               {currentSentence.length > 18 && isPlaying ? (
@@ -1035,7 +1177,7 @@ export function TtsPlayer({
             <button
               type="button"
               aria-label="展开播放器"
-              onClick={() => setCollapsed(false)}
+              onClick={() => setCollapsedState(false)}
               className="flex size-8 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground"
             >
               <ChevronUp className="size-5" />
@@ -1080,7 +1222,7 @@ export function TtsPlayer({
               size="icon"
               className="size-9 shrink-0 rounded-full"
               aria-label="收起播放器"
-              onClick={() => setCollapsed(true)}
+              onClick={() => setCollapsedState(true)}
             >
               <ChevronDown className="size-5" strokeWidth={1.75} />
             </Button>
@@ -2243,4 +2385,239 @@ export function speakOnce(
       }
     })()
   })
+}
+
+// ---------------------------------------------------------------------------
+// SelectionReadPlayer — 选区朗读临时播放器。
+// reader-view 选择菜单「朗读」通过 window 事件 'sb-read-selection' 分发
+// { text }，这里逐句朗读选中文本，并以 'sb-read-selection-progress' 回报
+// { index, total, text, done, cancelled }；主播放器未打开/已收起时也能响应。
+// 播放中右下角显示悬浮停止按钮，取消即消失。
+// ---------------------------------------------------------------------------
+
+interface SbReadProgressPayload {
+  index: number
+  total: number
+  text: string
+  done: boolean
+  cancelled?: boolean
+}
+
+function emitReadProgress(p: SbReadProgressPayload): void {
+  try {
+    window.dispatchEvent(
+      new CustomEvent<SbReadProgressPayload>('sb-read-selection-progress', { detail: p }),
+    )
+  } catch {
+    /* ignore */
+  }
+}
+
+export function SelectionReadPlayer({
+  settings,
+  context = 'reader',
+}: {
+  settings: SettingsData
+  context?: string
+}) {
+  const [mounted, setMounted] = React.useState(false)
+  const [active, setActive] = React.useState(false)
+  const [progress, setProgress] = React.useState<{ index: number; total: number } | null>(null)
+  const audioRef = React.useRef<HTMLAudioElement | null>(null)
+  const urlRef = React.useRef<string | null>(null)
+  const genRef = React.useRef(0)
+  const voices = useBrowserVoices(active)
+  const voicesRef = React.useRef(voices)
+  React.useEffect(() => {
+    voicesRef.current = voices
+  }, [voices])
+
+  React.useEffect(() => {
+    setMounted(true)
+    return () => {
+      genRef.current += 1
+      try {
+        window.speechSynthesis?.cancel()
+      } catch {
+        /* ignore */
+      }
+      if (audioRef.current) audioRef.current.pause()
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current)
+    }
+  }, [])
+
+  const stop = React.useCallback((cancelled: boolean) => {
+    genRef.current += 1
+    try {
+      window.speechSynthesis?.cancel()
+    } catch {
+      /* ignore */
+    }
+    if (audioRef.current) {
+      audioRef.current.pause()
+      audioRef.current = null
+    }
+    if (urlRef.current) {
+      URL.revokeObjectURL(urlRef.current)
+      urlRef.current = null
+    }
+    setActive(false)
+    setProgress(null)
+    emitReadProgress({ index: 0, total: 0, text: '', done: true, cancelled })
+  }, [])
+
+  /** 朗读一句（按用户默认引擎）；自然播完 resolve(true)，被打断/失败 resolve(false)。 */
+  const speakOne = React.useCallback(
+    (raw: string, gen: number): Promise<boolean> => {
+      const pref = seedQuickPref(context, settings)
+      return new Promise<boolean>((resolve) => {
+        if (pref.provider === 'browser') {
+          const synth = window.speechSynthesis
+          if (!synth) {
+            toast.error('当前浏览器不支持语音合成，请使用 Chrome / Edge')
+            resolve(false)
+            return
+          }
+          synth.cancel()
+          const chunks = splitSpeechChunks(raw)
+          if (chunks.length === 0) {
+            resolve(true)
+            return
+          }
+          let done = 0
+          chunks.forEach((chunk, ci) => {
+            const u = new SpeechSynthesisUtterance(chunk)
+            const selected =
+              voicesRef.current.find((v) => v.voiceURI === pref.voiceURI) ?? null
+            if (selected) {
+              u.voice = selected
+              u.lang = selected.lang
+            } else {
+              u.lang = 'zh-CN'
+            }
+            u.rate = pref.speed
+            if (ci === chunks.length - 1) {
+              const finish = () => {
+                if (genRef.current !== gen) {
+                  resolve(false)
+                  return
+                }
+                done += 1
+                if (done >= chunks.length) resolve(true)
+              }
+              u.onend = finish
+              u.onerror = finish
+            }
+            synth.speak(u)
+          })
+          return
+        }
+        void (async () => {
+          try {
+            const res = await fetch('/api/tts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                text: raw,
+                voice:
+                  pref.provider === 'custom' ? pref.voice.trim() || undefined : pref.voice,
+                speed: pref.speed,
+                provider: pref.provider,
+              }),
+            })
+            if (!res.ok) throw new Error('生成语音失败')
+            if (genRef.current !== gen) {
+              resolve(false)
+              return
+            }
+            const blob = await res.blob()
+            if (genRef.current !== gen) {
+              resolve(false)
+              return
+            }
+            if (urlRef.current) URL.revokeObjectURL(urlRef.current)
+            const url = URL.createObjectURL(blob)
+            urlRef.current = url
+            const audio = new Audio(url)
+            audio.playbackRate = pref.speed
+            audio.onended = () => resolve(genRef.current === gen)
+            audio.onerror = () => resolve(false)
+            audioRef.current = audio
+            try {
+              await audio.play()
+            } catch {
+              /* autoplay blocked — 停止本次朗读 */
+              resolve(false)
+            }
+          } catch {
+            toast.error('选区朗读失败，已停止')
+            resolve(false)
+          }
+        })()
+      })
+    },
+    [context, settings],
+  )
+
+  React.useEffect(() => {
+    const onRead = (e: Event) => {
+      const detail = (e as CustomEvent<{ text?: string }>).detail
+      const text = (detail?.text ?? '').trim()
+      if (!text) return
+      void (async () => {
+        // 取消上一次
+        genRef.current += 1
+        const gen = genRef.current
+        try {
+          window.speechSynthesis?.cancel()
+        } catch {
+          /* ignore */
+        }
+        if (audioRef.current) audioRef.current.pause()
+        const sentences = splitSentences(text)
+        if (sentences.length === 0) return
+        const rules = await ensureGlobalPronRules()
+        if (genRef.current !== gen) return
+        setActive(true)
+        for (let i = 0; i < sentences.length; i++) {
+          if (genRef.current !== gen) return
+          setProgress({ index: i, total: sentences.length })
+          emitReadProgress({
+            index: i,
+            total: sentences.length,
+            text: sentences[i],
+            done: false,
+          })
+          const s = applyPronRules(sentences[i], rules)
+          const ok = await speakOne(s, gen)
+          if (!ok) return
+        }
+        if (genRef.current !== gen) return
+        setActive(false)
+        setProgress(null)
+        emitReadProgress({ index: sentences.length, total: sentences.length, text: '', done: true })
+      })()
+    }
+    window.addEventListener('sb-read-selection', onRead)
+    return () => window.removeEventListener('sb-read-selection', onRead)
+  }, [speakOne])
+
+  if (!mounted || !active) return null
+
+  return createPortal(
+    <div className="fixed bottom-[calc(6rem+env(safe-area-inset-bottom))] right-4 z-[65] flex items-center gap-2 rounded-full border border-border bg-background/95 py-1.5 pl-3.5 pr-1.5 shadow-xl backdrop-blur">
+      <span className="text-xs tabular-nums text-muted-foreground">
+        选区朗读{progress ? ` ${progress.index + 1}/${progress.total}` : ''}
+      </span>
+      <button
+        type="button"
+        aria-label="停止选区朗读"
+        onClick={() => stop(true)}
+        className="flex size-9 items-center justify-center rounded-full bg-destructive/10 text-destructive transition-transform active:scale-95"
+      >
+        <Square className="size-3.5 fill-current" />
+      </button>
+    </div>,
+    document.body,
+  )
 }

@@ -2,7 +2,8 @@
 // multipart/form-data, field "file". Requires a session.
 //
 // Accepted:
-//   .pdf  → pdf-parse v2 (class API: new PDFParse({ data }).getText())
+//   .pdf  → 多引擎解析链：unpdf（现代 pdf.js 构建，文本聚合更佳）→ pdf-parse v2 兑底
+//          可通过 formData 字段 engine 指定：auto(默认) | unpdf | pdf-parse
 //   .docx → mammoth.extractRawText({ buffer })
 //   .txt / .md / .markdown / any text/* → UTF-8 decode with GB18030 fallback
 //     (many Chinese .txt files on disk are GBK-encoded; UTF-8 is tried strictly
@@ -139,20 +140,63 @@ export async function POST(req: NextRequest) {
       ])
 
     if (kind === 'pdf') {
-      const parser = new PDFParse({ data: new Uint8Array(buffer) })
-      try {
-        const result = await withTimeout(
-          parser.getText({ pageJoiner: '\n\n' }).catch((e: unknown) => {
-            // 文件损坏 / 加密 PDF / 恶意构造：转成友好错误而不是 500
-            throw new Error(
-              `PDF 解析失败：${e instanceof Error ? e.message : '文件可能已损坏或加密'}`,
-            )
-          }),
-          'PDF',
-        )
-        content = result?.text || ''
-      } finally {
-        await parser.destroy().catch(() => {})
+      // ---- 多引擎解析链（用户反馈 pdfjs 提取失败时自动切换引擎重试）----
+      const enginePref = (formData?.get('engine') as string) || 'auto'
+      const errors: string[] = []
+
+      const tryUnpdf = async (): Promise<string> => {
+        const { extractText, getDocumentProxy } = await import('unpdf')
+        const pdf = await getDocumentProxy(new Uint8Array(buffer))
+        const { text } = await extractText(pdf, { mergePages: true })
+        return typeof text === 'string' ? text : String(text ?? '')
+      }
+      const tryPdfParse = async (): Promise<string> => {
+        const parser = new PDFParse({ data: new Uint8Array(buffer) })
+        try {
+          const result = await parser.getText({ pageJoiner: '\n\n' })
+          return result?.text || ''
+        } finally {
+          await parser.destroy().catch(() => {})
+        }
+      }
+      // 质量检查：提取结果过短或乱码占比过高视为失败，继续下一个引擎
+      const looksGood = (t: string): boolean => {
+        if (!t || t.trim().length < 8) return false
+        const bad = (t.match(/\uFFFD/g) || []).length
+        return bad / t.length < 0.05
+      }
+
+      const chain: Array<{ name: string; run: () => Promise<string> }> =
+        enginePref === 'unpdf'
+          ? [{ name: 'unpdf', run: tryUnpdf }]
+          : enginePref === 'pdf-parse'
+            ? [{ name: 'pdf-parse', run: tryPdfParse }]
+            : [
+                { name: 'unpdf', run: tryUnpdf },
+                { name: 'pdf-parse', run: tryPdfParse },
+              ]
+
+      for (const eng of chain) {
+        try {
+          const text = await withTimeout(
+            eng.run().catch((e: unknown) => {
+              throw new Error(
+                `${eng.name} 引擎解析失败：${e instanceof Error ? e.message : '文件可能已损坏或加密'}`,
+              )
+            }),
+            eng.name,
+          )
+          if (looksGood(text)) {
+            content = text
+            break
+          }
+          errors.push(`${eng.name}：提取内容为空或乱码`)
+        } catch (e) {
+          errors.push(e instanceof Error ? e.message : String(e))
+        }
+      }
+      if (!content && errors.length > 0) {
+        console.error('[POST /api/parse] pdf engines failed:', errors.join(' | '))
       }
     } else if (kind === 'docx') {
       // 同时传 buffer（Node 版 unzip 用）+ arrayBuffer（browser-field 版 unzip 用）。

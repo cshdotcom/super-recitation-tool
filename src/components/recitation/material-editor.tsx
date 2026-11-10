@@ -5,8 +5,10 @@
 // 顶栏（两行，吸顶）：
 //   第 1 行：返回 / ⚡AI快速分块（emerald 胶囊）/ 撤销 / 重做 / 完成（黑字胶囊）
 //   第 2 行：横向可滚动工具条（icon+小字标签）：
-//     样式(Aa) / 格式 / 挖空 / 批量操作 / 图片 / 公式 / 表格 / 新建分块 / 分割分块 / 操作 / 键盘
+//     样式(Aa) / 格式 / 挖空 / 管理（批量复选框模式）/ 图片 / 公式 / 图表 / 表格 /
+//     新建分块 / 分割分块 / AI素材（3/5/8 组）/ 复制导出 / 操作 / 键盘
 //     「操作」= 更多操作菜单：新建分块 / 合并到下一块 / 隐藏 / 删除 / 全部展开（编辑）/ 全部收起（预览）
+//     「管理」= 批量模式：全选 / AI正面 / 合并 / 显隐切换 / 删除（确认弹窗）
 //
 // 内容：块列表（核心论点·正面 + 完整内容·背面）。
 //   • 每块左上 ✥ 移动手柄（点开上移/下移菜单），右上「拆分」按钮 + 预览切换（Markdown 渲染）。
@@ -18,8 +20,9 @@
 //   • AI生成核心论点改为函数式更新，请求返回时不再用旧快照覆盖用户在等待期间的输入。
 //
 // API：
-//   POST /api/chat  { mode:'ask', content, messages } -> { reply }   （AI生成核心论点）
-//   POST /api/chunk { content } -> { chunks: string[] }               （AI 语义分割分块）
+//   POST /api/chat  { mode:'ask', content, messages } -> { reply }     （AI生成核心论点）
+//   POST /api/chat  { mode:'blocks', content, count } -> { blocks }    （AI 一键生成问答素材，追加）
+//   POST /api/chunk { content } -> { chunks: string[] }                （AI 语义分割分块）
 
 import * as React from 'react'
 import {
@@ -519,6 +522,9 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   const [aiIdx, setAiIdx] = React.useState<number | null>(null)
   const [chunkLoading, setChunkLoading] = React.useState(false)
   const [chunkResult, setChunkResult] = React.useState<string[] | null>(null)
+  // AI 一键生成素材（mode:'blocks'）进行中；批量删除确认弹窗
+  const [blocksBusy, setBlocksBusy] = React.useState(false)
+  const [batchDeleteOpen, setBatchDeleteOpen] = React.useState(false)
   const [kbUp, setKbUp] = React.useState(false)
   const [fontSize, setFontSize] = React.useState(16)
   // 复制/导出时是否包含图片（与思维导图/HTML 等富格式）
@@ -844,15 +850,17 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     toast.success(`已合并 ${idxs.length} 块`)
   }
 
-  const hideSelected = () => {
+  /** 批量显示/隐藏切换：所选块全部已隐藏 → 全部显示；否则全部隐藏。 */
+  const toggleSelectedHidden = () => {
     if (selected.size === 0) return
     const n = selected.size
+    const allHidden = [...selected].every((i) => blocksRef.current[i]?.hidden === true)
     commit((prev) =>
-      prev.map((b, i) => (selected.has(i) ? { ...b, hidden: true } : b)),
+      prev.map((b, i) => (selected.has(i) ? { ...b, hidden: !allHidden } : b)),
     )
     setSelected(new Set())
     lastFocusRef.current = null
-    toast.success(`已隐藏 ${n} 块`)
+    toast.success(allHidden ? `已显示 ${n} 块` : `已隐藏 ${n} 块`)
   }
 
   const deleteSelected = () => {
@@ -862,6 +870,53 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     setSelected(new Set())
     lastFocusRef.current = null
     toast.success(`已删除 ${n} 块`)
+  }
+
+  // ---- AI 一键生成素材（POST /api/chat mode:'blocks'）：按当前材料生成问答 blocks，
+  //      追加到现有块之后（不清空现有内容） ----
+  const generateBlocks = async (count: number) => {
+    // 内嵌 base64 图片对生成素材没有意义，先替换为占位再截断（与服务端 6000 字上限对齐）
+    const raw =
+      blocksRef.current
+        .map((b) => b.back)
+        .filter(Boolean)
+        .join('\n')
+        .trim() || (card.content ?? '').trim()
+    const src = raw.replace(/!\[[^\]]*\]\(data:[^)]*\)/g, '［图片］').slice(0, 6000).trim()
+    if (!src) {
+      toast.warning('当前材料内容为空，无法生成素材')
+      return
+    }
+    setBlocksBusy(true)
+    const tid = toast.loading(`AI 正在生成 ${count} 组问答素材…`)
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'blocks', content: src, count }),
+      })
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(err.error || '生成失败')
+      }
+      const data = (await res.json()) as { blocks?: Array<{ front?: unknown; back?: unknown }> }
+      const got = (data.blocks ?? [])
+        .map((b) => ({
+          front: typeof b?.front === 'string' ? b.front : '',
+          back: typeof b?.back === 'string' ? b.back : '',
+        }))
+        .filter((b) => b.front.trim() && b.back.trim())
+      if (got.length === 0) throw new Error('AI 未返回素材，请重试')
+      commit((prev) => [...prev, ...got])
+      toast.success(`已生成 ${got.length} 组素材`, { id: tid })
+    } catch (err) {
+      toast.error(
+        'AI 生成素材失败：' + (err instanceof Error ? err.message : '未知错误'),
+        { id: tid },
+      )
+    } finally {
+      setBlocksBusy(false)
+    }
   }
 
   // ---- AI生成核心论点（POST /api/chat）----
@@ -1352,8 +1407,8 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                       { label: '全选', onClick: toggleSelectAll, disabled: blocks.length === 0 },
                       { label: 'AI正面', onClick: () => void batchGenerateFront(), disabled: selected.size === 0 },
                       { label: '合并', onClick: () => mergeSelected(), disabled: selected.size < 2 },
-                      { label: '隐藏', onClick: () => hideSelected(), disabled: selected.size === 0 },
-                      { label: '删除', onClick: () => deleteSelected(), disabled: selected.size === 0 },
+                      { label: '显/隐', onClick: () => toggleSelectedHidden(), disabled: selected.size === 0 },
+                      { label: '删除', onClick: () => setBatchDeleteOpen(true), disabled: selected.size === 0 },
                     ] as const
                   ).map((b) => (
                     <button
@@ -1625,16 +1680,16 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 <span className="text-[11px] leading-none">挖空</span>
               </button>
 
-              {/* 批量操作 */}
+              {/* 批量管理（复选框模式：全选 / AI正面 / 合并 / 显示隐藏切换 / 删除确认） */}
               <button
                 type="button"
-                aria-label={batch ? '退出批量操作' : '批量操作'}
+                aria-label={batch ? '退出管理' : '管理'}
                 aria-pressed={batch}
                 onClick={batch ? exitBatch : enterBatch}
                 className={cn(TOOLBAR_BTN, batch && 'bg-muted text-foreground')}
               >
                 <ListChecks className="size-5" strokeWidth={1.75} aria-hidden />
-                <span className="text-[11px] leading-none">批量操作</span>
+                <span className="text-[11px] leading-none">管理</span>
               </button>
 
               {/* 图片：本地上传（压缩≤800px 转 dataURL）/ 插入图片链接 */}
@@ -1935,6 +1990,37 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 <Columns3 className="size-5" strokeWidth={1.75} aria-hidden />
                 <span className="text-[11px] leading-none">分割分块</span>
               </button>
+
+              {/* AI 生成素材：按当前材料生成问答 blocks（3/5/8 组），追加到块列表末尾 */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="AI 生成素材"
+                    disabled={blocksBusy}
+                    onMouseDown={(e) => e.preventDefault()}
+                    className={TOOLBAR_BTN}
+                  >
+                    {blocksBusy ? (
+                      <Loader2 className="size-5 animate-spin text-emerald-600" strokeWidth={1.75} aria-hidden />
+                    ) : (
+                      <Sparkles className="size-5 text-emerald-600" strokeWidth={1.75} aria-hidden />
+                    )}
+                    <span className="text-[11px] leading-none">AI素材</span>
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="bottom" align="start" className="w-44 rounded-xl">
+                  <p className="px-2 py-1.5 text-[11px] text-muted-foreground">
+                    根据当前材料生成问答素材
+                  </p>
+                  {[3, 5, 8].map((n) => (
+                    <DropdownMenuItem key={n} onClick={() => void generateBlocks(n)}>
+                      <Sparkles className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                      生成 {n} 组
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
 
               {/* 复制 / 导出 */}
               <Popover>
@@ -2343,6 +2429,29 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
           <AlertDialogFooter>
             <AlertDialogCancel>取消</AlertDialogCancel>
             <AlertDialogAction onClick={applyChunks}>确定</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      {/* 批量删除确认（管理模式「删除」按钮） */}
+      <AlertDialog open={batchDeleteOpen} onOpenChange={setBatchDeleteOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除 {selected.size} 块？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将删除所选的 {selected.size} 个内容块；误删可用「撤销」找回。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              onClick={() => {
+                setBatchDeleteOpen(false)
+                deleteSelected()
+              }}
+            >
+              删除
+            </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>

@@ -1,12 +1,13 @@
 'use client'
 
-// Standalone share page: /share/[token]. Renders the shared card if the link
-// is valid & unexpired, with a friendly error screen otherwise.
+// Standalone share page: /share/[token]. Renders the shared card OR shared AI
+// conversation depending on the share kind (component self-detects), with a
+// friendly error screen otherwise.
 import * as React from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { Loader2 } from 'lucide-react'
 
-import { SharedCardView } from '@/components/recitation/shared-card-view'
+import { SharedConversationView } from '@/components/recitation/shared-conversation-view'
 
 export default function SharePage() {
   const params = useParams<{ token: string }>()
@@ -27,7 +28,8 @@ export default function SharePage() {
 
   return (
     <div className="flex min-h-screen flex-col bg-background text-foreground">
-      <SharedCardView token={token} onExit={handleExit} />
+      {/* 自动分流：卡片分享 → 内部委托 SharedCardView；对话分享 → 对话视图 */}
+      <SharedConversationView token={token} onExit={handleExit} />
     </div>
   )
 }

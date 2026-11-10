@@ -41,7 +41,7 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json(await getSettings())
     }
 
-    const data: Record<string, string | boolean | number> = {}
+    const data: Record<string, string | boolean | number | null> = {}
 
     if (typeof body?.clozeStyle === 'string') {
       // 挖空显示样式：下划线/模糊/星号/空白/高亮/圈圈
@@ -148,6 +148,33 @@ export async function PATCH(req: NextRequest) {
     // 导入时 AI 自动挖空
     if (typeof body?.aiAutoCloze === 'boolean') {
       data.aiAutoCloze = body.aiAutoCloze
+    }
+    // ---- AI 对话全局配置 ----
+    if (typeof body?.aiSystemPrompt === 'string') {
+      data.aiSystemPrompt = body.aiSystemPrompt.slice(0, 20000)
+    }
+    if (typeof body?.aiRules === 'string') {
+      data.aiRules = body.aiRules.slice(0, 20000)
+    }
+    if (typeof body?.aiSelfThinking === 'boolean') {
+      data.aiSelfThinking = body.aiSelfThinking
+    }
+    if (typeof body?.aiTemperature === 'number' && Number.isFinite(body.aiTemperature)) {
+      data.aiTemperature = Math.min(2, Math.max(0, body.aiTemperature))
+    }
+    if (body?.aiTemperature === null) {
+      data.aiTemperature = null
+    }
+    if (typeof body?.aiMaxTokens === 'number' && Number.isFinite(body.aiMaxTokens)) {
+      data.aiMaxTokens = Math.min(32768, Math.max(64, Math.round(body.aiMaxTokens)))
+    }
+    if (body?.aiMaxTokens === null) {
+      data.aiMaxTokens = null
+    }
+    // ---- PDF 解析引擎 ----
+    if (typeof body?.pdfEngine === 'string') {
+      data.pdfEngine =
+        body.pdfEngine === 'unpdf' || body.pdfEngine === 'pdf-parse' ? body.pdfEngine : 'auto'
     }
 
     if (Object.keys(data).length === 0) {

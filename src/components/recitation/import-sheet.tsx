@@ -26,6 +26,21 @@ export interface ImportPayload {
   keywords: string[]
 }
 
+/** PDF 解析引擎（与 /api/parse 的 engine 字段、settings.pdfEngine 对应） */
+type PdfEngine = 'auto' | 'unpdf' | 'pdf-parse'
+
+const PDF_ENGINE_OPTIONS: { value: PdfEngine; label: string }[] = [
+  { value: 'auto', label: '自动推荐' },
+  { value: 'unpdf', label: 'unpdf' },
+  { value: 'pdf-parse', label: 'pdf-parse' },
+]
+
+const PDF_ENGINE_DESC: Record<PdfEngine, string> = {
+  auto: '默认：先用引擎 A（unpdf 新版），提取失败自动改用引擎 B（pdf-parse 经典）',
+  unpdf: '引擎 A · unpdf 新版：现代 pdf.js 内核，中文段落聚合效果更好',
+  'pdf-parse': '引擎 B · pdf-parse 经典：老牌解析器，对特殊编码 / 老版 PDF 兼容性更好',
+}
+
 interface ImportSheetProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -63,6 +78,7 @@ export function ImportSheet({
   const [ocrLoading, setOcrLoading] = React.useState<EntryKey | null>(null)
   const [cameraOpen, setCameraOpen] = React.useState(false)
   const [imageEditorOpen, setImageEditorOpen] = React.useState(false)
+  const [pdfEngine, setPdfEngine] = React.useState<PdfEngine>('auto')
 
   // Reset / prefill when opened.
   React.useEffect(() => {
@@ -72,6 +88,53 @@ export function ImportSheet({
       setTitle(initialDraft?.title ?? '')
     }
   }, [open, initialDraft])
+
+  // 打开面板时读取已保存的 PDF 解析引擎设置（GET /api/settings 的 pdfEngine 字段）。
+  // 后端字段缺失/未设置时回退 auto，不影响使用。
+  React.useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    void fetch('/api/settings')
+      .then(async (res) => {
+        if (!res.ok) return null
+        return (await res.json()) as { pdfEngine?: string }
+      })
+      .then((data) => {
+        if (cancelled || !data) return
+        const v = data.pdfEngine
+        if (v === 'auto' || v === 'unpdf' || v === 'pdf-parse') setPdfEngine(v)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [open])
+
+  /** 切换 PDF 解析引擎并持久化到设置（PATCH /api/settings，旧接口 PUT 兜底）。 */
+  const handleChooseEngine = (v: PdfEngine) => {
+    if (v === pdfEngine) return
+    setPdfEngine(v)
+    void (async () => {
+      try {
+        let res = await fetch('/api/settings', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pdfEngine: v }),
+        })
+        // 兼容仅提供 PUT 的旧接口形态
+        if (res.status === 405 || res.status === 404) {
+          res = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pdfEngine: v }),
+          })
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      } catch {
+        toast.error('PDF 引擎设置保存失败（本次上传仍会使用刚选的引擎）')
+      }
+    })()
+  }
 
   const startInput = (kind: EntryKey, content = '') => {
     setMode('input')
@@ -97,13 +160,19 @@ export function ImportSheet({
     try {
       const fd = new FormData()
       fd.append('file', file)
+      // PDF 多引擎解析链：携带当前选择的引擎（auto/unpdf/pdf-parse）
+      fd.append('engine', pdfEngine)
       const res = await fetch('/api/parse', { method: 'POST', body: fd })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) {
-        throw new Error(
+        const isPdfFile = /\.pdf$/i.test(file.name) || file.type === 'application/pdf'
+        const base =
           res.status === 401
             ? '登录状态已过期，请重新登录后再上传文件'
-            : data.error || '文件解析失败',
+            : data.error || '文件解析失败'
+        // 422 解析失败：对 PDF 提示可切换解析引擎后重试
+        throw new Error(
+          res.status === 422 && isPdfFile ? `${base}；可尝试切换下方 PDF 解析引擎后重试` : base,
         )
       }
       const payload = data as { title?: string; content?: string }
@@ -244,6 +313,43 @@ export function ImportSheet({
                 e.target.value = ''
               }}
             />
+
+            {/* PDF 解析引擎选择：解析失败时可切换引擎重试 */}
+            <div className="rounded-2xl border border-border bg-card px-3.5 py-3">
+              <div className="flex items-baseline justify-between gap-2">
+                <p className="text-xs font-bold">PDF 解析引擎</p>
+                <span className="text-[10.5px] text-muted-foreground">解析失败时可切换引擎重试</span>
+              </div>
+              <div
+                className="mt-2 flex rounded-xl bg-muted p-1"
+                role="radiogroup"
+                aria-label="PDF 解析引擎"
+              >
+                {PDF_ENGINE_OPTIONS.map((o) => {
+                  const active = pdfEngine === o.value
+                  return (
+                    <button
+                      key={o.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      onClick={() => handleChooseEngine(o.value)}
+                      className={cn(
+                        'flex-1 rounded-lg px-2 py-1.5 text-xs transition-colors',
+                        active
+                          ? 'bg-background font-medium text-foreground shadow-sm'
+                          : 'text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      {o.label}
+                    </button>
+                  )
+                })}
+              </div>
+              <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                {PDF_ENGINE_DESC[pdfEngine]}
+              </p>
+            </div>
 
             {/* black pill button */}
             <Button

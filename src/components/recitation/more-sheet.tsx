@@ -7,15 +7,27 @@ import {
   Braces,
   Check,
   ChevronRight,
+  Code,
   Copy,
   Download,
+  FileCode,
+  FileJson,
   FileOutput,
   FileText,
+  Printer,
   Timer,
   Sparkles,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
+import {
+  downloadBlob,
+  exportCardHtml,
+  exportCardJson,
+  exportCardMarkdown,
+  exportCardTxt,
+  printCard,
+} from '@/lib/export-utils'
 import type { CardData, ClozeStyle, PageMode, SettingsData, ThemeName } from '@/lib/types'
 import { THEME_OPTIONS } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -90,6 +102,36 @@ function Segmented<T extends string>({
         )
       })}
     </div>
+  )
+}
+
+// ---------- export list row（导出tab内每行样式，与 ActionRow 同族） ----------
+function ExportRow({
+  icon: Icon,
+  title,
+  subtitle,
+  onClick,
+}: {
+  icon: React.ComponentType<{ className?: string; strokeWidth?: number }>
+  title: string
+  subtitle: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex w-full items-center gap-3 border-b border-border/60 px-4 py-3.5 text-left transition-colors last:border-b-0 hover:bg-accent/50"
+    >
+      <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-muted">
+        <Icon className="size-5 text-foreground/70" strokeWidth={1.5} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm font-bold">{title}</span>
+        <span className="block text-xs text-muted-foreground">{subtitle}</span>
+      </span>
+      <ChevronRight className="size-4 shrink-0 text-muted-foreground/60" strokeWidth={1.75} />
+    </button>
   )
 }
 
@@ -220,16 +262,6 @@ export function MoreSheet({
      
   }, [fontSizeDraft, open])
 
-  const downloadFile = (name: string, content: string, type: string) => {
-    const blob = new Blob([content], { type })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = name
-    a.click()
-    URL.revokeObjectURL(url)
-  }
-
   const handleCopy = async () => {
     try {
       await navigator.clipboard.writeText(card.content)
@@ -239,9 +271,27 @@ export function MoreSheet({
     }
   }
 
+  // ---- 导出（与超级编辑器导出对齐且为其超集：TXT / MD / HTML / 打印PDF / JSON） ----
+
   const handleExportTxt = () => {
-    downloadFile(`${card.title || '背书卡'}.txt`, card.content, 'text/plain;charset=utf-8')
-    toast.success('已导出 TXT 文件')
+    toast.success(`已导出 ${exportCardTxt(card)}`)
+  }
+
+  const handleExportMarkdown = () => {
+    toast.success(`已导出 ${exportCardMarkdown(card)}`)
+  }
+
+  const handleExportHtml = () => {
+    toast.success(`已导出 ${exportCardHtml(card)}`)
+  }
+
+  const handlePrintPdf = () => {
+    printCard(card)
+    toast.info('已打开打印窗口，目标打印机选「另存为 PDF」即可导出 PDF')
+  }
+
+  const handleExportCardJson = () => {
+    toast.success(`已导出 ${exportCardJson(card)}`)
   }
 
   const handleExportJson = async () => {
@@ -249,12 +299,11 @@ export function MoreSheet({
       const res = await fetch('/api/cards')
       if (!res.ok) throw new Error('获取数据失败')
       const data = await res.json()
-      downloadFile(
-        `背书吧-全部数据.json`,
-        JSON.stringify(data, null, 2),
-        'application/json',
+      downloadBlob(
+        '背书吧-全部数据.json',
+        new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' }),
       )
-      toast.success('已导出 JSON 数据')
+      toast.success('已导出 背书吧-全部数据.json')
     } catch (err) {
       toast.error('导出失败：' + (err instanceof Error ? err.message : '未知错误'))
     }
@@ -568,53 +617,58 @@ export function MoreSheet({
           </div>
         )}
 
-        {/* ---------------- 导出 ---------------- */}
+        {/* ---------------- 导出（与超级编辑器导出功能对齐且超集） ---------------- */}
         {tab === 'export' && (
-          <div className="space-y-2.5">
-            <button
-              type="button"
-              onClick={() => void handleCopy()}
-              className="flex w-full items-center gap-3 rounded-2xl border border-border bg-card px-4 py-4 text-left transition-colors hover:bg-accent/50"
-            >
-              <span className="flex size-10 items-center justify-center rounded-xl bg-muted">
-                <Copy className="size-5 text-foreground/70" strokeWidth={1.5} />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block text-sm font-bold">复制全文</span>
-                <span className="block text-xs text-muted-foreground">复制背书卡全文到剪贴板</span>
-              </span>
-              <ChevronRight className="size-4 text-muted-foreground/60" strokeWidth={1.75} />
-            </button>
+          <div className="space-y-4">
+            <p className="px-1 text-xs font-medium text-muted-foreground">当前背书卡</p>
+            <div className="overflow-hidden rounded-2xl border border-border bg-card">
+              <ExportRow
+                icon={Copy}
+                title="复制全文"
+                subtitle="复制当前背书卡全文到剪贴板"
+                onClick={() => void handleCopy()}
+              />
+              <ExportRow
+                icon={FileText}
+                title="导出 TXT"
+                subtitle="纯文本 · 含标题与记忆素材 · UTF-8+BOM 不乱码"
+                onClick={handleExportTxt}
+              />
+              <ExportRow
+                icon={FileCode}
+                title="导出 Markdown"
+                subtitle="Markdown 格式 · 保留图片与记忆素材问答"
+                onClick={handleExportMarkdown}
+              />
+              <ExportRow
+                icon={Code}
+                title="导出 HTML"
+                subtitle="独立网页文档 · 图片与排版完整渲染"
+                onClick={handleExportHtml}
+              />
+              <ExportRow
+                icon={Printer}
+                title="打印 / 导出 PDF"
+                subtitle="浏览器原生打印，选「另存为 PDF」即可"
+                onClick={handlePrintPdf}
+              />
+              <ExportRow
+                icon={FileJson}
+                title="导出 JSON 备份"
+                subtitle="当前卡完整数据（含记忆素材）"
+                onClick={handleExportCardJson}
+              />
+            </div>
 
-            <button
-              type="button"
-              onClick={handleExportTxt}
-              className="flex w-full items-center gap-3 rounded-2xl border border-border bg-card px-4 py-4 text-left transition-colors hover:bg-accent/50"
-            >
-              <span className="flex size-10 items-center justify-center rounded-xl bg-muted">
-                <FileText className="size-5 text-foreground/70" strokeWidth={1.5} />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block text-sm font-bold">导出 TXT</span>
-                <span className="block text-xs text-muted-foreground">下载当前背书卡的纯文本文件</span>
-              </span>
-              <ChevronRight className="size-4 text-muted-foreground/60" strokeWidth={1.75} />
-            </button>
-
-            <button
-              type="button"
-              onClick={() => void handleExportJson()}
-              className="flex w-full items-center gap-3 rounded-2xl border border-border bg-card px-4 py-4 text-left transition-colors hover:bg-accent/50"
-            >
-              <span className="flex size-10 items-center justify-center rounded-xl bg-muted">
-                <Braces className="size-5 text-foreground/70" strokeWidth={1.5} />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block text-sm font-bold">导出 JSON 数据</span>
-                <span className="block text-xs text-muted-foreground">下载全部背书卡的 JSON 备份</span>
-              </span>
-              <ChevronRight className="size-4 text-muted-foreground/60" strokeWidth={1.75} />
-            </button>
+            <p className="px-1 text-xs font-medium text-muted-foreground">全部数据</p>
+            <div className="overflow-hidden rounded-2xl border border-border bg-card">
+              <ExportRow
+                icon={Braces}
+                title="导出全部 JSON"
+                subtitle="下载所有背书卡的完整 JSON 备份"
+                onClick={() => void handleExportJson()}
+              />
+            </div>
 
             <div className="flex items-center gap-1.5 px-1 pt-2 text-[11px] text-muted-foreground">
               <Download className="size-3" /> 所有数据存储在本地 SQLite 数据库中

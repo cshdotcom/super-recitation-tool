@@ -9,6 +9,7 @@ import { toast } from 'sonner'
 import type { AccountData, CardData, KwEntry, Mastery, MaterialBlock, ProjectData, SettingsData } from '@/lib/types'
 import { kwText, normKeywordEntries } from '@/lib/cloze'
 import { extractClozeMarks } from '@/lib/editor-cloze'
+import { playbackStart } from '@/lib/playback'
 import type { ImportPayload } from '@/components/recitation/import-sheet'
 import NextDynamic from 'next/dynamic'
 import {
@@ -109,6 +110,26 @@ const ChatToolGlobal = NextDynamic(
   () => import('@/components/recitation/chat-tool').then((m) => m.ChatTool),
   { ssr: false, loading: () => <div className="h-[60vh] animate-pulse rounded-xl bg-muted" /> },
 )
+// 全局迷你播放按钮（可拖拽、播放动画、所有页面常驻；待播放列表/冲突弹窗/跨设备同步）
+const MiniPlayerFab = NextDynamic(
+  () => import('@/components/recitation/mini-player-fab').then((m) => m.MiniPlayerFab),
+  { ssr: false, loading: () => null },
+)
+// AI 对话侧边栏（对话列表/搜索/批量管理）
+const ChatSidebar = NextDynamic(
+  () => import('@/components/recitation/chat-sidebar').then((m) => m.ChatSidebar),
+  { ssr: false },
+)
+// 全局追问弹层（选中文本 → AI 追问，新建独立对话或当前对话接续）
+const FollowupPopover = NextDynamic(
+  () => import('@/components/recitation/followup-popover').then((m) => m.FollowupPopover),
+  { ssr: false, loading: () => null },
+)
+// 统一检索浮层（书本/文章/对话混合搜索 + 语音搜索）
+const SearchOverlay = NextDynamic(
+  () => import('@/components/recitation/search-overlay').then((m) => m.SearchOverlay),
+  { ssr: false },
+)
 
 function PageSkeleton() {
   return (
@@ -193,6 +214,11 @@ export default function Page() {
   const [ttsCollapsed, setTtsCollapsed] = React.useState(false)
   // 根级 AI 对话 Sheet（主页底部 Dock「对话」按钮 onOpenChat）
   const [chatRootOpen, setChatRootOpen] = React.useState(false)
+  // 统一检索浮层（主页搜索 pill / 'app:openSearch'）
+  const [searchOpen, setSearchOpen] = React.useState(false)
+  // AI 对话侧边栏 + 当前活动对话（对话模式 ChatTool 绑定）
+  const [chatSidebarOpen, setChatSidebarOpen] = React.useState(false)
+  const [activeConvId, setActiveConvId] = React.useState<string | null>(null)
 
   const saveTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -756,6 +782,83 @@ export default function Page() {
     return () => window.removeEventListener('sb-voice-prefs-changed', onVoicePrefs)
   }, [])
 
+  // ---------- 全局事件接线（新模块） ----------
+  // cards 稳定引用：事件回调里找卡不重新绑监听
+  const cardsRef = React.useRef(cards)
+  React.useEffect(() => {
+    cardsRef.current = cards
+  }, [cards])
+
+  // 主页搜索 pill → 打开统一检索浮层；ChatTool 侧边栏按钮 → 切换侧边栏
+  React.useEffect(() => {
+    const onOpenSearch = () => setSearchOpen(true)
+    const onToggleSidebar = () => setChatSidebarOpen((v) => !v)
+    window.addEventListener('app:openSearch', onOpenSearch)
+    window.addEventListener('app:toggleChatSidebar', onToggleSidebar)
+    return () => {
+      window.removeEventListener('app:openSearch', onOpenSearch)
+      window.removeEventListener('app:toggleChatSidebar', onToggleSidebar)
+    }
+  }, [])
+
+  // 检索/追问跳转：打开某本书（reader=阅读视图 / blocks=超级编辑器）；打开某对话
+  React.useEffect(() => {
+    const onOpenCardEvt = (e: Event) => {
+      const d = (e as CustomEvent<{ cardId: string; target?: 'reader' | 'blocks' }>).detail
+      if (!d?.cardId) return
+      const card = cardsRef.current.find((c) => c.id === d.cardId)
+      if (!card) {
+        toast.error('书本不存在或已删除')
+        return
+      }
+      if (d.target === 'blocks') {
+        setEditorMode('edit')
+        setEditorTitle(card.title)
+        setEditorDraft({ title: card.title, content: card.content, blocks: card.blocks ?? [] })
+        setView('material-editor')
+      } else {
+        setCurrentCard(card)
+        setView('reader')
+      }
+      setSearchOpen(false)
+    }
+    const onOpenConv = (e: Event) => {
+      const d = (e as CustomEvent<{ id: string }>).detail
+      if (!d?.id) return
+      setActiveConvId(d.id)
+      setChatSidebarOpen(false)
+      setSearchOpen(false)
+      setChatRootOpen(true)
+    }
+    window.addEventListener('app:openCard', onOpenCardEvt)
+    window.addEventListener('app:openConversation', onOpenConv)
+    return () => {
+      window.removeEventListener('app:openCard', onOpenCardEvt)
+      window.removeEventListener('app:openConversation', onOpenConv)
+    }
+  }, [])
+
+  // 迷你播放器/播放列表/冲突替换/自动连播 → 打开完整播放器
+  React.useEffect(() => {
+    const onOpenTts = (e: Event) => {
+      const d = (e as CustomEvent<{ cardId: string; title: string; text: string; expand?: boolean }>).detail
+      if (!d?.cardId) return
+      const card = cardsRef.current.find((c) => c.id === d.cardId)
+      if (!card) return
+      setTtsCard(d.text && d.text !== card.content ? { ...card, content: d.text } : card)
+      if (d.expand !== false) setTtsCollapsed(false)
+    }
+    window.addEventListener('app:openTtsPlayer', onOpenTts)
+    return () => window.removeEventListener('app:openTtsPlayer', onOpenTts)
+  }, [])
+
+  // 当前活动对话变化 → 通知追问弹层（source=chat 时在当前对话接续）
+  React.useEffect(() => {
+    window.dispatchEvent(
+      new CustomEvent('app:currentConversation', { detail: { id: activeConvId } }),
+    )
+  }, [activeConvId])
+
   // ---------- gated rendering ----------
   // 独立相机页：跳过登录门控（新标签页共享同源会话），全屏相机 + 拍完自动回传关闭
   if (standaloneCamera) {
@@ -874,7 +977,14 @@ export default function Page() {
           onOpenMaterialEditor={handleEditContent}
           onOpenOverview={() => setView('review-overview')}
           onOpenPlanEditor={handleOpenPlanEditor}
-          onStartTts={(c) => { setTtsCard(c); setTtsCollapsed(false) }}
+          onStartTts={(c) => {
+            // 换书播放冲突：播放中点另一本 → 迷你播放器弹窗（替换/加入待播放列表/取消）
+            const res = playbackStart(c)
+            if (res === 'started') {
+              setTtsCard(c)
+              setTtsCollapsed(false)
+            }
+          }}
         />
       ) : view === 'wrong' ? (
         <WrongQuestionsView onBack={() => setView('home')} />
@@ -1051,13 +1161,16 @@ export default function Page() {
                 ) : null}
               </SheetTitleGlobal>
             </SheetHeaderGlobal>
-            {chatRootCard ? (
+            {chatRootCard || activeConvId ? (
               <ChatToolGlobal
                 mode="ask"
-                content={chatRootCard.content}
+                content={chatRootCard?.content ?? ''}
                 allowImages
-                cardId={chatRootCard.id}
+                cardId={chatRootCard?.id}
                 settings={settings ?? undefined}
+                conversationId={activeConvId ?? undefined}
+                onOpenSidebar={() => setChatSidebarOpen(true)}
+                onConversationChange={(id) => setActiveConvId(id)}
               />
             ) : (
               <div className="flex min-h-[40vh] items-center justify-center px-6 py-10 text-center text-sm text-muted-foreground">
@@ -1067,6 +1180,44 @@ export default function Page() {
           </SheetContentGlobal>
         </SheetGlobal>
       )}
+
+      {/* AI 对话侧边栏（ChatTool PanelLeft / app:toggleChatSidebar）：
+          对话列表/全局搜索/批量管理，选中后载入根级对话 Sheet。 */}
+      <SheetGlobal
+        open={chatSidebarOpen}
+        onOpenChange={setChatSidebarOpen}
+      >
+        <SheetContentGlobal
+          side="left"
+          aria-describedby={undefined}
+          className="w-[86vw] max-w-sm gap-0 p-0"
+        >
+          <SheetHeaderGlobal className="sr-only">
+            <SheetTitleGlobal>AI 对话列表</SheetTitleGlobal>
+          </SheetHeaderGlobal>
+          <ChatSidebar
+            open={chatSidebarOpen}
+            onOpenChange={setChatSidebarOpen}
+            activeConversationId={activeConvId ?? undefined}
+            onSelect={(id) => {
+              setActiveConvId(id)
+              setChatSidebarOpen(false)
+              setChatRootOpen(true)
+            }}
+            cardId={chatRootCard?.id}
+            cardTitle={chatRootCard?.title}
+          />
+        </SheetContentGlobal>
+      </SheetGlobal>
+
+      {/* 统一检索浮层：书本/文章/对话混合检索 + 语音搜索（主页搜索 pill 触发） */}
+      <SearchOverlay mode="home" open={searchOpen} onOpenChange={setSearchOpen} />
+
+      {/* 全局迷你播放按钮：可拖拽、播放动画、所有页面常驻（含待播放列表/冲突弹窗/跨设备同步） */}
+      {settings && <MiniPlayerFab settings={settings} />}
+
+      {/* 全局追问弹层：选中文本 → AI 追问（解析场景新建对话 / 对话内接续） */}
+      <FollowupPopover getActiveConversationId={() => activeConvId ?? undefined} />
     </div>
   )
 }

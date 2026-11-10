@@ -15,6 +15,7 @@ import {
   Loader2,
   Mic,
   Palette,
+  Sparkles,
   Star,
   Trash2,
   Upload,
@@ -57,7 +58,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 
 interface SettingsSheetProps {
   open: boolean
@@ -366,6 +369,228 @@ function ToggleRow({
         aria-label={`开关：${label}`}
         className="data-[state=checked]:bg-emerald-600"
       />
+    </div>
+  )
+}
+
+// ---------- AI 对话配置（服务端持久化，多端同步） ----------
+
+interface AIChatConfigState {
+  aiSystemPrompt: string
+  aiRules: string
+  aiSelfThinking: boolean
+  /** null = 跟随服务端默认。 */
+  aiTemperature: number | null
+  /** null = 跟随服务端默认。 */
+  aiMaxTokens: number | null
+}
+
+/** 「AI 对话配置」卡片：系统提示词 / 自定义规则 / 自我思考 / 温度 / 最大回复长度。 */
+function AIChatConfigCard({ open }: { open: boolean }) {
+  const [draft, setDraft] = React.useState<AIChatConfigState>({
+    aiSystemPrompt: '',
+    aiRules: '',
+    aiSelfThinking: false,
+    aiTemperature: null,
+    aiMaxTokens: null,
+  })
+  const [loaded, setLoaded] = React.useState(false)
+  const [saving, setSaving] = React.useState(false)
+
+  // 打开设置时拉取服务端配置（lenient 读取：字段未就绪时按默认处理）
+  React.useEffect(() => {
+    if (!open || loaded) return
+    let alive = true
+    void (async () => {
+      try {
+        const res = await fetch('/api/settings')
+        if (!res.ok) return
+        const data = (await res.json()) as Record<string, unknown>
+        if (!alive) return
+        setDraft({
+          aiSystemPrompt: typeof data.aiSystemPrompt === 'string' ? data.aiSystemPrompt : '',
+          aiRules: typeof data.aiRules === 'string' ? data.aiRules : '',
+          aiSelfThinking: data.aiSelfThinking === true,
+          aiTemperature:
+            typeof data.aiTemperature === 'number' && Number.isFinite(data.aiTemperature)
+              ? data.aiTemperature
+              : null,
+          aiMaxTokens:
+            typeof data.aiMaxTokens === 'number' && Number.isFinite(data.aiMaxTokens)
+              ? data.aiMaxTokens
+              : null,
+        })
+      } catch {
+        /* 读取失败保持默认 */
+      } finally {
+        if (alive) setLoaded(true)
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [open, loaded])
+
+  const handleSave = async () => {
+    setSaving(true)
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          aiSystemPrompt: draft.aiSystemPrompt,
+          aiRules: draft.aiRules,
+          aiSelfThinking: draft.aiSelfThinking,
+          aiTemperature: draft.aiTemperature,
+          aiMaxTokens: draft.aiMaxTokens,
+        }),
+      })
+      if (!res.ok) {
+        const e = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(e.error || '保存失败')
+      }
+      toast.success('AI 对话配置已保存')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="rounded-2xl border border-border bg-card px-4 py-4">
+      <div className="flex items-center gap-2 text-sm font-bold">
+        <Sparkles className="size-4 text-muted-foreground" strokeWidth={1.75} />
+        AI 对话配置
+      </div>
+      <p className="mt-0.5 text-[11px] text-muted-foreground/70">云端同步，所有设备生效</p>
+
+      <div className="mt-3 space-y-3">
+        {/* 系统提示词 */}
+        <div className="space-y-1.5">
+          <Label htmlFor="ai-system-prompt" className="text-xs text-muted-foreground">
+            系统提示词
+          </Label>
+          <Textarea
+            id="ai-system-prompt"
+            value={draft.aiSystemPrompt}
+            onChange={(e) => setDraft((d) => ({ ...d, aiSystemPrompt: e.target.value }))}
+            placeholder="定义 AI 的角色与风格，置于内置提示词之前（如：你是一位温柔的语文老师…）"
+            className="min-h-20 rounded-xl text-sm"
+          />
+        </div>
+
+        {/* 自定义规则 */}
+        <div className="space-y-1.5">
+          <Label htmlFor="ai-rules" className="text-xs text-muted-foreground">
+            自定义规则
+          </Label>
+          <Textarea
+            id="ai-rules"
+            value={draft.aiRules}
+            onChange={(e) => setDraft((d) => ({ ...d, aiRules: e.target.value }))}
+            placeholder="追加到系统提示词末尾的规则（如：回答控制在100字内；多用比喻讲解）"
+            className="min-h-20 rounded-xl text-sm"
+          />
+        </div>
+
+        {/* 自我思考 */}
+        <ToggleRow
+          label="自我思考"
+          desc="AI 回复前先在「💭 思考过程」中简要思考（追问弹层可按次覆盖）"
+          checked={draft.aiSelfThinking}
+          onCheckedChange={(v) => setDraft((d) => ({ ...d, aiSelfThinking: v }))}
+        />
+
+        {/* 温度 */}
+        <div className="space-y-1.5 rounded-xl border border-border/70 bg-muted/30 px-3 py-3">
+          <div className="flex items-center justify-between">
+            <Label className="text-xs text-muted-foreground">温度（随机性）</Label>
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs font-medium tabular-nums">
+                {draft.aiTemperature === null ? '默认' : draft.aiTemperature.toFixed(1)}
+              </span>
+              {draft.aiTemperature !== null && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 rounded-full px-2 text-[11px]"
+                  onClick={() => setDraft((d) => ({ ...d, aiTemperature: null }))}
+                >
+                  恢复默认
+                </Button>
+              )}
+            </div>
+          </div>
+          <Slider
+            value={[draft.aiTemperature ?? 0.7]}
+            min={0}
+            max={2}
+            step={0.1}
+            aria-label="温度"
+            onValueChange={(vals) =>
+              setDraft((d) => ({
+                ...d,
+                aiTemperature: Math.round(Math.min(2, Math.max(0, vals[0] ?? 0)) * 10) / 10,
+              }))
+            }
+          />
+          <div className="flex justify-between text-[10px] text-muted-foreground">
+            <span>0 严谨</span>
+            <span>2 活跃</span>
+          </div>
+        </div>
+
+        {/* 最大回复长度 */}
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <Label htmlFor="ai-max-tokens" className="text-xs text-muted-foreground">
+              最大回复长度（tokens）
+            </Label>
+            {draft.aiMaxTokens !== null && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 rounded-full px-2 text-[11px]"
+                onClick={() => setDraft((d) => ({ ...d, aiMaxTokens: null }))}
+              >
+                恢复默认
+              </Button>
+            )}
+          </div>
+          <Input
+            id="ai-max-tokens"
+            type="number"
+            inputMode="numeric"
+            min={64}
+            max={32768}
+            value={draft.aiMaxTokens ?? ''}
+            placeholder="默认（不限制）"
+            onChange={(e) => {
+              const v = e.target.value.trim()
+              if (v === '') {
+                setDraft((d) => ({ ...d, aiMaxTokens: null }))
+                return
+              }
+              const n = Math.round(Number(v))
+              setDraft((d) => ({
+                ...d,
+                aiMaxTokens: Number.isFinite(n) ? Math.min(32768, Math.max(64, n)) : null,
+              }))
+            }}
+            className="h-10 rounded-xl"
+          />
+        </div>
+
+        <Button
+          onClick={() => void handleSave()}
+          disabled={saving}
+          className="h-10 w-full rounded-full bg-primary font-semibold"
+        >
+          {saving && <Loader2 className="size-4 animate-spin" />}
+          保存 AI 对话配置
+        </Button>
+      </div>
     </div>
   )
 }
@@ -1335,6 +1560,15 @@ export function SettingsSheet({
                 保存 AI 模型设置
               </Button>
             </div>
+          </section>
+
+          {/* ---------- AI 对话配置 ---------- */}
+          <section>
+            <p className="mb-2 px-1 text-xs font-medium text-muted-foreground">AI 对话配置</p>
+            <AIChatConfigCard open={open} />
+            <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">
+              应用于 AI 问问 / 督背 / 追问等全部对话，保存后立即生效
+            </p>
           </section>
         </div>
       )}

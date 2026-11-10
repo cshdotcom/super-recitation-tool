@@ -5,10 +5,13 @@
 // Data model (persisted per card via /api/state KV):
 //   `wheel:<cardId>`  (cardId '' -> `wheel:global`)
 //     -> { wheels: [{ id, name, items: [{ id, text, enabled, star }] }], currentId }
-//   `wheel:done:<cardId>` -> { [YYYYMMDD]: string[] }  (item ids marked done that day)
+//   `wheel:done:<cardId>:<wheelId>` -> { [YYYYMMDD]: string[] }
+//     （done 标记按转盘隔离；旧整卡共享 key `wheel:done:<cardId>` 只读迁移）
 //
-// Views: main (wheel + spin + result) and edit (转盘名称 / 全选 / item list).
-// New wheels are created from a source picker: AI 智能分块 / 按段落 / 按空行 / 按标点 / 按知识块.
+// Views: main (wheel + spin + result), edit (名称/全选/item 列表/添加选项),
+// manage (齿轮入口：全部转盘 + 搜索 + 使用/重命名/复制/删除 + 新建)。
+// New wheels are created from a source picker: AI 智能分块 / 按段落 / 按空行 /
+// 按标点 / 按知识块 / 手动空白菜单；每个来源各自创建独立 wheel，互不覆盖。
 
 import * as React from 'react'
 import { motion } from 'framer-motion'
@@ -24,9 +27,10 @@ import {
   MoreHorizontal,
   Pencil,
   Plus,
-  RefreshCw,
   RotateCw,
   Rows3,
+  Search,
+  Settings,
   Sparkles,
   Square,
   Trash2,
@@ -84,12 +88,16 @@ const MAX_WEDGES = 12
 /** Items per wheel cap (按句子 explicitly capped at 30; applied to all sources). */
 const SOURCE_CAP = 30
 
+/** 转盘文档 key（每个书/卡片一套独立 wheels，互不干扰）。 */
 function wheelStateKey(cardId?: string | null): string {
   return `wheel:${cardId || 'global'}`
 }
 
-function wheelDoneKey(cardId?: string | null): string {
-  return `wheel:done:${cardId || 'global'}`
+/** done 标记 key：按转盘隔离（wheel:done:<cardId>:<wheelId>）。
+ *  不传 wheelId 时返回旧版整卡共享 key（仅用于只读迁移）。 */
+function wheelDoneKey(cardId?: string | null, wheelId?: string | null): string {
+  const c = cardId || 'global'
+  return wheelId ? `wheel:done:${c}:${wheelId}` : `wheel:done:${c}`
 }
 
 function todayYmd(): string {
@@ -194,7 +202,8 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
   const tts = useQuickTts('wheel', ttsSettings)
 
   const cKey = wheelStateKey(cardId)
-  const dKey = wheelDoneKey(cardId)
+  // 旧版整卡共享 done key（只读迁移用）
+  const legacyDoneKey = wheelDoneKey(cardId)
 
   const [state, setState] = React.useState<WheelState | null>(null)
   const [loaded, setLoaded] = React.useState(false)
@@ -207,8 +216,11 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
   const [spinning, setSpinning] = React.useState(false)
   const [pickedId, setPickedId] = React.useState<string | null>(null)
 
-  const [switchOpen, setSwitchOpen] = React.useState(false)
+  // 转盘管理弹窗：搜索 + 全部转盘 CRUD
+  const [manageOpen, setManageOpen] = React.useState(false)
+  const [manageQuery, setManageQuery] = React.useState('')
   const [newOpen, setNewOpen] = React.useState(false)
+  const [manualName, setManualName] = React.useState('')
   const [aiLoading, setAiLoading] = React.useState(false)
   const [renamingId, setRenamingId] = React.useState<string | null>(null)
   const [renameText, setRenameText] = React.useState('')
@@ -218,7 +230,7 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
   const spinTimerRef = React.useRef<number | null>(null)
   const lastPickRef = React.useRef<string | null>(null)
 
-  // Load persisted state (wheels + done marks) on mount / card change.
+  // Load persisted wheels on mount / card change（done 标记另按当前转盘加载）.
   React.useEffect(() => {
     let alive = true
     if (spinTimerRef.current) window.clearTimeout(spinTimerRef.current)
@@ -229,7 +241,7 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
     setDraft(null)
     setPickedId(null)
     setRotation(0)
-    getState([cKey, dKey]).then((vals) => {
+    getState([cKey]).then((vals) => {
       if (!alive) return
       const ws = parseWheelState(vals[cKey])
       if (ws) {
@@ -239,14 +251,12 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
         const wheel = makeWheel('全文抽背', splitSentences(content).slice(0, MAX_WEDGES))
         setState({ wheels: [wheel], currentId: wheel.id })
       }
-      setDoneMap(parseDoneMap(vals[dKey]))
       setLoaded(true)
     })
     return () => {
       alive = false
     }
-     
-  }, [cKey, dKey, content])
+  }, [cKey, content])
 
   // Clear pending spin timer on unmount.
   React.useEffect(() => {
@@ -263,17 +273,52 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
     [cKey],
   )
 
+  // ------------------------------ done marks（按转盘隔离） ------------------------------
+  // key = wheel:done:<cardId>:<wheelId>——切转盘后 done 标记不串；
+  // 旧整卡共享 key 只在当前转盘 key 为空时只读迁移（首次标记时写入新 key）。
+  const curWheelId = state
+    ? (state.wheels.find((w) => w.id === state.currentId)?.id ?? state.wheels[0]?.id ?? null)
+    : null
+  const curDoneKey = React.useMemo(
+    () => (curWheelId ? wheelDoneKey(cardId, curWheelId) : null),
+    [cardId, curWheelId],
+  )
+
+  React.useEffect(() => {
+    let alive = true
+    setDoneMap({})
+    if (!curDoneKey) return
+    getState([curDoneKey, legacyDoneKey]).then((vals) => {
+      if (!alive) return
+      const perWheel = parseDoneMap(vals[curDoneKey])
+      setDoneMap(Object.keys(perWheel).length > 0 ? perWheel : parseDoneMap(vals[legacyDoneKey]))
+    })
+    return () => {
+      alive = false
+    }
+  }, [curDoneKey, legacyDoneKey])
+
   const persistDone = React.useCallback(
     (next: Record<string, string[]>) => {
       setDoneMap(next)
-      void putState(dKey, JSON.stringify(next))
+      if (curDoneKey) void putState(curDoneKey, JSON.stringify(next))
     },
-    [dKey],
+    [curDoneKey],
   )
 
   const wheel = state
     ? (state.wheels.find((w) => w.id === state.currentId) ?? state.wheels[0])
     : null
+  // 转盘管理弹窗的搜索过滤（按名称或任意词条）
+  const manageQueryTrim = manageQuery.trim().toLowerCase()
+  const filteredWheels = state
+    ? state.wheels.filter(
+        (w) =>
+          !manageQueryTrim ||
+          w.name.toLowerCase().includes(manageQueryTrim) ||
+          w.items.some((i) => i.text.toLowerCase().includes(manageQueryTrim)),
+      )
+    : []
   const enabledItems = React.useMemo(
     () => (wheel ? wheel.items.filter((i) => i.enabled) : []),
     [wheel],
@@ -352,9 +397,10 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
   const switchTo = (id: string) => {
     if (!state) return
     persist({ ...state, currentId: id })
-    setSwitchOpen(false)
+    setManageOpen(false)
     setPickedId(null)
     setView('main')
+    toast.success(`已切换到「${state.wheels.find((w) => w.id === id)?.name ?? '转盘'}」`)
   }
 
   const saveRename = () => {
@@ -399,6 +445,32 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
   }
 
   // ------------------------------ create from source ------------------------------
+
+  /** 新 wheel 落地：追加（不覆盖任何已有转盘）→ 切为当前 → 打开编辑。 */
+  const adoptNewWheel = (w: WheelDoc) => {
+    const next: WheelState = state
+      ? { wheels: [...state.wheels, w], currentId: w.id }
+      : { wheels: [w], currentId: w.id }
+    persist(next)
+    setNewOpen(false)
+    setManageOpen(false)
+    setPickedId(null)
+    setDraft(deepCopy(w))
+    setExpandedId(null)
+    setView('edit')
+  }
+
+  /** 手动空白菜单：建空白转盘后逐条添加。 */
+  const createManualWheel = () => {
+    const name = manualName.trim()
+    if (!name) {
+      toast.error('请填写转盘名称')
+      return
+    }
+    adoptNewWheel(makeWheel(name, []))
+    setManualName('')
+    toast.success(`已创建「${name}」，请在下方添加选项`)
+  }
 
   const createWheel = async (source: WheelSource) => {
     if (!content.trim()) {
@@ -450,15 +522,7 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
     }
     const name = `转盘${(state?.wheels.length ?? 0) + 1}`
     const w = makeWheel(name, texts)
-    const next: WheelState = state
-      ? { wheels: [...state.wheels, w], currentId: w.id }
-      : { wheels: [w], currentId: w.id }
-    persist(next)
-    setNewOpen(false)
-    setPickedId(null)
-    setDraft(deepCopy(w))
-    setExpandedId(null)
-    setView('edit')
+    adoptNewWheel(w)
     toast.success(`已创建「${name}」· 共 ${w.items.length} 项`)
   }
 
@@ -512,6 +576,13 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
   const removeDraftItem = (id: string) => {
     setDraft((d) => (d ? { ...d, items: d.items.filter((i) => i.id !== id) } : d))
     setExpandedId((e) => (e === id ? null : e))
+  }
+
+  /** 添加选项：追加空选项并展开编辑（手动空白菜单的核心入口）。 */
+  const addDraftItem = () => {
+    const item: WheelItem = { id: uid(), text: '', enabled: true, star: false }
+    setDraft((d) => (d ? { ...d, items: [...d.items, item] } : d))
+    setExpandedId(item.id)
   }
 
   // ------------------------------ render ------------------------------
@@ -656,9 +727,17 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
               </div>
             )
           })}
+          {/* 添加选项（手动空白菜单的核心入口） */}
+          <button
+            type="button"
+            onClick={addDraftItem}
+            className="flex min-h-11 w-full items-center justify-center gap-1.5 rounded-2xl border border-dashed border-border text-sm text-muted-foreground transition-colors hover:bg-muted/50"
+          >
+            <Plus className="size-4" strokeWidth={1.75} /> 添加选项
+          </button>
           {draft.items.length === 0 && (
             <div className="rounded-2xl border border-dashed border-border py-8 text-center text-sm text-muted-foreground">
-              暂无选项，请返回后重新新建转盘
+              暂无选项，点击上方「添加选项」逐条录入
             </div>
           )}
         </div>
@@ -780,21 +859,26 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
         )}
       </Button>
 
-      {/* 新建 / 切换 */}
+      {/* 新建 / 管理 */}
       <div className="flex w-full gap-2">
         <Button
           variant="outline"
-          className="h-10 flex-1 rounded-full"
+          className="h-11 flex-1 rounded-full"
           onClick={() => setNewOpen(true)}
         >
           <Plus className="size-4" strokeWidth={1.75} /> 新建转盘
         </Button>
         <Button
           variant="outline"
-          className="h-10 flex-1 rounded-full"
-          onClick={() => setSwitchOpen(true)}
+          className="h-11 flex-1 rounded-full"
+          onClick={() => {
+            setManageQuery('')
+            setRenamingId(null)
+            setDeletingId(null)
+            setManageOpen(true)
+          }}
         >
-          <RefreshCw className="size-4" strokeWidth={1.75} /> 切换转盘
+          <Settings className="size-4" strokeWidth={1.75} /> 管理转盘
         </Button>
       </div>
 
@@ -858,112 +942,159 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
         </motion.div>
       )}
 
-      {/* 切换转盘 sheet */}
-      <BottomSheet open={switchOpen} onOpenChange={setSwitchOpen} title="切换转盘">
-        <div className="mt-4 flex flex-col gap-2 pb-4">
-          {state.wheels.map((w) => {
-            const isCurrent = w.id === wheel.id
-            return (
-              <div key={w.id} className="rounded-2xl border border-border bg-card">
-                {renamingId === w.id ? (
-                  <div className="flex items-center gap-2 p-2">
-                    <Input
-                      autoFocus
-                      value={renameText}
-                      onChange={(e) => setRenameText(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') saveRename()
-                        if (e.key === 'Escape') setRenamingId(null)
-                      }}
-                      maxLength={20}
-                      className="h-10 flex-1"
-                      placeholder="转盘名称"
-                    />
-                    <Button size="icon" className="size-10 shrink-0 rounded-full" aria-label="保存名称" onClick={saveRename}>
-                      <Check className="size-4" strokeWidth={2} />
-                    </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="size-10 shrink-0 rounded-full"
-                      aria-label="取消重命名"
-                      onClick={() => setRenamingId(null)}
-                    >
-                      <X className="size-4" strokeWidth={1.75} />
-                    </Button>
-                  </div>
-                ) : deletingId === w.id ? (
-                  <div className="flex min-h-12 items-center justify-between gap-2 p-3">
-                    <span className="text-sm text-red-600">确认删除「{w.name}」？</span>
-                    <div className="flex shrink-0 gap-2">
-                      <Button size="sm" variant="ghost" className="h-9 rounded-full" onClick={() => setDeletingId(null)}>
-                        取消
+      {/* 转盘管理 sheet：搜索 + 全部转盘（使用/重命名/复制/删除） + 新建 */}
+      <BottomSheet open={manageOpen} onOpenChange={setManageOpen} title="管理转盘">
+        <div className="mt-4 flex flex-col gap-3 pb-4">
+          {/* 搜索：按转盘名称 / 词条内容过滤 */}
+          <div className="relative">
+            <Search
+              className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+              strokeWidth={1.75}
+            />
+            <Input
+              value={manageQuery}
+              onChange={(e) => setManageQuery(e.target.value)}
+              placeholder="搜索转盘名称或词条"
+              inputMode="search"
+              className="h-11 pl-9"
+            />
+          </div>
+          <div className="flex flex-col gap-2">
+            {filteredWheels.map((w) => {
+              const isCurrent = w.id === wheel.id
+              return (
+                <div key={w.id} className="rounded-2xl border border-border bg-card">
+                  {renamingId === w.id ? (
+                    <div className="flex items-center gap-2 p-2">
+                      <Input
+                        autoFocus
+                        value={renameText}
+                        onChange={(e) => setRenameText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') saveRename()
+                          if (e.key === 'Escape') setRenamingId(null)
+                        }}
+                        maxLength={20}
+                        className="h-10 flex-1"
+                        placeholder="转盘名称"
+                      />
+                      <Button size="icon" className="size-10 shrink-0 rounded-full" aria-label="保存名称" onClick={saveRename}>
+                        <Check className="size-4" strokeWidth={2} />
                       </Button>
                       <Button
-                        size="sm"
-                        className="h-9 rounded-full bg-red-600 text-white hover:bg-red-700"
-                        onClick={() => deleteWheel(w.id)}
+                        size="icon"
+                        variant="ghost"
+                        className="size-10 shrink-0 rounded-full"
+                        aria-label="取消重命名"
+                        onClick={() => setRenamingId(null)}
                       >
-                        删除
+                        <X className="size-4" strokeWidth={1.75} />
                       </Button>
                     </div>
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-1 p-1.5">
-                    <button
-                      type="button"
-                      onClick={() => switchTo(w.id)}
-                      className="flex min-h-11 min-w-0 flex-1 items-center gap-2.5 rounded-xl px-2 text-left transition-colors hover:bg-muted/50"
-                    >
-                      <span
-                        className={cn(
-                          'flex size-5 shrink-0 items-center justify-center rounded-full border-2',
-                          isCurrent ? 'border-emerald-600 bg-emerald-600 text-white' : 'border-zinc-300 text-transparent',
-                        )}
-                      >
-                        <Check className="size-3" strokeWidth={3} />
-                      </span>
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-medium">{w.name}</span>
-                        <span className="block text-xs text-muted-foreground">
-                          {w.items.filter((i) => i.enabled).length}/{w.items.length} 项
-                        </span>
-                      </span>
-                    </button>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="size-9 shrink-0 rounded-full text-muted-foreground"
-                          aria-label={`${w.name} 更多操作`}
-                        >
-                          <MoreHorizontal className="size-4.5" strokeWidth={1.75} />
+                  ) : deletingId === w.id ? (
+                    <div className="flex min-h-12 items-center justify-between gap-2 p-3">
+                      <span className="text-sm text-red-600">确认删除「{w.name}」？</span>
+                      <div className="flex shrink-0 gap-2">
+                        <Button size="sm" variant="ghost" className="h-9 rounded-full" onClick={() => setDeletingId(null)}>
+                          取消
                         </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end">
-                        <DropdownMenuItem
-                          onSelect={() => {
-                            setRenamingId(w.id)
-                            setRenameText(w.name)
-                          }}
-                        >
-                          重命名
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onSelect={() => duplicateWheel(w)}>复制</DropdownMenuItem>
-                        <DropdownMenuItem
-                          className="text-red-600 focus:text-red-600"
-                          onSelect={() => setDeletingId(w.id)}
+                        <Button
+                          size="sm"
+                          className="h-9 rounded-full bg-red-600 text-white hover:bg-red-700"
+                          onClick={() => deleteWheel(w.id)}
                         >
                           删除
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
-                )}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-1 p-1.5">
+                      <button
+                        type="button"
+                        onClick={() => switchTo(w.id)}
+                        className="flex min-h-11 min-w-0 flex-1 items-center gap-2.5 rounded-xl px-2 text-left transition-colors hover:bg-muted/50"
+                      >
+                        <span
+                          className={cn(
+                            'flex size-5 shrink-0 items-center justify-center rounded-full border-2',
+                            isCurrent ? 'border-emerald-600 bg-emerald-600 text-white' : 'border-zinc-300 text-transparent',
+                          )}
+                        >
+                          <Check className="size-3" strokeWidth={3} />
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="flex items-center gap-1.5">
+                            <span className="truncate text-sm font-medium">{w.name}</span>
+                            {isCurrent && (
+                              <span className="shrink-0 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">
+                                使用中
+                              </span>
+                            )}
+                          </span>
+                          <span className="block truncate text-xs text-muted-foreground">
+                            {w.items.filter((i) => i.enabled).length}/{w.items.length} 项
+                          </span>
+                        </span>
+                      </button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-9 shrink-0 rounded-full text-muted-foreground"
+                            aria-label={`${w.name} 更多操作`}
+                          >
+                            <MoreHorizontal className="size-4.5" strokeWidth={1.75} />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem onSelect={() => switchTo(w.id)}>
+                            <Check className="size-4" strokeWidth={1.75} /> 使用
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onSelect={() => {
+                              setRenamingId(w.id)
+                              setRenameText(w.name)
+                            }}
+                          >
+                            <Pencil className="size-4" strokeWidth={1.75} /> 重命名
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onSelect={() => duplicateWheel(w)}>
+                            <Copy className="size-4" strokeWidth={1.75} /> 复制
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            className="text-red-600 focus:text-red-600"
+                            onSelect={() => setDeletingId(w.id)}
+                          >
+                            <Trash2 className="size-4" strokeWidth={1.75} /> 删除
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+            {filteredWheels.length === 0 && (
+              <div className="rounded-2xl border border-dashed border-border py-8 text-center text-sm text-muted-foreground">
+                {state.wheels.length === 0
+                  ? '还没有转盘，点击下方新建'
+                  : `没有匹配「${manageQuery.trim()}」的转盘`}
               </div>
-            )
-          })}
+            )}
+          </div>
+          <Button
+            variant="outline"
+            className="h-11 rounded-full"
+            onClick={() => {
+              setRenamingId(null)
+              setDeletingId(null)
+              setManageOpen(false)
+              setNewOpen(true)
+            }}
+          >
+            <Plus className="size-4" strokeWidth={1.75} /> 新建转盘
+          </Button>
         </div>
       </BottomSheet>
 
@@ -1060,6 +1191,40 @@ export function WheelPanel({ content, settings, cardId, card }: WheelPanelProps)
               </span>
             </button>
           )}
+
+          {/* 手动空白菜单：建空白转盘后逐条添加 */}
+          <div className="rounded-2xl border border-dashed border-border p-3">
+            <div className="flex items-center gap-3">
+              <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-zinc-100 text-zinc-600">
+                <Pencil className="size-5" strokeWidth={1.75} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold">手动空白菜单</div>
+                <div className="truncate text-xs text-muted-foreground">
+                  先建空白转盘，再逐条添加选项
+                </div>
+              </div>
+            </div>
+            <div className="mt-2.5 flex gap-2">
+              <Input
+                value={manualName}
+                onChange={(e) => setManualName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') createManualWheel()
+                }}
+                placeholder="转盘名称（如：易错句）"
+                maxLength={20}
+                className="h-10 flex-1"
+              />
+              <Button
+                className="h-10 shrink-0 rounded-full px-4"
+                disabled={!manualName.trim() || aiLoading}
+                onClick={createManualWheel}
+              >
+                <Plus className="size-4" strokeWidth={1.75} /> 创建
+              </Button>
+            </div>
+          </div>
         </div>
       </BottomSheet>
     </div>

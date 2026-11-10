@@ -31,6 +31,7 @@ import {
   LayoutGrid,
   Menu,
   MessagesSquare,
+  Mic,
   Pencil,
   Pin,
   PinOff,
@@ -586,6 +587,29 @@ export function HomeView({
             </button>
           </div>
         </div>
+
+        {/* 全局混合检索入口：书本 / 文章素材 / AI 对话。
+            点击派发 window 'app:openSearch'，由主页统一挂载的 SearchOverlay
+            （home 模式）接管；本组件不自己渲染浮层。 */}
+        <button
+          type="button"
+          aria-label="打开全局搜索"
+          onClick={() => {
+            window.dispatchEvent(new CustomEvent('app:openSearch'))
+          }}
+          className="mt-4 flex h-11 w-full items-center gap-2.5 rounded-full border border-border bg-card pl-4 pr-1.5 shadow-sm transition-colors hover:bg-accent"
+        >
+          <Search className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} />
+          <span className="min-w-0 flex-1 truncate text-left text-sm text-muted-foreground">
+            搜索书本、文章、对话…
+          </span>
+          <span
+            aria-hidden
+            className="flex size-8 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600"
+          >
+            <Mic className="size-4" strokeWidth={1.9} />
+          </span>
+        </button>
 
         {loading ? (
           <div className="mt-6 space-y-3">

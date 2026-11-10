@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import { createPortal } from 'react-dom'
-import { Copy, Eraser, Eye, Flag, RotateCcw, Volume2 } from 'lucide-react'
+import { Copy, Eraser, Eye, Flag, GripVertical, RotateCcw, Volume2 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
@@ -21,10 +21,19 @@ import 'katex/contrib/mhchem'
 
 const LONG_PRESS_MS = 420
 const MOVE_TOLERANCE = 12
-const SEL_MENU_WIDTH = 196
-const SEL_MENU_PAD = 14
-const SEL_ROW_HEIGHT = 42
+/** 选区浮动菜单宽度（px，与面板 style.width 一致） */
+const SEL_MENU_WIDTH = 208
+/** 选区浮动菜单估算高度（含拖动把手，用于定位/clamp） */
+const SEL_MENU_H = 150
+/** 菜单与选区上下边缘的最小垂直间距：避开上下两个选择手柄（拖块） */
+const SEL_MENU_GAP = 56
 const VIEWPORT_INSET = 8
+/** 涂刷插值采样步长（px）：越小越不漏字 */
+const BRUSH_SAMPLE_STEP = 4
+/** 手柄拖到视口上下边缘多少 px 内时自动滚动页面 */
+const HANDLE_AUTOSCROLL_EDGE = 88
+/** 选区菜单拖动偏移的记忆 key（localStorage，跨会话记忆） */
+const SEL_MENU_DRAG_KEY = 'sb:cloze-selmenu-offset'
 
 interface CharToken {
   text: string
@@ -576,12 +585,29 @@ export function ClozeText({
   const [selMenu, setSelMenu] = React.useState<{
     x: number
     y: number
+    /** 自动定位的基准点（用户拖动偏移基于此记忆，下次打开继续生效） */
+    baseX: number
+    baseY: number
     above: boolean
     text: string
     isKeyword: boolean
     /** 打开菜单时解析的精确出现序号（null = 未解析，走首个出现回退）。 */
     occ?: number | null
   } | null>(null)
+  // 用户拖动选区菜单产生的偏移（相对自动定位基准），localStorage 记忆。
+  const selMenuOffRef = React.useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 })
+  React.useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(SEL_MENU_DRAG_KEY)
+      if (!raw) return
+      const p = JSON.parse(raw) as { dx?: unknown; dy?: unknown }
+      if (typeof p?.dx === 'number' && typeof p?.dy === 'number') {
+        selMenuOffRef.current = { dx: p.dx, dy: p.dy }
+      }
+    } catch {
+      /* noop */
+    }
+  }, [])
   // 手柄尖端坐标（拖拽时实时更新）；menuOpen=false 时只显示手柄不显示菜单。
   const [selTips, setSelTips] = React.useState<{
     start: { x: number; y: number }
@@ -755,6 +781,54 @@ export function ClozeText({
   const charIdxFromEvent = (e: { clientX: number; clientY: number }): number =>
     charIdxFromPoint(e.clientX, e.clientY)
 
+  // ---- 选区菜单定位 ----
+  // 菜单与选区上下保持 SEL_MENU_GAP(56px) 间距：避开上下两个选择手柄（拖块），
+  // 顶部放不下时放选区下方（同样 56px 间距），始终 clamp 在视口内。
+  const clampMenuX = (x: number) =>
+    Math.min(
+      Math.max(x, SEL_MENU_WIDTH / 2 + VIEWPORT_INSET),
+      Math.max(SEL_MENU_WIDTH / 2 + VIEWPORT_INSET, window.innerWidth - SEL_MENU_WIDTH / 2 - VIEWPORT_INSET),
+    )
+  const clampMenuY = (y: number) =>
+    Math.min(
+      Math.max(y, SEL_MENU_H / 2 + VIEWPORT_INSET),
+      Math.max(SEL_MENU_H / 2 + VIEWPORT_INSET, window.innerHeight - SEL_MENU_H / 2 - VIEWPORT_INSET),
+    )
+
+  const placeSelMenu = (bbox: { top: number; bottom: number; left: number; right: number }) => {
+    const halfH = SEL_MENU_H / 2
+    const vh = window.innerHeight
+    const x = clampMenuX((bbox.left + bbox.right) / 2)
+    const yAbove = bbox.top - SEL_MENU_GAP - halfH
+    const yBelow = bbox.bottom + SEL_MENU_GAP + halfH
+    const fitsAbove = yAbove - halfH >= VIEWPORT_INSET
+    const fitsBelow = yBelow + halfH <= vh - VIEWPORT_INSET
+    let above = fitsAbove || !fitsBelow
+    let y = above ? yAbove : yBelow
+    if (!fitsAbove && !fitsBelow) {
+      // 两侧都放不下：选空间更大的一侧并 clamp 进视口
+      above = bbox.top > vh - bbox.bottom
+      y = above ? yAbove : yBelow
+    }
+    return { x, y: clampMenuY(y), above }
+  }
+
+  /** 桌面右键路径：菜单出现在点击点附近（同样应用记忆偏移 + clamp）。 */
+  const openMenuAtPoint = (x: number, y: number, text: string, isKeyword: boolean, occ: number | null) => {
+    const baseX = clampMenuX(x)
+    const baseY = clampMenuY(y)
+    setSelMenu({
+      x: clampMenuX(baseX + selMenuOffRef.current.dx),
+      y: clampMenuY(baseY + selMenuOffRef.current.dy),
+      baseX,
+      baseY,
+      above: y > window.innerHeight / 2,
+      text,
+      isKeyword,
+      occ,
+    })
+  }
+
   const openMenuForRange = React.useCallback(
     (a: number, f: number, at?: { x: number; y: number }, occ?: number | null) => {
       const els = getCharEls()
@@ -765,34 +839,23 @@ export function ClozeText({
       if (!text) return
       const layout = computeSelLayout(a, f)
       if (!layout) return
-      const { bbox, above } = layout
       const kw = isOccBlanked(text, occ ?? null)
-      const SEL_MENU_W = 208
-      const x = Math.min(
-        Math.max((bbox.left + bbox.right) / 2, SEL_MENU_W / 2 + VIEWPORT_INSET),
-        window.innerWidth - SEL_MENU_W / 2 - VIEWPORT_INSET,
-      )
-      const y = above ? bbox.top - 10 : bbox.bottom + 10
-      const mk = (px: number, py: boolean) => ({
-        x: px,
-        y: py ? bbox.top - 10 : bbox.bottom + 10,
-        above: py,
+      if (at) {
+        openMenuAtPoint(at.x, at.y, text, kw, occ ?? null)
+        return
+      }
+      const base = placeSelMenu(layout.bbox)
+      const off = selMenuOffRef.current
+      setSelMenu({
+        x: clampMenuX(base.x + off.dx),
+        y: clampMenuY(base.y + off.dy),
+        baseX: base.x,
+        baseY: base.y,
+        above: base.above,
         text,
         isKeyword: kw,
         occ: occ ?? null,
       })
-      if (at) {
-        setSelMenu({
-          x: at.x,
-          y: at.y,
-          above: at.y > window.innerHeight / 2,
-          text,
-          isKeyword: kw,
-          occ: occ ?? null,
-        })
-      } else {
-        setSelMenu(mk(x, above))
-      }
     },
     [extractSelText, getCharEls, computeSelLayout, isOccBlanked],
   )
@@ -861,6 +924,50 @@ export function ClozeText({
 
   // ---- 自由选择手柄（teardrop）：拖动任意手柄自由拉升/收缩选择范围 ----
   const HANDLE_BODY_OFFSET = 34 // 手柄身体离尖端的距离
+  const handleDragPosRef = React.useRef<{ x: number; y: number } | null>(null)
+  const autoScrollRafRef = React.useRef<number | null>(null)
+
+  /** 手柄尖端 → 解析字并更新选择范围（拖拽与自动滚动共用）。 */
+  const resolveHandleToChar = (which: 'start' | 'end', tip: { x: number; y: number }) => {
+    const idx = charIdxFromPoint(tip.x, tip.y)
+    if (idx < 0) return
+    if (which === 'start' && idx !== anchorRef.current) {
+      highlightRange(idx, focusRef.current)
+    } else if (which === 'end' && idx !== focusRef.current) {
+      highlightRange(anchorRef.current, idx)
+    }
+  }
+
+  // 手柄拖到视口上下边缘时自动滚动页面（解决“选择框无法继续往下滑动选择手柄”）。
+  const startAutoScroll = () => {
+    if (autoScrollRafRef.current !== null) return
+    const step = () => {
+      autoScrollRafRef.current = window.requestAnimationFrame(step)
+      const which = handleDragRef.current
+      const pos = handleDragPosRef.current
+      if (!which || !pos) return
+      const vh = window.innerHeight
+      let dy = 0
+      if (pos.y < HANDLE_AUTOSCROLL_EDGE) {
+        dy = -Math.ceil(Math.min(16, (HANDLE_AUTOSCROLL_EDGE - pos.y) / 5 + 3))
+      } else if (pos.y > vh - HANDLE_AUTOSCROLL_EDGE) {
+        dy = Math.ceil(Math.min(16, (pos.y - (vh - HANDLE_AUTOSCROLL_EDGE)) / 5 + 3))
+      }
+      if (dy === 0) return
+      window.scrollBy(0, dy)
+      // 内容随滚动位移后，重新解析手柄下的字（选择随滚动继续延伸）
+      resolveHandleToChar(which, pos)
+    }
+    autoScrollRafRef.current = window.requestAnimationFrame(step)
+  }
+  const stopAutoScroll = () => {
+    if (autoScrollRafRef.current !== null) {
+      window.cancelAnimationFrame(autoScrollRafRef.current)
+      autoScrollRafRef.current = null
+    }
+  }
+  React.useEffect(() => stopAutoScroll, [])
+
   const beginHandleDrag = (which: 'start' | 'end') => (e: React.PointerEvent) => {
     e.preventDefault()
     e.stopPropagation()
@@ -872,6 +979,11 @@ export function ClozeText({
     handleDragRef.current = which
     setHandleDrag(which)
     setSelMenu(null) // 拖拽期间隐藏菜单，松手再出现
+    handleDragPosRef.current =
+      which === 'start'
+        ? { x: e.clientX + 6, y: e.clientY - HANDLE_BODY_OFFSET + 4 }
+        : { x: e.clientX - 6, y: e.clientY + HANDLE_BODY_OFFSET - 4 }
+    startAutoScroll()
   }
   const moveHandleDrag = (which: 'start' | 'end') => (e: React.PointerEvent) => {
     if (handleDragRef.current !== which) return
@@ -882,19 +994,16 @@ export function ClozeText({
       which === 'start'
         ? { x: e.clientX + 6, y: e.clientY - HANDLE_BODY_OFFSET + 4 }
         : { x: e.clientX - 6, y: e.clientY + HANDLE_BODY_OFFSET - 4 }
-    const idx = charIdxFromPoint(tip.x, tip.y)
-    if (idx < 0) return
-    if (which === 'start' && idx !== anchorRef.current) {
-      highlightRange(idx, focusRef.current)
-    } else if (which === 'end' && idx !== focusRef.current) {
-      highlightRange(anchorRef.current, idx)
-    }
+    handleDragPosRef.current = tip
+    resolveHandleToChar(which, tip)
   }
   const endHandleDrag = (which: 'start' | 'end') => (e: React.PointerEvent) => {
     if (handleDragRef.current !== which) return
     e.preventDefault()
     handleDragRef.current = null
     setHandleDrag(null)
+    stopAutoScroll()
+    handleDragPosRef.current = null
     try {
       ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
     } catch {
@@ -909,6 +1018,55 @@ export function ClozeText({
         /* noop */
       }
       openMenuForRange(a, f)
+    }
+  }
+
+  // ---- 选区菜单拖动（把手）：拖到不挡手柄的位置，偏移跨会话记忆 ----
+  const selMenuDragRef = React.useRef<{ px: number; py: number; baseX: number; baseY: number } | null>(null)
+  const beginSelMenuDrag = (e: React.PointerEvent) => {
+    if (!selMenu) return
+    e.preventDefault()
+    e.stopPropagation()
+    try {
+      ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+    } catch {
+      /* noop */
+    }
+    selMenuDragRef.current = {
+      px: e.clientX,
+      py: e.clientY,
+      baseX: selMenu.baseX + selMenuOffRef.current.dx,
+      baseY: selMenu.baseY + selMenuOffRef.current.dy,
+    }
+  }
+  const moveSelMenuDrag = (e: React.PointerEvent) => {
+    const d = selMenuDragRef.current
+    if (!d || !selMenu) return
+    e.preventDefault()
+    e.stopPropagation()
+    setSelMenu({
+      ...selMenu,
+      x: clampMenuX(d.baseX + (e.clientX - d.px)),
+      y: clampMenuY(d.baseY + (e.clientY - d.py)),
+    })
+  }
+  const endSelMenuDrag = (e: React.PointerEvent) => {
+    const d = selMenuDragRef.current
+    if (!d) return
+    selMenuDragRef.current = null
+    try {
+      ;(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId)
+    } catch {
+      /* noop */
+    }
+    if (!selMenu) return
+    // 记忆相对自动定位基准的偏移（下次打开继续生效）
+    const off = { dx: selMenu.x - selMenu.baseX, dy: selMenu.y - selMenu.baseY }
+    selMenuOffRef.current = off
+    try {
+      window.localStorage.setItem(SEL_MENU_DRAG_KEY, JSON.stringify(off))
+    } catch {
+      /* noop */
     }
   }
 
@@ -935,25 +1093,19 @@ export function ClozeText({
       root.contains(sel.focusNode)
 
     if (nativeInside && selText && selText.length <= 200) {
-      const x = Math.min(
-        Math.max(e.clientX, SEL_MENU_WIDTH / 2 + VIEWPORT_INSET),
-        window.innerWidth - SEL_MENU_WIDTH / 2 - VIEWPORT_INSET,
-      )
-      const y = Math.min(Math.max(e.clientY, VIEWPORT_INSET + 8), window.innerHeight - 8)
       // 尝试从选区起点解析精确出现序号（拖选第二处「明月」也能精准挖空这一处）。
       const anchorEl = (sel!.anchorNode?.parentElement ?? null)?.closest?.(
         '[data-char]',
       ) as HTMLElement | null
       const occSel = occFromCharEl(anchorEl, selText)
       const occValid = occSel !== null && occSel >= 0
-      setSelMenu({
-        x,
-        y,
-        above: y > window.innerHeight / 2,
-        text: selText,
-        isKeyword: occValid ? isOccBlanked(selText, occSel) : isTextBlanked(selText),
-        occ: occValid ? occSel : null,
-      })
+      openMenuAtPoint(
+        e.clientX,
+        e.clientY,
+        selText,
+        occValid ? isOccBlanked(selText, occSel) : isTextBlanked(selText),
+        occValid ? occSel : null,
+      )
       return
     }
 
@@ -1030,8 +1182,6 @@ export function ClozeText({
 
   React.useEffect(() => clearPressTimer, [])
 
-  const selMenuH = 3 * SEL_ROW_HEIGHT + SEL_MENU_PAD
-  void selMenuH
   const selOriginX = selMenu
     ? selMenu.x > window.innerWidth / 2
       ? 'right'
@@ -1044,24 +1194,19 @@ export function ClozeText({
     : 'top'
 
   // ---- 自由选择框 portal：手柄 + 浮动菜单 ----
+  // 层级关系（Bug2 修复核心）：
+  //   9997 点按关闭层（selBackdrop，菜单打开时才挂）
+  //   9998 手柄层（selOverlay，永远高于关闭层 → 菜单打开时也能直接抓拖块）
+  //   9999 菜单面板本体（无整屏容器，pointer-events 只在面板 → 绝不遮挡手柄/正文）
   const teardropCls =
     'pointer-events-auto absolute size-6 rounded-full bg-white shadow-[0_2px_10px_rgba(0,0,0,0.35)] ring-1 ring-black/10'
   const selOverlay = selTips ? (
-    <div
-      className="fixed inset-0 z-[9998]"
-      style={{ pointerEvents: 'none' }}
-      onPointerDown={(e) => {
-        // 点击空白关闭选择（菜单打开时）。
-        if (selMenu && !handleDrag) {
-          e.stopPropagation()
-          closeSelMenu()
-        }
-      }}
-    >
+    <div data-cloze-ui="1" className="fixed inset-0 z-[9998]" style={{ pointerEvents: 'none' }}>
       {/* start handle — 身体在尖端左下方 */}
       <div
         role="button"
         aria-label="拖动调整选择起点"
+        data-cloze-ui="1"
         style={{
           position: 'fixed',
           left: selTips.start.x,
@@ -1081,6 +1226,7 @@ export function ClozeText({
       <div
         role="button"
         aria-label="拖动调整选择终点"
+        data-cloze-ui="1"
         style={{
           position: 'fixed',
           left: selTips.end.x,
@@ -1099,31 +1245,54 @@ export function ClozeText({
     </div>
   ) : null
 
-  const selMenuPanel = selMenu ? (
+  // 点按任意空白处关闭选择（仅在菜单打开时挂载；低于手柄层，不会拦截拖块）
+  const selBackdrop = selMenu ? (
     <div
-      className="fixed inset-0 z-[9999]"
-      onPointerDown={(e) => e.stopPropagation()}
-      onClick={closeSelMenu}
+      data-cloze-ui="1"
+      aria-hidden
+      className="fixed inset-0 z-[9997]"
+      onPointerDown={(e) => {
+        e.stopPropagation()
+        closeSelMenu()
+      }}
       onContextMenu={(e) => {
         e.preventDefault()
         closeSelMenu()
       }}
+    />
+  ) : null
+
+  const selMenuPanel = selMenu ? (
+    <div
+      role="menu"
+      aria-label="选择菜单"
+      data-cloze-ui="1"
+      style={{
+        position: 'fixed',
+        left: selMenu.x,
+        top: selMenu.y,
+        width: SEL_MENU_WIDTH,
+        zIndex: 9999,
+        transformOrigin: `${selOriginX} ${selOriginY}`,
+        transform: 'translate(-50%, -50%)',
+      }}
+      className="pointer-events-auto rounded-2xl border border-white/10 bg-zinc-900/95 p-1.5 pt-0 text-white shadow-2xl backdrop-blur"
+      onClick={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.preventDefault()}
     >
+      {/* 拖动把手：菜单可拖到不挡手柄的位置，偏移跨会话记忆 */}
       <div
-        role="menu"
-        aria-label="选择菜单"
-        style={{
-          position: 'fixed',
-          left: selMenu.x,
-          top: selMenu.y,
-          width: SEL_MENU_WIDTH,
-          transformOrigin: `${selOriginX} ${selOriginY}`,
-          transform: 'translate(-50%, -50%)',
-        }}
-        className="pointer-events-auto rounded-2xl border border-white/10 bg-zinc-900/95 p-1.5 text-white shadow-2xl backdrop-blur"
-        onClick={(e) => e.stopPropagation()}
-        onContextMenu={(e) => e.preventDefault()}
+        role="button"
+        aria-label="拖动菜单位置"
+        tabIndex={0}
+        onPointerDown={beginSelMenuDrag}
+        onPointerMove={moveSelMenuDrag}
+        onPointerUp={endSelMenuDrag}
+        onPointerCancel={endSelMenuDrag}
+        className="flex h-9 w-full cursor-grab touch-none items-center justify-center rounded-lg text-zinc-400 transition-colors hover:text-zinc-200 active:cursor-grabbing"
       >
+        <GripVertical className="size-4" strokeWidth={1.75} />
+      </div>
         {!readOnly && (
           <button
             type="button"
@@ -1175,21 +1344,43 @@ export function ClozeText({
           <Copy className="size-4 shrink-0" strokeWidth={1.75} />
           <span className="truncate">复制</span>
         </button>
-      </div>
     </div>
   ) : null
 
-  // ---- 挖空刷：一次连续滑动 = 一个空（松手才提交） ----
-  // 拖动期间只收集字元素并做临时高亮；pointerup 时按渲染源分组、取连续区间，
-  // 每个源提交一个挖空（区间含标点/跨词），与「划过的部分是一个空」一致。
-  const brushAccRef = React.useRef<Map<string, HTMLElement[]>>(new Map())
+  // ===========================================================================
+  // 挖空刷 v2.1：一次连续滑动 = 一个空（松手才提交）
+  //
+  // 手机端「挖 1~2 个词就停」的根因与对策：
+  //  1) touch-action:none 必须挂在**块级文字层**上——此前只挂在行内字 <span> 上，
+  //     而 CSS 规范规定 touch-action 不适用于 non-replaced inline 元素（浏览器
+  //     直接忽略）→ 触摸被当作页面滚动，~150ms 后浏览器接管派发 pointercancel，
+  //     涂刷被迫提前提交（与“挖 1~2 个词就停”完全吻合）。
+  //     → 现在 brushMode 时给每个渲染源的块级包裹层加 touchAction:'none'（wrap()）。
+  //  2) 涂刷期间零 setState（ref + classList 高亮）：重渲染不会重建 DOM / 丢 capture。
+  //  3) elementFromPoint 命中悬浮 UI（[data-cloze-ui] 工具栏/手柄/菜单）时只跳过
+  //     该采样点，绝不中断整次涂刷；命中非文字区域同样只不扩展。
+  //  4) getCoalescedEvents 合并事件 + 每 4px 线段插值，快速滑动不漏字。
+  //  5) window 级 pointermove/pointerup/pointercancel 兜底（部分安卓浏览器
+  //     setPointerCapture 不稳定）；且只响应当次涂刷的 pointerId——第二根手指
+  //     /手掌抬起的 pointerup 不再误提交（此前多指误触也会提前结束涂刷）。
+  //  6) pointercancel（来电/手势接管）同样提交已采集的词，不丢已选内容。
+  // ===========================================================================
+  const brushAccRef = React.useRef<Map<string, Set<HTMLElement>>>(new Map())
+  const brushModeRef = React.useRef(brushMode)
+  const brushPointerIdRef = React.useRef<number | null>(null)
+  React.useEffect(() => {
+    brushModeRef.current = brushMode
+  }, [brushMode])
 
   const brushAddEl = (el: HTMLElement) => {
     const srcKey = el.dataset.src || 'root'
-    const list = brushAccRef.current.get(srcKey) ?? []
-    if (!list.includes(el)) {
-      list.push(el)
-      brushAccRef.current.set(srcKey, list)
+    let set = brushAccRef.current.get(srcKey)
+    if (!set) {
+      set = new Set()
+      brushAccRef.current.set(srcKey, set)
+    }
+    if (!set.has(el)) {
+      set.add(el)
       // 临时高亮（松手后由正式挖空样式接管）
       el.classList.add('rounded-sm', 'bg-accent')
     }
@@ -1200,10 +1391,10 @@ export function ClozeText({
     if (groups.size === 0) return
     let committed = 0
     for (const [srcKey, els] of groups) {
-      if (els.length === 0) continue
+      if (els.size === 0) continue
       const src = sources.find((s) => s.key === srcKey)
       if (!src) continue
-      // 按位置排序，取 min..max 连续区间（划过的部分连成一个空）
+      // 按位置排序，取 min..max 连续区间（划过的部分连成一个空，支持跨行/跨段）
       const sorted = [...els].sort((a, b) => Number(a.dataset.pos) - Number(b.dataset.pos))
       const first = sorted[0]
       const last = sorted[sorted.length - 1]
@@ -1218,8 +1409,8 @@ export function ClozeText({
       onSelectionCloze?.(text, occ)
       committed += 1
     }
-    for (const list of groups.values()) {
-      for (const el of list) el.classList.remove('rounded-sm', 'bg-accent')
+    for (const set of groups.values()) {
+      for (const el of set) el.classList.remove('rounded-sm', 'bg-accent')
     }
     brushAccRef.current = new Map()
     if (committed > 0) {
@@ -1227,39 +1418,91 @@ export function ClozeText({
     }
   }
 
-  // latest-ref：window pointerup 监听只挂一次，回调始终取最新
+  // latest-ref：window 兜底监听只挂一次，回调始终取最新
   const commitBrushRef = React.useRef(commitBrush)
   React.useEffect(() => {
     commitBrushRef.current = commitBrush
   })
 
-  React.useEffect(() => {
-    const end = () => {
-      if (draggingRef.current) {
-        draggingRef.current = false
-        commitBrushRef.current()
-      }
+  const lastBrushPosRef = React.useRef<{ x: number; y: number } | null>(null)
+
+  /** 采样一个点：命中悬浮 UI 只跳过（不中断），命中字则收集。 */
+  const brushSamplePoint = (x: number, y: number) => {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null
+    if (!el) return
+    // 悬浮工具栏/选择手柄/菜单等挖空 UI：跳过该采样点（继续而非中断）
+    if (el.closest('[data-cloze-ui]')) return
+    const wordEl = el.closest('[data-char][data-pos]') as HTMLElement | null
+    if (wordEl) brushAddEl(wordEl)
+  }
+
+  /** last→cur 线段插值采样（步长 4px）：快划时补齐 pointermove 之间的空隙。 */
+  const brushSampleSegment = (x0: number, y0: number, x1: number, y1: number) => {
+    const dx = x1 - x0
+    const dy = y1 - y0
+    const dist = Math.hypot(dx, dy)
+    const n = Math.max(1, Math.ceil(dist / BRUSH_SAMPLE_STEP))
+    for (let i = 1; i <= n; i++) {
+      const t = i / n
+      brushSamplePoint(x0 + dx * t, y0 + dy * t)
     }
-    window.addEventListener('pointerup', end)
-    window.addEventListener('pointercancel', end)
+  }
+
+  const brushHandleMove = (x: number, y: number) => {
+    const last = lastBrushPosRef.current
+    if (last) brushSampleSegment(last.x, last.y, x, y)
+    else brushSamplePoint(x, y)
+    lastBrushPosRef.current = { x, y }
+  }
+
+  /** 结束涂刷：提交已采集的词（pointercancel 也走这里，不丢已选词）。 */
+  const endBrush = () => {
+    if (!draggingRef.current) return
+    draggingRef.current = false
+    brushPointerIdRef.current = null
+    lastBrushPosRef.current = null
+    commitBrushRef.current()
+  }
+
+  const brushMoveRef = React.useRef(brushHandleMove)
+  const brushEndRef = React.useRef(endBrush)
+  React.useEffect(() => {
+    brushMoveRef.current = brushHandleMove
+    brushEndRef.current = endBrush
+  })
+
+  // window 级兜底：涂刷激活期间接收 move/up/cancel（部分安卓浏览器
+  // setPointerCapture 不稳/丢失时仍能继续采样与提交）。
+  React.useEffect(() => {
+    const isBrushPointer = (ev: PointerEvent) =>
+      brushPointerIdRef.current === null || ev.pointerId === brushPointerIdRef.current
+    const onMove = (ev: PointerEvent) => {
+      if (!brushModeRef.current || !draggingRef.current || !isBrushPointer(ev)) return
+      brushMoveRef.current(ev.clientX, ev.clientY)
+    }
+    const onEnd = (ev: PointerEvent) => {
+      if (!brushModeRef.current || !draggingRef.current || !isBrushPointer(ev)) return
+      brushEndRef.current()
+    }
+    window.addEventListener('pointermove', onMove, { passive: true })
+    window.addEventListener('pointerup', onEnd)
+    window.addEventListener('pointercancel', onEnd)
     return () => {
-      window.removeEventListener('pointerup', end)
-      window.removeEventListener('pointercancel', end)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onEnd)
+      window.removeEventListener('pointercancel', onEnd)
     }
   }, [])
 
-  // 挖空刷按下：开始收集（不再逐字立即挖空）。
-  // 只有按在「字」上才启动刷（空白处按下 = 页面滚动意图，不进刷模式）。
-  // setPointerCapture：把后续 pointermove 全部锁定到根容器，避免手指滑过
-  // 行间空白时事件丢失（这是"经常识别不出来"的主因）。
-  // 另：移动时对上一位置→当前位置做线段插值采样，快划也能采到中间漏掉的字。
-  const lastBrushPosRef = React.useRef<{ x: number; y: number } | null>(null)
+  // 挖空刷按下：只有按在「字」上才启动刷（空白处按下 = 页面滚动意图）。
+  // setPointerCapture 到根容器：后续 move 全部锁定，滑过行间空白不丢事件。
   const handleBrushPointerDown = (e: React.PointerEvent) => {
     if (!brushMode) return
     const target = e.target as HTMLElement
     const wordEl = target.closest?.('[data-char][data-pos]') as HTMLElement | null
     if (!wordEl) return
     draggingRef.current = true
+    brushPointerIdRef.current = e.pointerId
     brushAccRef.current = new Map()
     brushAddEl(wordEl)
     lastBrushPosRef.current = { x: e.clientX, y: e.clientY }
@@ -1269,29 +1512,23 @@ export function ClozeText({
       /* noop */
     }
   }
+
   const handleBrushPointerMove = (e: React.PointerEvent) => {
     if (!brushMode || !draggingRef.current) return
-    const last = lastBrushPosRef.current
-    const cur = { x: e.clientX, y: e.clientY }
-    if (last) {
-      // 插值采样：按每 6px 一个点在 last→cur 线段上取点，elementFromPoint 找字。
-      // 快速滑动时 pointermove 事件稀疏，不插值会漏掉中间的字 → "识别不出来"。
-      const dx = cur.x - last.x
-      const dy = cur.y - last.y
-      const dist = Math.hypot(dx, dy)
-      const n = Math.max(1, Math.ceil(dist / 6))
-      for (let i = 1; i <= n; i++) {
-        const t = i / n
-        const el = document.elementFromPoint(last.x + dx * t, last.y + dy * t)
-        const wordEl = el?.closest('[data-char][data-pos]') as HTMLElement | null
-        if (wordEl) brushAddEl(wordEl)
+    // getCoalescedEvents：一次回调拿到浏览器合并的高频采样点（快划不漏字）；
+    // 不支持的浏览器回退到当前事件坐标。
+    const native = e.nativeEvent
+    const coalescer = (native as { getCoalescedEvents?: () => PointerEvent[] }).getCoalescedEvents
+    let pts: PointerEvent[] = []
+    if (typeof coalescer === 'function') {
+      try {
+        pts = coalescer.call(native)
+      } catch {
+        pts = []
       }
-    } else {
-      const el = document.elementFromPoint(cur.x, cur.y)
-      const wordEl = el?.closest('[data-char][data-pos]') as HTMLElement | null
-      if (wordEl) brushAddEl(wordEl)
     }
-    lastBrushPosRef.current = cur
+    if (pts.length === 0) pts = [native]
+    for (const p of pts) brushHandleMove(p.clientX, p.clientY)
   }
 
   const scrollToPage = (idx: number) => {
@@ -1599,7 +1836,9 @@ export function ClozeText({
               style={styleProp}
               className={cn(
                 runCls,
-                // 挖空刷：仅在「字」上禁用触摸滚动（划字=刷），行间/页边空白仍可滑动页面
+                // 挖空刷：字上加 touch-none 仅为兼容兜底——真正生效的是外层块级
+                // wrap() 上的 touchAction:'none'（touch-action 对行内 span 无效），
+                // 行间/页边空白仍可滑动页面（空白处按下不启动涂刷）。
                 brushMode &&
                   'cursor-crosshair touch-none rounded-sm transition-colors hover:bg-accent/70',
                 manualMode && 'cursor-text rounded-sm transition-colors hover:bg-accent/70',
@@ -1691,7 +1930,16 @@ export function ClozeText({
       }
     }
 
-    const wrap = (nodes: React.ReactNode[]) => <div className="space-y-3">{nodes}</div>
+    // brushMode 时给块级文字层禁用触摸滚动（touch-action 对行内 span 无效，
+    // 必须挂在块级层上，否则浏览器把涂刷当滚动 → ~150ms 后 pointercancel）。
+    const wrap = (nodes: React.ReactNode[]) => (
+      <div
+        className="space-y-3"
+        style={{ touchAction: brushMode ? 'none' : undefined }}
+      >
+        {nodes}
+      </div>
+    )
     const body = ctx.blocks.map((b, i) => renderBlock(b, i))
 
     if (ctx.chunkIndex !== null) {
@@ -1716,70 +1964,17 @@ export function ClozeText({
     return wrap(body)
   }
 
-  // ---- layouts ----
-  if (chunks) {
-    return (
-      <div className="flex flex-col gap-3">
-        {sources.map((s) => (
-          <React.Fragment key={s.key}>{renderSource(s)}</React.Fragment>
-        ))}
-      </div>
-    )
-  }
-
-  if (pages) {
-    return (
-      <div className="relative">
-        <div
-          ref={containerRef}
-          className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-          onScroll={(e) => {
-            const el = e.currentTarget
-            const cur = Math.round(el.scrollLeft / Math.max(1, el.clientWidth))
-            if (cur !== page) setPage(cur)
-          }}
-        >
-          {sources.map((s) => (
-            <div key={s.key} className="w-full shrink-0 snap-center px-1">
-              {renderSource(s)}
-            </div>
-          ))}
-        </div>
-        {pages.length > 1 && (
-          <>
-            <button
-              type="button"
-              aria-label="上一页"
-              disabled={page <= 0}
-              onClick={() => scrollToPage(page - 1)}
-              className="absolute left-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background/90 shadow-md transition-opacity disabled:opacity-25"
-            >
-              ‹
-            </button>
-            <button
-              type="button"
-              aria-label="下一页"
-              disabled={page >= pages.length - 1}
-              onClick={() => scrollToPage(page + 1)}
-              className="absolute right-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background/90 shadow-md transition-opacity disabled:opacity-25"
-            >
-              ›
-            </button>
-          </>
-        )}
-      </div>
-    )
-  }
-
+  // ---- layout ----
+  // 统一根容器：三种布局（全文/分块/分页）都挂 rootRef + 指针处理器。
+  // 此前分块/分页布局完全没有挂事件 → 挖空刷与长按选字在这两种模式下失效。
+  // brushMode 时根容器统一 select-none + 禁用长按弹菜单（防涂刷被系统手势打断）。
   return (
     <div
       ref={rootRef}
       className={cn(
-        'leading-loose text-zinc-800 dark:text-zinc-200',
-        brushMode ? 'select-none' : undefined,
-        suppressNativeSelect && 'select-none [-webkit-touch-callout:none]',
+        (brushMode || suppressNativeSelect) &&
+          'select-none [-webkit-touch-callout:none] [-webkit-user-select:none]',
       )}
-      style={{ fontSize: `${fontSize}px` }}
       onPointerDown={(e) => {
         handleBrushPointerDown(e)
         handleRootPointerDown(e)
@@ -1789,11 +1984,9 @@ export function ClozeText({
         handleRootPointerMove(e)
       }}
       onPointerUp={(e) => {
-        // 挖空刷：松手提交（根容器的 pointerup 先于 window 监听触发，必须在这里提交）
+        // 挖空刷：松手提交（根容器 pointerup 先于 window 兜底触发；endBrush 幂等）
         if (brushMode && draggingRef.current) {
-          draggingRef.current = false
-          lastBrushPosRef.current = null
-          commitBrush()
+          endBrush()
         } else {
           draggingRef.current = false
         }
@@ -1805,10 +1998,9 @@ export function ClozeText({
         handleRootPointerEnd(e)
       }}
       onPointerCancel={(e) => {
+        // pointercancel（来电/手势接管等）同样提交已采集的词，不丢已选内容
         if (brushMode && draggingRef.current) {
-          draggingRef.current = false
-          lastBrushPosRef.current = null
-          commitBrush()
+          endBrush()
         } else {
           draggingRef.current = false
         }
@@ -1821,9 +2013,63 @@ export function ClozeText({
       }}
       onContextMenu={handleRootContextMenu}
     >
-      {sources.map((s) => (
-        <React.Fragment key={s.key}>{renderSource(s)}</React.Fragment>
-      ))}
+      {chunks ? (
+        <div className="flex flex-col gap-3">
+          {sources.map((s) => (
+            <React.Fragment key={s.key}>{renderSource(s)}</React.Fragment>
+          ))}
+        </div>
+      ) : pages ? (
+        <div className="relative">
+          <div
+            ref={containerRef}
+            className="flex snap-x snap-mandatory overflow-x-auto scroll-smooth [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            onScroll={(e) => {
+              const el = e.currentTarget
+              const cur = Math.round(el.scrollLeft / Math.max(1, el.clientWidth))
+              if (cur !== page) setPage(cur)
+            }}
+          >
+            {sources.map((s) => (
+              <div key={s.key} className="w-full shrink-0 snap-center px-1">
+                {renderSource(s)}
+              </div>
+            ))}
+          </div>
+          {pages.length > 1 && (
+            <>
+              <button
+                type="button"
+                aria-label="上一页"
+                disabled={page <= 0}
+                onClick={() => scrollToPage(page - 1)}
+                className="absolute left-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background/90 shadow-md transition-opacity disabled:opacity-25"
+              >
+                ‹
+              </button>
+              <button
+                type="button"
+                aria-label="下一页"
+                disabled={page >= pages.length - 1}
+                onClick={() => scrollToPage(page + 1)}
+                className="absolute right-0 top-1/2 flex size-9 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-background/90 shadow-md transition-opacity disabled:opacity-25"
+              >
+                ›
+              </button>
+            </>
+          )}
+        </div>
+      ) : (
+        <div
+          className="leading-loose text-zinc-800 dark:text-zinc-200"
+          style={{ fontSize: `${fontSize}px` }}
+        >
+          {sources.map((s) => (
+            <React.Fragment key={s.key}>{renderSource(s)}</React.Fragment>
+          ))}
+        </div>
+      )}
+      {selMounted && selBackdrop ? createPortal(selBackdrop, document.body) : null}
       {selMounted && selOverlay ? createPortal(selOverlay, document.body) : null}
       {selMounted && selMenuPanel ? createPortal(selMenuPanel, document.body) : null}
     </div>

@@ -22,6 +22,30 @@ export interface AIConfig {
   model?: string
 }
 
+/** 采样参数（可选）：AI 对话全局配置的温度 / 最大回复长度。
+ *  未传或非有限数时走服务端默认。 */
+export interface ChatOptions {
+  /** 采样温度 0~2。 */
+  temperature?: number
+  /** 最大回复 tokens（64~32768）。 */
+  maxTokens?: number
+}
+
+/** 规范化采样参数：越界值裁剪，非有限数丢弃（返回不含该键）。 */
+function normalizeSampling(options?: ChatOptions): {
+  temperature?: number
+  max_tokens?: number
+} {
+  const out: { temperature?: number; max_tokens?: number } = {}
+  if (options && typeof options.temperature === 'number' && Number.isFinite(options.temperature)) {
+    out.temperature = Math.min(2, Math.max(0, options.temperature))
+  }
+  if (options && typeof options.maxTokens === 'number' && Number.isFinite(options.maxTokens)) {
+    out.max_tokens = Math.min(32768, Math.max(64, Math.round(options.maxTokens)))
+  }
+  return out
+}
+
 // ---------- vision helpers ----------
 
 // OpenAI-style multimodal content parts.
@@ -76,10 +100,12 @@ function toOpenAIMessages(
 
 export async function chatComplete(
   messages: ChatMessage[],
-  config?: AIConfig
+  config?: AIConfig,
+  options?: ChatOptions
 ): Promise<string> {
   const vision = hasImages(messages)
   const payloadMessages = toOpenAIMessages(messages)
+  const sampling = normalizeSampling(options)
 
   // Custom OpenAI-compatible endpoint
   if (
@@ -98,6 +124,7 @@ export async function chatComplete(
       body: JSON.stringify({
         model: config.model || 'gpt-4o-mini',
         messages: payloadMessages,
+        ...sampling,
       }),
     })
     if (!res.ok) {
@@ -112,18 +139,20 @@ export async function chatComplete(
     return content
   }
 
-  // Default: z-ai SDK
+  // Default: z-ai SDK（body 带 index signature，额外采样参数原样透传）
   const zai = await getZAI()
   if (vision) {
     const completion = await zai.chat.completions.createVision({
       messages: payloadMessages,
       thinking: { type: 'disabled' },
+      ...sampling,
     } as CreateVisionBody)
     return completion.choices?.[0]?.message?.content ?? ''
   }
   const completion = await zai.chat.completions.create({
     messages: messages as never,
     thinking: { type: 'disabled' },
+    ...sampling,
   })
   return completion.choices[0]?.message?.content ?? ''
 }

@@ -30,6 +30,44 @@ export async function GET(
       return NextResponse.json({ error: '分享链接已过期' }, { status: 410 })
     }
 
+    // ---- AI 对话分享 ----
+    if (share.kind === 'conversation') {
+      const conv = await db.conversation.findUnique({ where: { id: share.refId } })
+      if (!conv) {
+        return NextResponse.json({ error: '分享不存在或已取消' }, { status: 404 })
+      }
+      const messages = await db.chatMessage.findMany({
+        where: { conversationId: conv.id },
+        orderBy: { createdAt: 'asc' },
+      })
+      return NextResponse.json({
+        conversation: {
+          id: conv.id,
+          title: conv.title,
+          type: conv.type,
+          createdAt: conv.createdAt.toISOString(),
+        },
+        messages: messages.map((m) => ({
+          id: m.id,
+          role: m.role,
+          content: m.content,
+          images: (() => {
+            try {
+              return JSON.parse(m.images)
+            } catch {
+              return []
+            }
+          })(),
+          createdAt: m.createdAt.toISOString(),
+        })),
+        share: {
+          token: share.token,
+          expiresAt: share.expiresAt ? share.expiresAt.toISOString() : null,
+          createdAt: share.createdAt.toISOString(),
+        },
+      })
+    }
+
     const card = await db.card.findUnique({ where: { id: share.cardId } })
     if (!card) {
       return NextResponse.json({ error: '分享不存在或已取消' }, { status: 404 })

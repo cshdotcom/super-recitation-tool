@@ -6,8 +6,9 @@
 // message, each base64 payload <= 2MB — otherwise 400. Valid images are
 // forwarded through chatComplete (vision-capable payload, see src/lib/ai.ts).
 import { NextRequest, NextResponse } from 'next/server'
-import { chatComplete } from '@/lib/ai'
+import { chatComplete, type ChatOptions } from '@/lib/ai'
 import { getAIConfig } from '@/lib/settings'
+import { db } from '@/lib/db'
 import type { ChatMessage } from '@/lib/types'
 
 const MAX_IMAGES_PER_MESSAGE = 4
@@ -66,6 +67,169 @@ export async function POST(req: NextRequest) {
         }
       }
       return NextResponse.json({ right, reason })
+    }
+
+    // ---- 举一反三模式：根据原题生成 N 道相似变式题 ----
+    // 输入 { mode:'extend', items: [{question, answer, type?}], count?: number }
+    // 输出 { text } — Markdown 编号题目+答案（富媒体渲染）
+    if (body?.mode === 'extend') {
+      const items = Array.isArray(body?.items)
+        ? (body.items as Record<string, unknown>[])
+            .map((q) => ({
+              question: typeof q?.question === 'string' ? q.question : '',
+              answer: typeof q?.answer === 'string' ? q.answer : '',
+              type: typeof q?.type === 'string' ? q.type : '',
+            }))
+            .filter((q) => q.question)
+            .slice(0, 8)
+        : []
+      const count = typeof body?.count === 'number' ? Math.min(10, Math.max(1, Math.round(body.count))) : 3
+      if (items.length === 0) {
+        return NextResponse.json({ error: '缺少原题' }, { status: 400 })
+      }
+      const FORMAT_PROMPT_EXT = `你的回复会原样渲染，可按需使用：Markdown、LaTeX 公式（$...$ / $$...$$）、mermaid 图表（\`\`\`mermaid 代码块）、HTML 片段、代码块、SVG。`
+      const sys = `你是优秀的语文/背诵出题老师。根据给出的原题，举一反三生成新题。要求：
+- 新题与原题考查相同知识点但角度不同（换语境/换问法/逆向提问）
+- 每题附标准答案与简要解析
+- 难度与原题相当
+${FORMAT_PROMPT_EXT}
+输出格式（严格遵循）：
+## 第1题
+**题目：** ...
+**答案：** ...
+**解析：** ...
+## 第2题
+...`
+      const userMsg = `原题${items.length > 1 ? `（共${items.length}道）` : ''}：
+${items.map((q, i) => `${i + 1}. [${q.type || '未标注'}] ${q.question}\n答案：${q.answer}`).join('\n\n')}
+
+请生成 ${count} 道举一反三的新题。`
+      const config = await getAIConfig()
+      const reply = await chatComplete(
+        [
+          { role: 'system', content: sys },
+          { role: 'user', content: userMsg },
+        ],
+        config,
+      )
+      return NextResponse.json({ text: reply })
+    }
+
+    // ---- AI解析模式：对题目/收藏内容做深度讲解 ----
+    // 输入 { mode:'analyze', question, answer?, context?, extra? }
+    // 输出 { text } — 富媒体讲解（SVG/mindmap/MD/LaTeX/HTML/代码块）
+    if (body?.mode === 'analyze') {
+      const question: string = typeof body?.question === 'string' ? body.question : ''
+      const answer: string = typeof body?.answer === 'string' ? body.answer : ''
+      const context: string = typeof body?.context === 'string' ? body.context : ''
+      const extra: string = typeof body?.extra === 'string' ? body.extra : ''
+      if (!question.trim()) {
+        return NextResponse.json({ error: '解析内容不能为空' }, { status: 400 })
+      }
+      const FORMAT_PROMPT_AN = `你的回复会原样渲染，支持全部富媒体格式：Markdown、LaTeX 数学公式（行内 $...$、展示 $$...$$，支持化学式 \\ce{}）、mermaid（\`\`\`mermaid 代码块：mindmap/流程图/时序图）、SVG（\`\`\`svg 代码块或 <svg>）、HTML 片段、代码块、表格。讲解结构、层次、流程时优先用 mermaid 思维导图或表格。`
+      const sys = `你是耐心的全能学科讲解老师。对给出的题目/内容做深度解析，帮助学生真正理解：
+- 讲清考点、解题思路（分步骤）
+- 易错点提醒、相关知识拓展
+- 必要时用思维导图/表格/公式辅助讲解
+${FORMAT_PROMPT_AN}`
+      const userMsg = `${context ? `【课文上下文】\n${context.slice(0, 3000)}\n\n` : ''}【题目/内容】\n${question}${answer ? `\n\n【标准答案】\n${answer}` : ''}${extra ? `\n\n【补充要求】\n${extra}` : '\n\n请给出完整解析。'}`
+      const config = await getAIConfig()
+      const reply = await chatComplete(
+        [
+          { role: 'system', content: sys },
+          { role: 'user', content: userMsg },
+        ],
+        config,
+      )
+      return NextResponse.json({ text: reply })
+    }
+
+    // ---- 智能选题模式：从题库中挑选最有价值的 N 题 ----
+    // 输入 { mode:'pick', questions: [{question, reason?}], count }
+    // 输出 { indices: number[] } — 选中题目的下标（0-based）
+    if (body?.mode === 'pick') {
+      const questions = Array.isArray(body?.questions)
+        ? (body.questions as unknown[]).map((q) => (typeof q === 'string' ? q : typeof (q as Record<string, unknown>)?.question === 'string' ? String((q as Record<string, unknown>).question) : '')).slice(0, 120)
+        : []
+      const count = typeof body?.count === 'number' ? Math.min(50, Math.max(1, Math.round(body.count))) : 10
+      if (questions.length === 0) {
+        return NextResponse.json({ error: '缺少题目列表' }, { status: 400 })
+      }
+      const sys = `你是智能选题老师。从题目列表中挑选最值得练习的题：优先选高频考点、易错点、经典题型、覆盖不同知识点。只返回严格 JSON：{"indices":[选中的题目下标数组]}，下标从0开始，最多选 ${Math.min(count, questions.length)} 题，不要任何解释。`
+      const userMsg = `题目列表：\n${questions.map((q, i) => `${i}. ${q.slice(0, 120)}`).join('\n')}\n\n请挑选 ${count} 题。`
+      const config = await getAIConfig()
+      const reply = await chatComplete(
+        [
+          { role: 'system', content: sys },
+          { role: 'user', content: userMsg },
+        ],
+        config,
+      )
+      const m = reply.match(/\{[\s\S]*\}/)
+      let indices: number[] = []
+      if (m) {
+        try {
+          const parsed = JSON.parse(m[0]) as { indices?: unknown }
+          if (Array.isArray(parsed.indices)) {
+            indices = parsed.indices
+              .map((x) => (typeof x === 'number' ? x : parseInt(String(x), 10)))
+              .filter((x) => Number.isInteger(x) && x >= 0 && x < questions.length)
+              .slice(0, count)
+          }
+        } catch {
+          /* 解析失败返回空 */
+        }
+      }
+      if (indices.length === 0) {
+        // 兜底：均匀取样
+        const step = Math.max(1, Math.floor(questions.length / count))
+        for (let i = 0; i < questions.length && indices.length < count; i += step) indices.push(i)
+      }
+      return NextResponse.json({ indices: Array.from(new Set(indices)) })
+    }
+
+    // ---- 素材生成模式：根据课文生成问答记忆素材 blocks ----
+    // 输入 { mode:'blocks', content, count? }
+    // 输出 { blocks: [{front, back}] }
+    if (body?.mode === 'blocks') {
+      const src: string = typeof body?.content === 'string' ? body.content : ''
+      const count = typeof body?.count === 'number' ? Math.min(10, Math.max(1, Math.round(body.count))) : 5
+      if (!src.trim()) {
+        return NextResponse.json({ error: '课文内容不能为空' }, { status: 400 })
+      }
+      const sys = `你是背诵素材整理助手。根据课文内容生成问答式记忆素材（正面是问题/提示，背面是答案/原文）。
+只返回严格 JSON：{"blocks":[{"front":"问题或提示","back":"答案或原文"}]}，不要任何额外解释。front 简短（≤30字），back 精准摘自或概括课文。`
+      const userMsg = `【课文内容】\n${src.slice(0, 6000)}\n\n请生成 ${count} 组问答素材。`
+      const config = await getAIConfig()
+      const reply = await chatComplete(
+        [
+          { role: 'system', content: sys },
+          { role: 'user', content: userMsg },
+        ],
+        config,
+      )
+      const m = reply.match(/\{[\s\S]*\}/)
+      let blocks: Array<{ front: string; back: string }> = []
+      if (m) {
+        try {
+          const parsed = JSON.parse(m[0]) as { blocks?: unknown }
+          if (Array.isArray(parsed.blocks)) {
+            blocks = (parsed.blocks as Record<string, unknown>[])
+              .map((b) => ({
+                front: typeof b?.front === 'string' ? b.front.slice(0, 200) : '',
+                back: typeof b?.back === 'string' ? b.back.slice(0, 2000) : '',
+              }))
+              .filter((b) => b.front && b.back)
+              .slice(0, count)
+          }
+        } catch {
+          /* 解析失败返回空 */
+        }
+      }
+      if (blocks.length === 0) {
+        return NextResponse.json({ error: 'AI 生成素材失败，请重试' }, { status: 502 })
+      }
+      return NextResponse.json({ blocks })
     }
 
     const content: string = typeof body?.content === 'string' ? body.content : ''
@@ -150,6 +314,46 @@ export async function POST(req: NextRequest) {
         ? `你是一位严格而鼓励人的背书督背老师。用户正在背诵下面这段课文原文。任务：1) 引导用户逐句逐段背诵；2) 对照原文检查用户背诵，精确指出漏字、错字、多字；3) 多给提示而非直接给完整答案，除非用户明确说"想不起来"；4) 适时鼓励。每次回复简短，不超过180字。\n\n【课文原文】\n${content}${FORMAT_PROMPT}${ASK_PROMPT}`
         : `你是这篇课文的阅读理解助手。根据下面这段课文原文回答用户的问题，帮助理解内容、主旨、写作手法、字词含义等。回答简明准确，不超过300字。\n\n【课文原文】\n${content}${FORMAT_PROMPT}${ASK_PROMPT}`
 
+    // ---- AI 对话全局配置（设置页「AI 对话配置」卡片，服务端持久化）----
+    // aiSystemPrompt 前置 / aiRules 追加到系统提示词；aiSelfThinking 开启时
+    // 要求模型先在 <thinking>…</thinking> 内简短思考；温度/最大 tokens 透传
+    // 给 chatComplete（未设置时用服务端默认）。body.selfThinking（可选布尔）
+    // 可对单次请求覆盖自我思考设置（追问弹层「仅本次」开关）。
+    let systemPromptFinal = systemPrompt
+    const aiChatOptions: ChatOptions = {}
+    const reqSelfThinking =
+      typeof body?.selfThinking === 'boolean' ? (body.selfThinking as boolean) : null
+    try {
+      const row = await db.settings.findUnique({ where: { id: 'singleton' } })
+      const customSystem =
+        typeof row?.aiSystemPrompt === 'string' ? row.aiSystemPrompt.trim() : ''
+      const customRules =
+        typeof row?.aiRules === 'string' ? row.aiRules.trim() : ''
+      const wantThinking =
+        reqSelfThinking === true ||
+        (reqSelfThinking === null && row?.aiSelfThinking === true)
+      if (customSystem || customRules || wantThinking) {
+        const parts: string[] = []
+        if (customSystem) parts.push(customSystem)
+        parts.push(systemPrompt)
+        if (wantThinking) {
+          parts.push(
+            '【自我思考】回答前先在 <thinking>…</thinking> 块内用几句话简要思考（梳理问题、回忆原文相关片段），然后另起一行给出正式回答。思考块要简短，正式回答不要重复思考内容。',
+          )
+        }
+        if (customRules) parts.push(`【自定义规则】\n${customRules}`)
+        systemPromptFinal = parts.join('\n\n')
+      }
+      if (typeof row?.aiTemperature === 'number' && Number.isFinite(row.aiTemperature)) {
+        aiChatOptions.temperature = row.aiTemperature
+      }
+      if (typeof row?.aiMaxTokens === 'number' && Number.isFinite(row.aiMaxTokens)) {
+        aiChatOptions.maxTokens = row.aiMaxTokens
+      }
+    } catch {
+      /* 设置读取失败 → 走默认配置，不影响对话 */
+    }
+
     // 上游要求至少一条 user 消息：空对话历史时补一条开场白，
     // 避免只有 system 消息导致 API 400（messages 参数非法）。
     const opener: ChatMessage[] =
@@ -166,13 +370,13 @@ export async function POST(req: NextRequest) {
         : []
 
     const finalMessages: ChatMessage[] = [
-      { role: 'system', content: systemPrompt },
+      { role: 'system', content: systemPromptFinal },
       ...opener,
       ...incomingMessages,
     ]
 
     const config = await getAIConfig()
-    const reply = await chatComplete(finalMessages, config)
+    const reply = await chatComplete(finalMessages, config, aiChatOptions)
     return NextResponse.json({ reply })
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)

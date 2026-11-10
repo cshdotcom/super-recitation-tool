@@ -4,6 +4,8 @@ import * as React from 'react'
 import {
   Loader2,
   FileQuestion,
+  FolderOpen,
+  FolderPlus,
   ImagePlus,
   CheckCircle2,
   XCircle,
@@ -28,6 +30,7 @@ import { cn } from '@/lib/utils'
 import type { QuizQuestion } from '@/lib/types'
 import { putState, getState, deleteState } from '@/lib/server-state'
 import { VoiceInput } from '@/components/recitation/voice-input'
+import { PapersView } from '@/components/recitation/papers-view'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -381,6 +384,13 @@ function formatDraftAge(ts: number): string {
   return `${Math.round(h / 24)} 天前`
 }
 
+/** 试卷默认标题：「试卷 M月D日 HH:mm」 */
+function defaultPaperTitle(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `试卷 ${d.getMonth() + 1}月${d.getDate()}日 ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 interface QuizPanelProps {
   content: string
   keywords: string[]
@@ -547,6 +557,81 @@ export function QuizPanel({
   // ---- 草稿恢复 ----
   const [pendingDraft, setPendingDraft] = React.useState<QuizDraft | null>(null)
   const draftCheckedRef = React.useRef(false)
+
+  // ---- 试卷夹：存为试卷 / 打开试卷夹 / 答题图片放大 ----
+  const [saveOpen, setSaveOpen] = React.useState(false)
+  const [paperTitle, setPaperTitle] = React.useState(defaultPaperTitle)
+  const [savingPaper, setSavingPaper] = React.useState(false)
+  const [papersOpen, setPapersOpen] = React.useState(false)
+  const [zoomImg, setZoomImg] = React.useState<string | null>(null)
+
+  /** 把当前题目存为试卷（POST /api/papers，source:'ai'） */
+  const saveAsPaper = async (title?: string) => {
+    if (questions.length === 0) {
+      toast.warning('当前没有题目，先生成题目再保存')
+      return
+    }
+    if (!cardId) {
+      toast.error('缺少书本信息，无法保存到试卷夹')
+      return
+    }
+    setSavingPaper(true)
+    try {
+      const res = await fetch('/api/papers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cardId,
+          title: (title ?? '').trim() || defaultPaperTitle(),
+          items: questions,
+          source: 'ai',
+        }),
+      })
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(err.error || '保存失败')
+      }
+      setSaveOpen(false)
+      toast.success('已存入试卷夹，可随时重练')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setSavingPaper(false)
+    }
+  }
+
+  /** 试卷夹「开始练习」：把试卷题目载入当前作答流（富媒体题目按原样作答） */
+  const practicePaper = React.useCallback(
+    (items: unknown[], title: string) => {
+      const qs = (Array.isArray(items) ? items : []).filter(
+        (q): q is QuizQuestionX =>
+          !!q &&
+          typeof q === 'object' &&
+          typeof (q as QuizQuestionX).question === 'string' &&
+          typeof (q as QuizQuestionX).answer === 'string' &&
+          VALID_TYPES.includes((q as QuizQuestionX).type),
+      )
+      if (qs.length === 0) {
+        toast.error('这份试卷没有可练习的题目')
+        return
+      }
+      setPapersOpen(false)
+      setQuestions(qs)
+      setAnswers({})
+      setRevealed(new Set())
+      setFavorites(new Set())
+      setChecked(false)
+      setSelfJudge({})
+      setReported(new Set())
+      setDontKnow(new Set())
+      setOverride({})
+      setAiJudging(new Set())
+      setQuizStart(Date.now())
+      setStep('answering')
+      toast.success(`已载入试卷「${title}」，共 ${qs.length} 题`)
+    },
+    [],
+  )
 
   // ---- Step1：AI 提炼知识点（可附带课文图片，服务端先 OCR 再提炼） ----
   const fetchPoints = React.useCallback(async () => {
@@ -824,6 +909,18 @@ export function QuizPanel({
       clearDraftStorage()
       setStep('answering')
       toast.success(`已生成 ${qs.length} 道题`)
+      // 轻提示：一键存入试卷夹（可保存后随时重练）
+      toast('本次题目已生成，存入试卷夹？', {
+        description: '保存后可在试卷夹随时重练',
+        action: {
+          label: '存入',
+          onClick: () => {
+            setPaperTitle(defaultPaperTitle())
+            setSaveOpen(true)
+          },
+        },
+        duration: 10000,
+      })
     } catch (err) {
       // 友好中文错误（含服务端消息）留在「出题中」视图，提供重试 / 返回
       setGenError(friendlyQuizError(err))
@@ -1428,13 +1525,37 @@ export function QuizPanel({
             title="开始答题"
             onBack={() => setStep('types')}
             right={
-              <button
-                type="button"
-                onClick={saveDraft}
-                className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
-              >
-                <Save className="size-3.5" /> 存草稿
-              </button>
+              <div className="flex items-center gap-2 text-xs">
+                <button
+                  type="button"
+                  aria-label="打开试卷夹"
+                  title="打开试卷夹"
+                  onClick={() => setPapersOpen(true)}
+                  className="rounded-full p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <FolderOpen className="size-4" />
+                </button>
+                <button
+                  type="button"
+                  aria-label="存为试卷"
+                  onClick={() => {
+                    setPaperTitle(defaultPaperTitle())
+                    setSaveOpen(true)
+                  }}
+                  className="flex items-center gap-0.5 text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <FolderPlus className="size-3.5" /> 存为试卷
+                </button>
+                <button
+                  type="button"
+                  aria-label="存草稿"
+                  title="存草稿"
+                  onClick={saveDraft}
+                  className="rounded-full p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <Save className="size-4" />
+                </button>
+              </div>
             }
           />
 
@@ -1492,11 +1613,13 @@ export function QuizPanel({
                 <li key={idx}>
                   <Card className="gap-3 p-4">
                     <div className="flex items-start justify-between gap-2">
-                      <div className="flex min-w-0 items-start gap-2">
-                        <span className="pt-0.5 text-xs font-semibold text-muted-foreground">
+                      <div className="flex min-w-0 flex-1 items-start gap-2">
+                        <span className="shrink-0 pt-0.5 text-xs font-semibold text-muted-foreground">
                           {idx + 1}.
                         </span>
-                        <p className="text-sm leading-relaxed">{renderQuestionText(q.question)}</p>
+                        <p className="min-w-0 flex-1 break-words text-sm leading-relaxed">
+                          {renderQuestionText(q.question)}
+                        </p>
                       </div>
                       <Badge variant="secondary" className={cn('shrink-0', badgeTone(q.type))}>
                         {TYPE_LABEL[q.type]}
@@ -1542,7 +1665,7 @@ export function QuizPanel({
                                 isMulti ? toggleMultiOption(idx, opt) : setAnswer(idx, opt)
                               }
                               className={cn(
-                                'flex min-h-[44px] items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition-colors',
+                                'flex min-h-[44px] min-w-0 items-center justify-between rounded-md border px-3 py-2 text-left text-sm transition-colors',
                                 !isRevealed && selected
                                   ? 'border-emerald-500/50 bg-emerald-500/10'
                                   : 'hover:bg-accent',
@@ -1552,7 +1675,7 @@ export function QuizPanel({
                                   'border-destructive/40 bg-destructive/10 text-destructive',
                               )}
                             >
-                              <span>
+                              <span className="min-w-0 flex-1 break-words">
                                 {isChoice && (
                                   <span className="mr-1.5 font-semibold text-muted-foreground">
                                     {String.fromCharCode(65 + oIdx)}.
@@ -1585,7 +1708,7 @@ export function QuizPanel({
                                 placeholder="在此输入你的答案…（可语音输入 / 上传图片）"
                                 rows={3}
                                 disabled={isRevealed}
-                                className="text-sm"
+                                className="min-w-0 flex-1 text-sm"
                               />
                               <VoiceInput
                                 size="sm"
@@ -1635,21 +1758,28 @@ export function QuizPanel({
                                 }}
                               />
                             </label>
-                            {/* 已上传图片预览 */}
+                            {/* 已上传图片预览（不溢出，点击可全屏放大） */}
                             {userAnswer.includes('![答题图片]') && (
-                              <div className="flex flex-wrap gap-1.5">
+                              <div className="flex max-w-full flex-wrap gap-1.5">
                                 {userAnswer
                                   .match(/!\[答题图片\]\(([^)]+)\)/g)
                                   ?.slice(0, 4)
                                   .map((m, i) => {
                                     const url = m.match(/\(([^)]+)\)/)?.[1] ?? ''
                                     return (
-                                      <img
+                                      <button
                                         key={i}
-                                        src={url}
-                                        alt={`答题图片${i + 1}`}
-                                        className="h-16 rounded-lg border border-border object-cover"
-                                      />
+                                        type="button"
+                                        aria-label={`放大答题图片${i + 1}`}
+                                        onClick={() => setZoomImg(url)}
+                                        className="max-w-full overflow-hidden rounded-lg"
+                                      >
+                                        <img
+                                          src={url}
+                                          alt={`答题图片${i + 1}`}
+                                          className="h-16 max-w-full rounded-lg border border-border object-cover"
+                                        />
+                                      </button>
                                     )
                                   })}
                               </div>
@@ -1662,6 +1792,7 @@ export function QuizPanel({
                               onChange={(e) => setAnswer(idx, e.target.value)}
                               placeholder="在此输入你的答案…（可语音输入）"
                               disabled={isRevealed}
+                              className="min-w-0 flex-1"
                             />
                             <VoiceInput
                               size="sm"
@@ -1682,10 +1813,10 @@ export function QuizPanel({
 
                     {/* 答案 */}
                     {isRevealed && (
-                      <div className="rounded-md border bg-muted/30 px-3 py-2 text-sm">
-                        <p>
+                      <div className="min-w-0 overflow-hidden break-words rounded-md border bg-muted/30 px-3 py-2 text-sm">
+                        <p className="break-words">
                           <span className="text-muted-foreground">参考答案：</span>
-                          <span className="font-medium text-emerald-700 dark:text-emerald-300">
+                          <span className="break-words font-medium text-emerald-700 dark:text-emerald-300">
                             {isJudge
                               ? normJudge(q.answer)
                               : isMulti
@@ -1694,7 +1825,7 @@ export function QuizPanel({
                           </span>
                         </p>
                         {isMulti && (
-                          <p className="mt-1 text-xs text-muted-foreground">
+                          <p className="mt-1 break-words text-xs text-muted-foreground">
                             你的选择：
                             {userAnswer.split(MULTI_SEP).filter(Boolean).join('、') || '（未作答）'}
                           </p>
@@ -1940,6 +2071,76 @@ export function QuizPanel({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* ================= 存为试卷 ================= */}
+      <Dialog open={saveOpen} onOpenChange={setSaveOpen}>
+        <DialogContent className="max-w-sm rounded-2xl">
+          <DialogHeader>
+            <DialogTitle>存为试卷</DialogTitle>
+            <DialogDescription>
+              把当前 {questions.length} 道题保存到试卷夹，可随时重练
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            value={paperTitle}
+            onChange={(e) => setPaperTitle(e.target.value)}
+            placeholder="试卷标题"
+            aria-label="试卷标题"
+            className="h-11 rounded-xl"
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !savingPaper) void saveAsPaper(paperTitle)
+            }}
+          />
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              className="flex-1 rounded-full"
+              onClick={() => setSaveOpen(false)}
+              disabled={savingPaper}
+            >
+              取消
+            </Button>
+            <Button
+              className="flex-1 rounded-full bg-zinc-900 text-white hover:bg-zinc-800"
+              onClick={() => void saveAsPaper(paperTitle)}
+              disabled={savingPaper || !paperTitle.trim() || questions.length === 0}
+            >
+              {savingPaper ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <FolderPlus className="size-4" />
+              )}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* ================= 答题图片全屏放大 ================= */}
+      <Dialog open={!!zoomImg} onOpenChange={(o) => !o && setZoomImg(null)}>
+        <DialogContent className="rounded-2xl p-4 sm:max-w-2xl [&>button:last-child]:z-10">
+          <DialogHeader className="sr-only">
+            <DialogTitle>答题图片</DialogTitle>
+            <DialogDescription>放大查看答题图片</DialogDescription>
+          </DialogHeader>
+          {zoomImg && (
+            <img
+              src={zoomImg}
+              alt="答题图片（放大）"
+              className="max-h-[85dvh] w-full rounded-xl bg-muted/40 object-contain"
+            />
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* ================= 试卷夹（按书本划分，含批量管理与重练） ================= */}
+      <PapersView
+        open={papersOpen}
+        onOpenChange={setPapersOpen}
+        cardId={cardId || ''}
+        cardTitle={cardTitle || '当前书本'}
+        onPractice={practicePaper}
+      />
     </div>
   )
 }

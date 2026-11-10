@@ -38,6 +38,12 @@ export function parseSettings(row: {
   asrModel?: string | null
   quizAutoRemove?: number | null
   aiAutoCloze?: boolean | null
+  aiSystemPrompt?: string | null
+  aiRules?: string | null
+  aiSelfThinking?: boolean | null
+  aiTemperature?: number | null
+  aiMaxTokens?: number | null
+  pdfEngine?: string | null
 } | null): SettingsData {
   let tools: ToolToggles = { ...DEFAULT_TOOLS }
   try {
@@ -103,6 +109,19 @@ export function parseSettings(row: {
         ? (row.quizAutoRemove as 1 | 2 | 3 | 5)
         : 2,
     aiAutoCloze: !!row?.aiAutoCloze,
+    aiSystemPrompt: row?.aiSystemPrompt ?? '',
+    aiRules: row?.aiRules ?? '',
+    aiSelfThinking: !!row?.aiSelfThinking,
+    aiTemperature:
+      typeof row?.aiTemperature === 'number' && Number.isFinite(row.aiTemperature)
+        ? Math.min(2, Math.max(0, row.aiTemperature))
+        : null,
+    aiMaxTokens:
+      typeof row?.aiMaxTokens === 'number' && Number.isFinite(row.aiMaxTokens)
+        ? Math.round(row.aiMaxTokens)
+        : null,
+    pdfEngine:
+      row?.pdfEngine === 'unpdf' || row?.pdfEngine === 'pdf-parse' ? row.pdfEngine : 'auto',
   }
 }
 

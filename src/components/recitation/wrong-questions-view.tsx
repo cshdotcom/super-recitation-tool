@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   Download,
   EyeOff,
+  FolderPlus,
   GraduationCap,
   Loader2,
   MoreVertical,
@@ -39,6 +40,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
 import {
   fetchQuizUserAnswers,
   recordQuizUserAnswer,
@@ -52,6 +54,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -148,6 +151,34 @@ function formatDate(iso: string): string {
   return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
 }
 
+/** 举一反三试卷默认标题：「举一反三 M月D日 HH:mm」 */
+function extendPaperTitle(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `举一反三 ${d.getMonth() + 1}月${d.getDate()}日 ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+/** 解析举一反三返回的 Markdown（「## 第N题」小节 + 加粗的题目/答案标记）为试卷条目；
+ * 解析不出任何题时返回空数组（调用方回退到保存所选原题）。 */
+function parseExtendPaper(
+  md: string,
+): Array<{ type: string; question: string; answer: string }> {
+  const out: Array<{ type: string; question: string; answer: string }> = []
+  const sections = md.split(/^##\s*/m).slice(1)
+  for (const sec of sections) {
+    const body = sec.replace(/^[^\n]*题[^\n]*\n?/, '')
+    const qm = body.match(/\*\*题目[:：]\*\*\s*([\s\S]*?)(?=\*\*(?:答案|解析)[:：]\*\*|$)/)
+    if (!qm) continue
+    const am = body.match(/\*\*答案[:：]\*\*\s*([\s\S]*?)(?=\*\*解析[:：]\*\*|$)/)
+    out.push({
+      type: 'short',
+      question: qm[1].trim(),
+      answer: (am?.[1] ?? '').trim(),
+    })
+  }
+  return out
+}
+
 type ViewMode = 'list' | 'practice' | 'similar' | 'done'
 
 // 错题本：统计 + 筛选 + 错题列表 + 批量操作 + 举一反三 + 导出/打印
@@ -189,6 +220,15 @@ export function WrongQuestionsView({
   // ---- 举一反三 ----
   const [similarBusy, setSimilarBusy] = React.useState(false)
   const [similarItems, setSimilarItems] = React.useState<QuizItemData[]>([])
+
+  // ---- AI 智能选题（mode:'pick'）/ 批量举一反三（mode:'extend'，可存为试卷） ----
+  const [aiPickBusy, setAiPickBusy] = React.useState(false)
+  const [extendBusy, setExtendBusy] = React.useState(false)
+  const [extendOpen, setExtendOpen] = React.useState(false)
+  const [extendText, setExtendText] = React.useState('')
+  const [extendError, setExtendError] = React.useState('')
+  const [extendSaving, setExtendSaving] = React.useState(false)
+  const [extendBase, setExtendBase] = React.useState<QuizItemData[]>([])
 
   // ---- AI 解析 ----
   const [explainItem, setExplainItem] = React.useState<QuizItemData | null>(null)
@@ -527,6 +567,138 @@ export function WrongQuestionsView({
     }
   }
 
+  // ---- AI 智能选题：让 AI 从当前筛选列表中挑最值得练习的题并勾选 ----
+  const aiPick = async () => {
+    if (filteredItems.length === 0) {
+      toast('当前筛选下没有错题')
+      return
+    }
+    const count = Math.min(10, filteredItems.length)
+    setAiPickBusy(true)
+    const tid = toast.loading(`AI 正在挑选最值得练习的 ${count} 道题…`)
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'pick',
+          questions: filteredItems.map((i) => ({ question: i.question, reason: `错${i.wrongCount}次` })),
+          count,
+        }),
+      })
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(err.error || 'AI 选题失败')
+      }
+      const data = (await res.json()) as { indices?: unknown }
+      const idxs = Array.isArray(data.indices)
+        ? data.indices.filter(
+            (n): n is number =>
+              typeof n === 'number' &&
+              Number.isInteger(n) &&
+              n >= 0 &&
+              n < filteredItems.length,
+          )
+        : []
+      if (idxs.length === 0) throw new Error('AI 未返回有效选择，请重试')
+      setSelected(new Set(idxs.map((n) => filteredItems[n].id)))
+      toast.success(`AI 已选出 ${idxs.length} 道最值得练习的题`, { id: tid })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'AI 选题失败', { id: tid })
+    } finally {
+      setAiPickBusy(false)
+    }
+  }
+
+  // ---- 批量举一反三（mode:'extend'）：生成变式题讲解，可一键存入试卷夹 ----
+  const startExtend = async (baseItems: QuizItemData[]) => {
+    if (baseItems.length === 0) {
+      toast.warning('请先选择错题')
+      return
+    }
+    if (baseItems.length > 8) toast('一次最多 8 道错题，已取前 8 道生成')
+    const use = baseItems.slice(0, 8)
+    setExtendBusy(true)
+    setExtendOpen(true)
+    setExtendText('')
+    setExtendError('')
+    setExtendBase(use)
+    const tid = toast.loading('AI 正在举一反三…')
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'extend',
+          items: use.map((i) => ({ question: i.question, answer: i.answer, type: i.type })),
+          count: 3,
+        }),
+      })
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(err.error || '生成失败')
+      }
+      const data = (await res.json()) as { text?: string }
+      const text = (data.text ?? '').trim()
+      if (!text) throw new Error('AI 未返回内容，请重试')
+      setExtendText(text)
+      toast.dismiss(tid)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '生成失败'
+      setExtendError(msg)
+      toast.error(msg, { id: tid })
+    } finally {
+      setExtendBusy(false)
+    }
+  }
+
+  /** 把举一反三结果存为试卷：优先保存 AI 变式题，解析不出则保存所选原题。
+   *  错题可能跨卡 — 简单方案：存到第一道所选错题所属书。 */
+  const saveExtendAsPaper = async () => {
+    const cardId0 = extendBase[0]?.cardId
+    if (!cardId0) {
+      toast.error('缺少书本信息，无法保存到试卷夹')
+      return
+    }
+    const parsed = parseExtendPaper(extendText)
+    const items: Array<{ type: string; question: string; answer: string; options?: string[] }> =
+      parsed.length > 0
+        ? parsed
+        : extendBase.map((i) => ({
+            type: i.type,
+            question: i.question,
+            answer: i.answer,
+            options: i.options,
+          }))
+    if (items.length === 0) {
+      toast.warning('没有可保存的题目')
+      return
+    }
+    setExtendSaving(true)
+    try {
+      const res = await fetch('/api/papers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cardId: cardId0,
+          title: extendPaperTitle(),
+          items,
+          source: 'extend',
+        }),
+      })
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string }
+        throw new Error(err.error || '保存失败')
+      }
+      toast.success('已存入试卷夹')
+      setExtendOpen(false)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '保存失败')
+    } finally {
+      setExtendSaving(false)
+    }
+  }
+
   // ---- 朗读错题：题目（展开态附带正确答案） ----
   const speakItem = (item: QuizItemData, includeAnswer: boolean) => {
     if (tts.speaking) {
@@ -649,7 +821,9 @@ export function WrongQuestionsView({
         break
       case 'recent7': {
         const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000
-        next = new Set(filtered.filter((i) => i.updatedAt >= cutoff).map((i) => i.id))
+        next = new Set(
+          filtered.filter((i) => new Date(i.updatedAt).getTime() >= cutoff).map((i) => i.id),
+        )
         toast.success(`已选近 7 天错的 ${next.size} 道`)
         break
       }
@@ -742,7 +916,7 @@ export function WrongQuestionsView({
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  <DropdownMenuItem onClick={exportCSV}>
+                  <DropdownMenuItem onClick={() => exportCSV()}>
                     <Download className="size-4" /> 导出 CSV
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => window.print()}>
@@ -769,6 +943,14 @@ export function WrongQuestionsView({
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
+                  <DropdownMenuItem onClick={() => void aiPick()} disabled={aiPickBusy}>
+                    {aiPickBusy ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Sparkles className="size-4" />
+                    )}
+                    AI 智能选题
+                  </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => smartSelect('ge5')}>
                     错次 ≥ 5（高频错）
                   </DropdownMenuItem>
@@ -1164,6 +1346,22 @@ export function WrongQuestionsView({
                 导出选中（{selected.size}）
               </button>
             </div>
+            <div className="mb-2">
+              {/* 批量举一反三：AI 变式题讲解（≤8 道），可一键存入试卷夹 */}
+              <button
+                type="button"
+                disabled={selected.size === 0 || extendBusy || batchBusy || similarBusy}
+                onClick={() => void startExtend(selectedItems)}
+                className="flex h-11 w-full items-center justify-center gap-1.5 rounded-xl bg-emerald-600 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-40"
+              >
+                {extendBusy ? (
+                  <Loader2 className="size-4 animate-spin" />
+                ) : (
+                  <Sparkles className="size-4" />
+                )}
+                AI 举一反三（变式题{selected.size > 8 ? ' · 取前8道' : ''}）
+              </button>
+            </div>
             <div className="grid grid-cols-4 gap-2">
               <button
                 type="button"
@@ -1294,6 +1492,72 @@ export function WrongQuestionsView({
               <RichContent content={explainReply} />
             )}
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* 批量举一反三弹窗：AI 变式题讲解（RichContent 渲染）+ 存为试卷 */}
+      <Dialog
+        open={extendOpen}
+        onOpenChange={(o) => {
+          if (!o && !extendBusy) setExtendOpen(false)
+        }}
+      >
+        <DialogContent className="rounded-2xl sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>AI 举一反三</DialogTitle>
+            <DialogDescription className="text-xs leading-relaxed">
+              基于 {extendBase.length} 道错题生成的变式题与讲解
+              {extendBase.length > 0 && extendBase[0].cardTitle
+                ? ` · 将存入《${extendBase[0].cardTitle}》`
+                : ''}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[60vh] overflow-y-auto overscroll-contain">
+            {extendBusy ? (
+              <div className="flex flex-col items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
+                <Loader2 className="size-5 animate-spin" />
+                AI 正在举一反三…
+              </div>
+            ) : extendError ? (
+              <div className="flex flex-col items-center gap-3 py-8 text-center">
+                <p className="text-sm text-destructive">{extendError}</p>
+                <Button
+                  variant="outline"
+                  className="rounded-full"
+                  onClick={() => void startExtend(extendBase)}
+                >
+                  重试
+                </Button>
+              </div>
+            ) : (
+              /* 富媒体防护容器：变式题讲解绝撑不破弹窗 */
+              <div className="min-w-0 max-w-full break-words">
+                <RichContent content={extendText} />
+              </div>
+            )}
+          </div>
+          <DialogFooter className="gap-2">
+            <Button
+              variant="outline"
+              className="flex-1 rounded-full"
+              onClick={() => setExtendOpen(false)}
+              disabled={extendBusy}
+            >
+              关闭
+            </Button>
+            <Button
+              className="flex-1 rounded-full bg-zinc-900 text-white hover:bg-zinc-800"
+              onClick={() => void saveExtendAsPaper()}
+              disabled={extendBusy || extendSaving || !extendText.trim()}
+            >
+              {extendSaving ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <FolderPlus className="size-4" />
+              )}
+              存为试卷
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

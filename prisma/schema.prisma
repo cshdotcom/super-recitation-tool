@@ -85,6 +85,14 @@ model Settings {
   quizAutoRemove Int @default(2)
   // 导入时是否开启 AI 自动挖空
   aiAutoCloze Boolean @default(false)
+  // ---- AI 对话全局配置（服务端持久化，多端同步）----
+  aiSystemPrompt String  @default("")  // 系统提示词
+  aiRules        String  @default("")  // 自定义规则（追加到系统提示词）
+  aiSelfThinking Boolean @default(false) // 自我思考开关
+  aiTemperature  Float?  // 采样温度（空 = 默认）
+  aiMaxTokens    Int?    // 最大 tokens（空 = 默认）
+  // ---- PDF 解析引擎: auto(推荐,多引擎链) | unpdf | pdf-parse ----
+  pdfEngine String @default("auto")
 }
 
 // The single app account. Registration is only allowed while this table is
@@ -106,13 +114,64 @@ model Session {
   createdAt DateTime @default(now())
 }
 
-// One share link per card. expiresAt = null means 无限 (never expires).
+// One share link per card / conversation. expiresAt = null means 无限 (never expires).
+// kind: card(书籍内容分享) | conversation(AI对话分享)。refId = 对话 id（kind=conversation）。
 model Share {
   id        String    @id @default(uuid())
   token     String    @unique
-  cardId    String
+  cardId    String    @default("")
+  kind      String    @default("card")
+  refId     String    @default("")
+  title     String    @default("")
   expiresAt DateTime?
   createdAt DateTime  @default(now())
+}
+
+// 待播放列表 — 全局朗读播放队列（跨书本）。label = 片段名（整本朗读为空）。
+// startText/endText = 片段起止锚文本（内容子串匹配，各取 ≤60 字）。
+model PlayItem {
+  id        String   @id @default(uuid())
+  cardId    String
+  cardTitle String   @default("")
+  label     String   @default("")
+  startText String   @default("")
+  endText   String   @default("")
+  ord       Int      @default(0)
+  createdAt DateTime @default(now())
+}
+
+// 试卷夹 — 按书本（Card）独立划分。items = JSON 题目数组（与 quiz-panel 题型一致）。
+// source: ai(AI出题) | manual(手动组卷) | wrong(错题组卷)。
+model Paper {
+  id        String   @id @default(uuid())
+  cardId    String
+  cardTitle String   @default("")
+  title     String   @default("")
+  items     String   @default("[]")
+  source    String   @default("ai")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// AI 对话 — 独立会话（侧边栏统一管理）。
+// type: chat(自由对话) | analysis(题目解析) | favorite(收藏解析) | followup(追问) | supervise(督背)
+model Conversation {
+  id        String   @id @default(uuid())
+  title     String   @default("新对话")
+  type      String   @default("chat")
+  pinned    Boolean  @default(false)
+  cardId    String   @default("") // 来源书本（可选，解析/督背场景）
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ChatMessage {
+  id             String   @id @default(uuid())
+  conversationId String
+  role           String // user | assistant
+  content        String
+  images         String   @default("[]") // JSON string[]（dataURL，压缩后）
+  createdAt      DateTime @default(now())
 }
 
 // A quiz question stored on the server: 错题本 (wrong questions) + 收藏题目.

@@ -274,6 +274,14 @@ export interface SettingsData {
   quizAutoRemove: 1 | 2 | 3 | 5
   /** 导入时是否开启 AI 自动挖空 */
   aiAutoCloze: boolean
+  /** AI 对话全局配置（服务端持久化，多端同步） */
+  aiSystemPrompt: string
+  aiRules: string
+  aiSelfThinking: boolean
+  aiTemperature: number | null
+  aiMaxTokens: number | null
+  /** PDF 解析引擎: auto | unpdf | pdf-parse */
+  pdfEngine: 'auto' | 'unpdf' | 'pdf-parse'
 }
 
 export interface ChatMessage {
