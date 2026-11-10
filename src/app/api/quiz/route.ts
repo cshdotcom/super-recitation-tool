@@ -66,6 +66,14 @@ const VALID_TYPES: readonly string[] = ['fill', 'short', 'choice', 'multi', 'jud
 const MAX_PER_TYPE = 100
 const MAX_TOTAL = 100
 
+/**
+ * 富媒体格式指引（只改 prompt 文案，不改变请求/响应 JSON 结构）：
+ * 题干保持简洁适合作答；简答题参考答案可完整富媒体；
+ * 机器判分题型（填空/选择/判断）的 answer 保持简洁纯文本，避免影响自动判分。
+ */
+const RICH_FORMAT_HINT =
+  '富文本格式要求：数学/物理/化学式必须用 LaTeX（行内 $...$、独立 $$...$$）。题干(question)保持简洁适合作答，可用 LaTeX，但不要在题干里塞 mermaid 图、大表格或图片外链；简答题(short)的 answer 是供对照自评的参考答案，可完整使用富文本——**加粗**、markdown 表格、LaTeX 公式、mermaid 思维导图（```mermaid 代码块，适合知识结构梳理）、代码块；填空/选择/判断题的 answer 保持简洁纯文本（可含 LaTeX），便于自动判分；options 为纯文本短语。任何字段都不要输出图片外链。'
+
 function clampCount(n: unknown, max = MAX_PER_TYPE): number {
   const v = Math.floor(Number(n))
   if (!Number.isFinite(v) || v < 0) return 0
@@ -152,7 +160,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: '缺少错题数据' }, { status: 400 })
       }
 
-      const system = `你是语文老师。下面这些是学生做错的题目。请围绕这些错题所考察的知识点，出 3 到 5 道相似的新题，帮助学生举一反三：考点相同，但换一种提问角度或表述，难度相当。题型规则：选择题(type="choice")必须提供 options（恰好 4 个）且 answer 为正确选项的完整文本（与 options 中某一项完全一致）；多选题(type="multi")的 answer 为所有正确选项的完整文本、用「、」连接；判断题(type="judge")的 answer 只能是「正确」或「错误」；填空题(type="fill")题干用____表示空缺，answer 为应填内容；简答题(type="short")的 answer 为参考答案要点。只返回严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
+      const system = `你是语文老师。下面这些是学生做错的题目。请围绕这些错题所考察的知识点，出 3 到 5 道相似的新题，帮助学生举一反三：考点相同，但换一种提问角度或表述，难度相当。题型规则：选择题(type="choice")必须提供 options（恰好 4 个）且 answer 为正确选项的完整文本（与 options 中某一项完全一致）；多选题(type="multi")的 answer 为所有正确选项的完整文本、用「、」连接；判断题(type="judge")的 answer 只能是「正确」或「错误」；填空题(type="fill")题干用____表示空缺，answer 为应填内容；简答题(type="short")的 answer 为参考答案要点。${RICH_FORMAT_HINT} 只返回严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
       const listText = sources
         .map(
           (q, i) =>
@@ -223,7 +231,7 @@ export async function POST(req: NextRequest) {
         .filter(Boolean)
         .join('；')
 
-      const system = `你是语文出题老师。请严格依据给定的"知识点清单"范围出题，结合课文原文，优先覆盖标注为[核心]的知识点，题型分布与数量必须满足：${typeReq}。只返回严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
+      const system = `你是语文出题老师。请严格依据给定的"知识点清单"范围出题，结合课文原文，优先覆盖标注为[核心]的知识点，题型分布与数量必须满足：${typeReq}。${RICH_FORMAT_HINT} 只返回严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
 
       const pointsText = points
         .map((p, i) => `${i + 1}. [${p.importance === 'core' ? '核心' : '次要'}] ${p.text}`)
@@ -264,7 +272,7 @@ export async function POST(req: NextRequest) {
     if (count < 1) count = 1
     if (count > MAX_TOTAL) count = MAX_TOTAL
 
-    const system = `你是语文出题老师。根据下面这段文字生成背书练习题，题型混合：填空题(type="fill")、简答题(type="short")、选择题(type="choice")。要求：填空题用____表示空缺，answer为应填内容；选择题必须提供options(恰好4个选项的字符串数组)和answer(正确选项的完整文本，须与options中某一项完全一致)；简答题answer为参考答案。共生成${count}道题。只返回JSON：{"questions":[{"type":"fill"|"short"|"choice","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
+    const system = `你是语文出题老师。根据下面这段文字生成背书练习题，题型混合：填空题(type="fill")、简答题(type="short")、选择题(type="choice")。要求：填空题用____表示空缺，answer为应填内容；选择题必须提供options(恰好4个选项的字符串数组)和answer(正确选项的完整文本，须与options中某一项完全一致)；简答题answer为参考答案。共生成${count}道题。${RICH_FORMAT_HINT} 只返回JSON：{"questions":[{"type":"fill"|"short"|"choice","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
     const user = `课文：\n${content.slice(0, MAX_CONTENT)}\n\n重点关注词语：${
       keywords.length > 0 ? keywords.join('、') : '（无）'
     }`

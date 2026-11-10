@@ -7,12 +7,12 @@
 //   • 对话列表：置顶分组 + 更新时间倒序；每行含类型徽章 / 标题 / 最后消息
 //     摘要 / 时间 / 消息数；活动对话高亮。
 //   • 每行更多菜单：置顶、重命名、AI 智能重命名（PATCH autoRename）、分享
-//     （POST /api/shares → 复制链接）、导出（TXT/MD/JSON）、删除（确认）。
+//     （先选有效期 → POST /api/shares → 复制链接）、导出（TXT/MD/JSON）、删除（确认）。
 //   • 顶部新建对话（类型：自由对话/题目解析/收藏解析/追问）。
 //   • 一级全局搜索：GET /api/conversations?q= →「标题命中」对话列表 +
 //     「内容命中」消息列表（关键词高亮，点击跳转该对话）。
 //   • 批量管理：复选框模式，全选 / 批量删除（确认）/ 批量导出合并 MD /
-//     批量分享（逐个创建并列出链接）。
+//     批量分享（先选有效期，逐个创建并列出链接）。
 //
 // 本文件同时导出对话相关的共享工具（类型 / 导出 / 分享），ChatTool 复用。
 import * as React from 'react'
@@ -52,6 +52,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -66,6 +67,8 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { Label } from '@/components/ui/label'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 
 // ---------- 共享类型 / 工具（ChatTool 也使用） ----------
 
@@ -336,6 +339,138 @@ function Highlight({ text, kw }: { text: string; kw: string }) {
 const SCROLLBAR =
   '[scrollbar-width:thin] [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:min-h-6 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent'
 
+// ---------- 对话分享对话框（单条 / 批量共用：先选有效期再创建） ----------
+
+type ShareExpiry = 'inf' | '1' | '7' | '30' | 'custom'
+
+const SHARE_EXPIRY_OPTIONS: { value: ShareExpiry; label: string }[] = [
+  { value: 'inf', label: '永久有效' },
+  { value: '1', label: '1 天' },
+  { value: '7', label: '7 天' },
+  { value: '30', label: '30 天' },
+  { value: 'custom', label: '自定义' },
+]
+
+/**
+ * 分享对话前的有效期选择对话框（与卡片/书籍分享一致）。
+ * - mode 'single'：分享单个对话（title 如「分享对话「xxx」」）。
+ * - mode 'batch'：批量分享（title 如「批量分享 N 个对话」）。
+ * 确认后回调 onConfirm(days)：0 = 永久，N = N 天有效；由调用方执行
+ * shareConversationLink(id, days)。自定义天数需为 1-3650 的整数。
+ */
+function ConversationShareDialog({
+  open,
+  onOpenChange,
+  title,
+  mode,
+  onConfirm,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  title: string
+  mode: 'single' | 'batch'
+  onConfirm: (days: number) => void
+}) {
+  const [expiry, setExpiry] = React.useState<ShareExpiry>('7')
+  const [customDays, setCustomDays] = React.useState('7')
+
+  // 每次打开重置（默认 7 天，与卡片分享默认一致）
+  React.useEffect(() => {
+    if (open) {
+      setExpiry('7')
+      setCustomDays('7')
+    }
+  }, [open])
+
+  const handleConfirm = () => {
+    if (expiry === 'inf') {
+      onConfirm(0)
+      return
+    }
+    if (expiry === 'custom') {
+      const v = customDays.trim()
+      const n = Number(v)
+      if (!/^\d+$/.test(v) || !Number.isInteger(n) || n < 1 || n > 3650) {
+        toast.error('自定义有效期需为 1-3650 的整数（天）')
+        return
+      }
+      onConfirm(n)
+      return
+    }
+    onConfirm(Number(expiry))
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="rounded-2xl">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>
+            {mode === 'batch'
+              ? '将为所选对话分别创建只读分享链接，并逐个复制到剪贴板；到期后链接自动失效。'
+              : '将创建只读分享链接并复制到剪贴板；到期后链接自动失效。'}
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-3">
+          <p className="text-sm font-medium">有效期</p>
+          <RadioGroup
+            value={expiry}
+            onValueChange={(v) => setExpiry(v as ShareExpiry)}
+            className="gap-2.5"
+          >
+            {SHARE_EXPIRY_OPTIONS.map((opt) => (
+              <div
+                key={opt.value}
+                className={cn(
+                  'flex items-center gap-2.5 rounded-xl border px-3 py-2.5 transition-colors',
+                  expiry === opt.value
+                    ? 'border-primary/40 bg-primary/5'
+                    : 'border-border',
+                )}
+              >
+                <RadioGroupItem value={opt.value} id={`conv-share-expiry-${opt.value}`} />
+                <Label
+                  htmlFor={`conv-share-expiry-${opt.value}`}
+                  className="flex-1 cursor-pointer text-sm font-medium"
+                >
+                  {opt.label}
+                </Label>
+              </div>
+            ))}
+          </RadioGroup>
+
+          {expiry === 'custom' && (
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={1}
+                max={3650}
+                value={customDays}
+                onChange={(e) => setCustomDays(e.target.value)}
+                placeholder="1-3650"
+                aria-label="自定义天数"
+                className="h-10 w-28 rounded-xl"
+              />
+              <span className="text-sm text-muted-foreground">天（1-3650）</span>
+            </div>
+          )}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" className="rounded-full" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button className="rounded-full" onClick={handleConfirm}>
+            <Share2 className="size-4" />
+            确认分享
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function ChatSidebar({
   open,
   onOpenChange,
@@ -365,6 +500,9 @@ export function ChatSidebar({
   const [shareLinks, setShareLinks] = React.useState<
     { title: string; link: string }[] | null
   >(null)
+  // ---- 分享有效期对话框（单条 shareTarget / 批量 batchShareOpen） ----
+  const [shareTarget, setShareTarget] = React.useState<ConversationSummary | null>(null)
+  const [batchShareOpen, setBatchShareOpen] = React.useState(false)
 
   const loadConversations = React.useCallback(async () => {
     setLoading(true)
@@ -612,13 +750,13 @@ export function ChatSidebar({
     }
   }
 
-  const handleBatchShare = async () => {
+  const handleBatchShare = async (days: number) => {
     if (selectedConvs.length === 0) return
     setBatchBusy(true)
     const tid = toast.loading('正在创建分享…')
     const links: { title: string; link: string }[] = []
     for (const c of selectedConvs) {
-      const link = await shareConversationLink(c.id)
+      const link = await shareConversationLink(c.id, days)
       if (link) links.push({ title: c.title, link })
     }
     setBatchBusy(false)
@@ -734,7 +872,7 @@ export function ChatSidebar({
                 )}
                 AI 智能重命名
               </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => void shareConversationLink(c.id)}>
+              <DropdownMenuItem onClick={() => setShareTarget(c)}>
                 <Share2 className="size-4" />
                 分享
               </DropdownMenuItem>
@@ -888,7 +1026,7 @@ export function ChatSidebar({
             size="sm"
             className="h-8 rounded-full text-xs"
             disabled={batchBusy || selected.size === 0}
-            onClick={() => void handleBatchShare()}
+            onClick={() => setBatchShareOpen(true)}
           >
             <Share2 className="size-3.5" />
             分享
@@ -1131,6 +1269,33 @@ export function ChatSidebar({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* 单条分享：先选有效期 */}
+      <ConversationShareDialog
+        open={!!shareTarget}
+        onOpenChange={(o) => {
+          if (!o) setShareTarget(null)
+        }}
+        title={`分享对话「${shareTarget?.title ?? ''}」`}
+        mode="single"
+        onConfirm={(days) => {
+          const target = shareTarget
+          setShareTarget(null)
+          if (target) void shareConversationLink(target.id, days)
+        }}
+      />
+
+      {/* 批量分享：先选有效期（再逐个创建 + 结果列表） */}
+      <ConversationShareDialog
+        open={batchShareOpen}
+        onOpenChange={setBatchShareOpen}
+        title={`批量分享 ${selected.size} 个对话`}
+        mode="batch"
+        onConfirm={(days) => {
+          setBatchShareOpen(false)
+          void handleBatchShare(days)
+        }}
+      />
     </div>
   )
 }

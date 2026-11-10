@@ -62,6 +62,16 @@ const IMPORT_ENTRIES = [
 
 type EntryKey = (typeof IMPORT_ENTRIES)[number]['key']
 
+/** 音频扩展名（与 /api/parse 的音频分流一致）：大小上限 30MB、提示「正在语音转文字」 */
+const AUDIO_FILE_RE = /\.(mp3|wav|m4a|aac|ogg|webm|amr|flac)$/i
+/** 图片扩展名（与 /api/parse 的图片分流一致）：提示「正在AI识别图片文字」 */
+const IMAGE_FILE_RE = /\.(png|jpe?g|webp|gif|bmp|heic)$/i
+
+const isAudioFile = (file: File) =>
+  AUDIO_FILE_RE.test(file.name) || file.type.startsWith('audio/')
+const isImageFile = (file: File) =>
+  IMAGE_FILE_RE.test(file.name) || file.type.startsWith('image/')
+
 export function ImportSheet({
   open,
   onOpenChange,
@@ -151,12 +161,20 @@ export function ImportSheet({
   }
 
   const handleTextFile = async (file: File) => {
-    if (file.size > 15 * 1024 * 1024) {
-      toast.error('文件过大，最大支持 15MB')
+    // 音频放宽到 30MB（服务端 ASR 同步支持），其余类型 15MB
+    const audio = isAudioFile(file)
+    const maxBytes = audio ? 30 * 1024 * 1024 : 15 * 1024 * 1024
+    if (file.size > maxBytes) {
+      toast.error(audio ? '音频过大，最大支持 30MB' : '文件过大，最大支持 15MB')
       return
     }
     setOcrLoading('file')
-    const toastId = toast.loading(`正在解析「${file.name}」…`)
+    const verb = audio
+      ? '正在语音转文字'
+      : isImageFile(file)
+        ? '正在AI识别图片文字'
+        : '正在解析'
+    const toastId = toast.loading(`${verb}「${file.name}」…`)
     try {
       const fd = new FormData()
       fd.append('file', file)
@@ -301,11 +319,16 @@ export function ImportSheet({
               })}
             </div>
 
+            {/* 支持类型提示 */}
+            <p className="-mt-3 text-center text-[11px] leading-relaxed text-muted-foreground">
+              文件导入支持 PDF / Word / Excel / PPT / EPUB / 图片 / 音频 / 文本
+            </p>
+
             {/* hidden inputs */}
             <input
               id="import-file-input"
               type="file"
-              accept=".pdf,.docx,.txt,.md,.markdown,text/*,application/pdf"
+              accept="*/*"
               className="hidden"
               onChange={(e) => {
                 const f = e.target.files?.[0]

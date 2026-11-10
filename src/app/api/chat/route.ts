@@ -39,6 +39,7 @@ export async function POST(req: NextRequest) {
 - 填空题：答案的核心含义与标准答案一致即可，允许标点、同义词、近义表述差异（如「因为」≈「由于」、「地」≈「的」在合理语境下）。
 - 简答题：要点覆盖即算对，不要求字面一致；只要学生答出标准答案的关键信息即判对。
 - 完全无关/答非所问/空白 → 错。
+- reason 为一句话中文说明；如涉及数学式可用 LaTeX（$...$ 行内写法），但不要使用表格、图表、代码块等多行格式，确保返回的是合法 JSON。
 只返回严格 JSON：{"right": true或false, "reason": "一句话说明判定依据"}，不要任何额外解释。`
       const userMsg = `题型：${type || '未标注'}${optionsPart}
 题目：${question}
@@ -87,7 +88,7 @@ export async function POST(req: NextRequest) {
       if (items.length === 0) {
         return NextResponse.json({ error: '缺少原题' }, { status: 400 })
       }
-      const FORMAT_PROMPT_EXT = `你的回复会原样渲染，可按需使用：Markdown、LaTeX 公式（$...$ / $$...$$）、mermaid 图表（\`\`\`mermaid 代码块）、HTML 片段、代码块、SVG。`
+      const FORMAT_PROMPT_EXT = `输出格式：你的回复会原样渲染，可以使用富文本格式——**加粗**、markdown 表格、LaTeX 公式（$行内$ / $$独立$$，数学/物理/化学题答案必须用 LaTeX）、mermaid 思维导图（\`\`\`mermaid 代码块，适合知识结构梳理）、HTML 片段、SVG、代码块。不要输出图片外链。`
       const sys = `你是优秀的语文/背诵出题老师。根据给出的原题，举一反三生成新题。要求：
 - 新题与原题考查相同知识点但角度不同（换语境/换问法/逆向提问）
 - 每题附标准答案与简要解析
@@ -126,7 +127,7 @@ ${items.map((q, i) => `${i + 1}. [${q.type || '未标注'}] ${q.question}\n答�
       if (!question.trim()) {
         return NextResponse.json({ error: '解析内容不能为空' }, { status: 400 })
       }
-      const FORMAT_PROMPT_AN = `你的回复会原样渲染，支持全部富媒体格式：Markdown、LaTeX 数学公式（行内 $...$、展示 $$...$$，支持化学式 \\ce{}）、mermaid（\`\`\`mermaid 代码块：mindmap/流程图/时序图）、SVG（\`\`\`svg 代码块或 <svg>）、HTML 片段、代码块、表格。讲解结构、层次、流程时优先用 mermaid 思维导图或表格。`
+      const FORMAT_PROMPT_AN = `输出格式：你的回复会原样渲染，可以使用富文本格式——**加粗**、markdown 表格、LaTeX 公式（$行内$ / $$独立$$，支持化学式 \\ce{}，数学/物理/化学题答案必须用 LaTeX）、mermaid 思维导图（\`\`\`mermaid 代码块，适合知识结构梳理）、SVG（\`\`\`svg 代码块或 <svg>）、HTML 片段、代码块。讲解结构、层次、流程时优先用 mermaid 思维导图或表格。不要输出图片外链。`
       const sys = `你是耐心的全能学科讲解老师。对给出的题目/内容做深度解析，帮助学生真正理解：
 - 讲清考点、解题思路（分步骤）
 - 易错点提醒、相关知识拓展

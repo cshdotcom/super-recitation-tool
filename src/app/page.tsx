@@ -11,6 +11,7 @@ import { kwText, normKeywordEntries } from '@/lib/cloze'
 import { extractClozeMarks } from '@/lib/editor-cloze'
 import { playbackStart } from '@/lib/playback'
 import type { ImportPayload } from '@/components/recitation/import-sheet'
+import type { AiMarkOptions as AiMarkOptionsT } from '@/components/recitation/ai-mark-dialog'
 import NextDynamic from 'next/dynamic'
 import {
   Sheet as SheetGlobal,
@@ -129,6 +130,11 @@ const FollowupPopover = NextDynamic(
 const SearchOverlay = NextDynamic(
   () => import('@/components/recitation/search-overlay').then((m) => m.SearchOverlay),
   { ssr: false },
+)
+// AI 自动标记询问弹窗（导入创建前询问 / 新卡创建后询问）
+const AiMarkDialog = NextDynamic(
+  () => import('@/components/recitation/ai-mark-dialog').then((m) => m.AiMarkDialog),
+  { ssr: false, loading: () => null },
 )
 
 function PageSkeleton() {
@@ -400,36 +406,13 @@ export default function Page() {
         setEditorDraft(null)
         setView('reader')
         toast.success('已创建背书卡，开始背诵吧！', { id: tid })
-        // 导入偏好：AI 自动挖空
-        if (settings?.aiAutoCloze && marks.length === 0 && content.length >= 20) {
-          toast.loading('AI 正在自动挖空…', { id: 'auto-cloze' })
-          try {
-            const r2 = await fetch('/api/cloze', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ content }),
-            })
-            if (r2.ok) {
-              const d2 = (await r2.json()) as { keywords?: string[] }
-              const kws = (d2.keywords || []).filter(Boolean)
-              if (kws.length > 0) {
-                const r3 = await fetch(`/api/cards/${encodeURIComponent(created.id)}`, {
-                  method: 'PATCH',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ keywords: kws }),
-                })
-                if (r3.ok) {
-                  created = { ...created, keywords: kws }
-                  setCards((prev) => prev.map((c) => (c.id === created.id ? created : c)))
-                  setCurrentCard((cur) => (cur && cur.id === created.id ? created : cur))
-                  toast.success(`AI 已自动挖空 ${kws.length} 处`, { id: 'auto-cloze' })
-                }
-              }
-            }
-          } catch {
-            toast.error('AI 自动挖空失败，可稍后手动挖空', { id: 'auto-cloze' })
-          }
+        // 创建后询问：是否 AI 自动标记（直接输入内容等未经导入询问的路径；导入路径已问过不再重复）
+        if (!importMarkAskedRef.current && marks.length === 0 && content.length >= 20) {
+          setAiMarkPayload(null)
+          setAiMarkCard(created)
+          setAiMarkOpen(true)
         }
+        importMarkAskedRef.current = false
         setCurrentCard(created)
       } catch (err) {
         toast.error('创建失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
@@ -438,10 +421,161 @@ export default function Page() {
     [editorDraft, editorTitle, editorMode, currentCard, settings, activeCategoryId],
   )
 
-  // ---------- 兼容旧 ImportSheet onImport（文件/图片/粘贴导入 → 全部进入超级编辑器） ----------
+  // ---------- 导入时询问：是否 AI 自动标记（上传文件/粘贴文本/拍照/图片识别全部路径） ----------
+  const [aiMarkOpen, setAiMarkOpen] = React.useState(false)
+  const [aiMarkLoading, setAiMarkLoading] = React.useState(false)
+  /** 导入链路待标记的 payload；创建后链路为 null（用 aiMarkCard） */
+  const [aiMarkPayload, setAiMarkPayload] = React.useState<ImportPayload | null>(null)
+  /** 创建后询问的目标卡（直接输入内容路径） */
+  const [aiMarkCard, setAiMarkCard] = React.useState<CardData | null>(null)
+  /** 本次导入是否已问过（编辑器保存后不再重复问） */
+  const importMarkAskedRef = React.useRef(false)
+
+  const aiMarkDefaults = React.useMemo(
+    () => ({ cloze: settings?.aiAutoCloze ?? true, highlight: true, media: true }),
+    [settings?.aiAutoCloze],
+  )
+
+  /** 导入路径确认：AI 标记后带标记内容+分块进入编辑器 */
+  const handleAiMarkConfirm = React.useCallback(
+    async (options: AiMarkOptionsT) => {
+      const payload = aiMarkPayload
+      if (!payload) return
+      setAiMarkLoading(true)
+      const tid = toast.loading('AI 正在标记导入内容…')
+      try {
+        const res = await fetch('/api/automark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: payload.content,
+            title: payload.title,
+            options,
+          }),
+        })
+        const data = (await res.json().catch(() => ({}))) as {
+          content?: string
+          blocks?: { front: string; back: string }[]
+          error?: string
+          truncated?: boolean
+        }
+        if (!res.ok || !data.content) throw new Error(data.error || 'AI 标记失败')
+        setAiMarkOpen(false)
+        setImportOpen(false)
+        setEditorMode('create')
+        setEditorTitle(payload.title || '')
+        setEditorDraft({
+          title: payload.title || '',
+          content: data.content,
+          blocks: (data.blocks ?? []).map((b) => ({
+            front: b.front ?? '',
+            back: b.back ?? '',
+          })),
+        })
+        setView('material-editor')
+        toast.success(
+          data.truncated
+            ? '内容较长，AI 已标记前 6000 字，可在编辑器继续手动标记'
+            : 'AI 标记完成，可在编辑器继续调整',
+          { id: tid },
+        )
+      } catch (err) {
+        toast.error(
+          (err instanceof Error ? err.message : 'AI 标记失败') + '；已改为直接导入',
+          { id: tid },
+        )
+        // 失败回退：不标记直接进编辑器
+        setAiMarkOpen(false)
+        setImportOpen(false)
+        setEditorMode('create')
+        setEditorTitle(payload.title || '')
+        setEditorDraft({ title: payload.title || '', content: payload.content, blocks: [] })
+        setView('material-editor')
+      } finally {
+        setAiMarkLoading(false)
+        setAiMarkPayload(null)
+      }
+    },
+    [aiMarkPayload],
+  )
+
+  /** 跳过：不标记直接进编辑器（原导入行为） */
+  const handleAiMarkSkip = React.useCallback(() => {
+    setAiMarkOpen(false)
+    const payload = aiMarkPayload
+    setAiMarkPayload(null)
+    if (!payload) return
+    setImportOpen(false)
+    setEditorMode('create')
+    setEditorTitle(payload.title || '')
+    setEditorDraft({ title: payload.title || '', content: payload.content, blocks: [] })
+    setView('material-editor')
+  }, [aiMarkPayload])
+
+  /** 创建后路径确认：对已建卡执行 AI 标记并回写（直接输入内容等未经导入询问的路径） */
+  const handleAiMarkCardConfirm = React.useCallback(
+    async (options: AiMarkOptionsT) => {
+      const card = aiMarkCard
+      if (!card) return
+      setAiMarkLoading(true)
+      const tid = toast.loading(`AI 正在标记「${card.title}」…`)
+      try {
+        const res = await fetch('/api/automark', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: card.content, title: card.title, options }),
+        })
+        const data = (await res.json().catch(() => ({}))) as {
+          content?: string
+          blocks?: { front: string; back: string }[]
+          error?: string
+        }
+        if (!res.ok || !data.content) throw new Error(data.error || 'AI 标记失败')
+        const { content, keywords } = extractClozeMarks(data.content)
+        const blocks: MaterialBlock[] =
+          data.blocks && data.blocks.length > 0
+            ? data.blocks.map((b) => ({ front: b.front ?? '', back: b.back ?? '' }))
+            : (card.blocks ?? [])
+        const res2 = await fetch(`/api/cards/${encodeURIComponent(card.id)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: content.trim() || card.content,
+            keywords,
+            blocks,
+          }),
+        })
+        if (!res2.ok) {
+          const err = await res2.json().catch(() => ({}))
+          throw new Error((err as { error?: string }).error || '保存失败')
+        }
+        const saved = (await res2.json()) as CardData
+        setCards((prev) => prev.map((c) => (c.id === saved.id ? saved : c)))
+        setCurrentCard((cur) => (cur && cur.id === saved.id ? saved : cur))
+        setAiMarkOpen(false)
+        toast.success('AI 标记完成，开始背诵吧！', { id: tid })
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : 'AI 标记失败', { id: tid })
+      } finally {
+        setAiMarkLoading(false)
+        setAiMarkCard(null)
+      }
+    },
+    [aiMarkCard],
+  )
+
+  // ---------- 兼容旧 ImportSheet onImport（文件/图片/粘贴导入 → 询问 AI 标记 → 超级编辑器） ----------
   const handleImport = React.useCallback(
     (payload: ImportPayload) => {
       setImportOpen(false)
+      importMarkAskedRef.current = true
+      // 内容足够长才询问（超短内容标记意义不大，直接进编辑器）
+      if (payload.content.trim().length >= 20) {
+        setAiMarkCard(null)
+        setAiMarkPayload(payload)
+        setAiMarkOpen(true)
+        return
+      }
       setEditorMode('create')
       setEditorTitle(payload.title || '')
       setEditorDraft({
@@ -450,7 +584,6 @@ export default function Page() {
         blocks: [],
       })
       setView('material-editor')
-      toast.info('内容已导入编辑器，可继续编辑后保存')
     },
     [],
   )
@@ -1070,6 +1203,35 @@ export default function Page() {
           onDirectEdit={handleNewCard}
         />
       )}
+
+      {/* AI 自动标记询问（导入创建前 / 新卡创建后，两种模式共用） */}
+      <AiMarkDialog
+        open={aiMarkOpen}
+        onOpenChange={(o) => {
+          if (!o && !aiMarkLoading) {
+            if (aiMarkPayload) handleAiMarkSkip()
+            else {
+              setAiMarkOpen(false)
+              setAiMarkCard(null)
+            }
+          }
+        }}
+        defaultOptions={aiMarkDefaults}
+        loading={aiMarkLoading}
+        context="import"
+        contentPreview={aiMarkPayload?.content ?? aiMarkCard?.content ?? undefined}
+        onConfirm={(o) => {
+          if (aiMarkPayload) void handleAiMarkConfirm(o)
+          else void handleAiMarkCardConfirm(o)
+        }}
+        onSkip={() => {
+          if (aiMarkPayload) handleAiMarkSkip()
+          else {
+            setAiMarkOpen(false)
+            setAiMarkCard(null)
+          }
+        }}
+      />
 
       {/* 卡片 ⋯ 菜单里的分享弹窗 */}
       {shareCard && settings && (

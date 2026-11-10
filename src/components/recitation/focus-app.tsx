@@ -22,7 +22,6 @@ import {
   ChevronUp,
   Clock3,
   Loader2,
-  Minimize2,
   Minus,
   Pause,
   Play,
@@ -30,6 +29,7 @@ import {
   Settings2,
   SquarePen,
   Trash2,
+  X,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import {
@@ -849,14 +849,14 @@ export function FocusApp({ onBack }: FocusAppProps) {
           )}
           <div className="absolute inset-0 bg-gradient-to-b from-black/60 via-black/40 to-black/60" />
 
-          {/* 最小化 */}
+          {/* 最小化（X 按钮：收起全屏遮罩，计时后台继续） */}
           <button
             type="button"
             onClick={minimize}
-            className="absolute left-4 top-4 z-10 flex h-10 items-center gap-1.5 rounded-full bg-white/10 px-4 text-sm font-medium text-white backdrop-blur transition-colors hover:bg-white/20"
+            aria-label="最小化（计时后台继续）"
+            className="absolute left-4 top-4 z-10 flex size-10 items-center justify-center rounded-full bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
           >
-            <Minimize2 className="size-4" strokeWidth={1.75} />
-            最小化
+            <X className="size-5" strokeWidth={2} />
           </button>
 
           <div className="relative z-10 flex h-full flex-col items-center justify-center px-6 pb-28">

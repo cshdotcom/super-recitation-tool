@@ -27,6 +27,12 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 
+// 选中/AI 内容富媒体渲染（懒加载，模块级定义一次，参照 cloze-text.tsx 写法）：
+// markdown / LaTeX / mermaid / 表格 / SVG / HTML / 代码块统一渲染，纯文本同样兼容。
+const RichContentLazy = React.lazy(
+  () => import('@/components/recitation/rich-content').then((m) => ({ default: m.RichContent })),
+)
+
 /** FollowupPopover 一次性自我思考偏好的 sessionStorage key（ChatTool 消费后清除）。 */
 export const FOLLOWUP_THINKING_KEY = 'bs:followup-thinking'
 
@@ -382,9 +388,20 @@ export function FollowupPopover({ getActiveConversationId }: FollowupPopoverProp
               </div>
             </div>
 
-            {/* 选中文本预览（≤3 行截断） */}
-            <div className="mt-2.5 line-clamp-3 rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-3 py-2 text-[13px] leading-relaxed text-foreground/85">
-              {detail.text}
+            {/* 选中文本预览：富媒体渲染（选中文本多来自 AI 对话/解析，可含 LaTeX/表格等）。
+                外层限宽限高：长内容/富媒体在区域内滚动（横向溢出交给内部滚动容器），
+                mermaid/表格可完整查看且不撑破浮层。 */}
+            <div className="mt-2.5 max-h-60 min-w-0 overflow-y-auto overscroll-contain rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-3 py-2">
+              <React.Suspense
+                fallback={
+                  <div className="py-2 text-center text-xs text-muted-foreground">渲染中…</div>
+                }
+              >
+                <RichContentLazy
+                  content={detail.text}
+                  className="overflow-x-auto text-[13px] leading-relaxed text-foreground/85"
+                />
+              </React.Suspense>
             </div>
 
             {/* 附图预览 */}

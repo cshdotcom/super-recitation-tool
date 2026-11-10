@@ -116,6 +116,11 @@ import { Slider } from '@/components/ui/slider'
 import { Textarea } from '@/components/ui/textarea'
 import { RichContent } from '@/components/recitation/rich-content'
 import { CameraCapture } from '@/components/recitation/camera-capture'
+import { MediaRefStrip, type MediaAction } from '@/components/recitation/media-ref-strip'
+import { MediaDetailDialog } from '@/components/recitation/media-detail-dialog'
+import { MediaEditDialog } from '@/components/recitation/media-edit-dialog'
+import { AiMarkDialog, type AiMarkOptions } from '@/components/recitation/ai-mark-dialog'
+import type { MediaRef } from '@/components/recitation/media-refs'
 
 // ---------- props 契约 ----------
 export interface MaterialEditorProps {
@@ -251,6 +256,23 @@ function compressImage(file: File): Promise<string> {
   })
 }
 
+/** 上传图片到图片服务器（POST /api/upload {dataUrl} → /api/upload/<id> 短链接）。
+ * 成功后正文只保留短引用（~40 字符）而不是巨型 base64；失败回退 dataURL 内嵌（离线可用）。 */
+async function uploadImageRef(dataUrl: string): Promise<string> {
+  try {
+    const res = await fetch('/api/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dataUrl }),
+    })
+    if (!res.ok) return dataUrl
+    const data = (await res.json().catch(() => ({}))) as { url?: string }
+    return data.url || dataUrl
+  } catch {
+    return dataUrl
+  }
+}
+
 /** 裁剪：按自然像素框裁出 dataURL（宽 ≤800px） */
 function cropDataUrl(
   src: string,
@@ -307,49 +329,7 @@ function toPreviewMarkdown(text: string): string {
     })
 }
 
-// ---------- 块内图片预览条 ----------
-function extractImages(text: string): { alt: string; url: string; raw: string }[] {
-  const out: { alt: string; url: string; raw: string }[] = []
-  const re = /!\[([^\]]*)\]\(([^)\s]+)\)/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(text)) !== null) {
-    out.push({ alt: m[1], url: m[2], raw: m[0] })
-  }
-  return out
-}
-
-function BlockImageStrip({
-  content,
-  onRemove,
-}: {
-  content: string
-  onRemove: (raw: string) => void
-}) {
-  const imgs = React.useMemo(() => extractImages(content), [content])
-  if (imgs.length === 0) return null
-  return (
-    <div className="flex flex-wrap gap-2 rounded-xl bg-muted/40 p-2">
-      {imgs.map((img, idx) => (
-        <div key={idx} className="group relative">
-          <img
-            src={img.url}
-            alt={img.alt || '图片'}
-            loading="lazy"
-            className="h-20 w-20 rounded-lg border border-border object-cover"
-          />
-          <button
-            type="button"
-            aria-label="删除该图片"
-            onClick={() => onRemove(img.raw)}
-            className="absolute -right-1.5 -top-1.5 flex size-5 items-center justify-center rounded-full bg-destructive text-destructive-foreground opacity-0 shadow transition-opacity group-hover:opacity-100"
-          >
-            <Trash2 className="size-3" strokeWidth={2.5} aria-hidden />
-          </button>
-        </div>
-      ))}
-    </div>
-  )
-}
+// ---------- 块内富媒体引用条：见 media-ref-strip.tsx（图片/表格/导图/公式统一引用机制） ----------
 
 // ---------- 复制 / 导出 ----------
 /** 把 blocks 拼成纯文本（图片按 includeImages 决定保留或移除）。 */
@@ -766,14 +746,193 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     toast.success('已合并到上一块')
   }
 
-  /** 删除本块 back 中指定的图片 markdown 片段。 */
-  const removeImageFromBlock = (index: number, raw: string) => {
+  // ---- 富媒体引用操作（块顶 MediaRefStrip → 详情/定位/复制/删除/替换/裁剪/可视化编辑） ----
+  const [mediaDetail, setMediaDetail] = React.useState<MediaRef | null>(null)
+  const [mediaDetailCtx, setMediaDetailCtx] = React.useState('')
+  const [mediaDetailLocate, setMediaDetailLocate] = React.useState<{
+    index: number
+    field: 'front' | 'back'
+  } | null>(null)
+  const [mediaEditRef, setMediaEditRef] = React.useState<MediaRef | null>(null)
+  const [mediaEditTarget, setMediaEditTarget] = React.useState<{
+    index: number
+    field: 'front' | 'back'
+  } | null>(null)
+  const [cropTarget, setCropTarget] = React.useState<{
+    index: number
+    field: 'front' | 'back'
+    raw: string
+  } | null>(null)
+  const replaceInputRef = React.useRef<HTMLInputElement>(null)
+  const replaceTargetRef = React.useRef<{
+    index: number
+    field: 'front' | 'back'
+    raw: string
+  } | null>(null)
+
+  /** 把块内指定字段的 raw 片段替换为 next（删除传 ''）。 */
+  const replaceInBlock = (
+    index: number,
+    field: 'front' | 'back',
+    raw: string,
+    next: string,
+  ) => {
     commit((prev) =>
-      prev.map((b, bi) =>
-        bi === index ? { ...b, back: b.back.split(raw).join('') } : b,
-      ),
+      prev.map((b, bi) => {
+        if (bi !== index) return b
+        const text = field === 'front' ? b.front : b.back
+        const updated = text.split(raw).join(next)
+        return field === 'front' ? { ...b, front: updated } : { ...b, back: updated }
+      }),
     )
-    toast.success('已删除该图片')
+  }
+
+  /** 定位引用：聚焦对应文本框并选中引用原文，滚动到可视区。 */
+  const locateMedia = (index: number, field: 'front' | 'back', ref: MediaRef) => {
+    const el = taRefs.current.get(`${index}-${field}`)
+    const block = blocksRef.current[index]
+    if (!el || !block) {
+      toast.warning('未找到对应文本框')
+      return
+    }
+    const text = field === 'front' ? block.front : block.back
+    const pos = text.indexOf(ref.raw)
+    if (pos === -1) {
+      toast.warning('未找到引用位置（内容可能已被修改）')
+      return
+    }
+    el.focus()
+    el.setSelectionRange(pos, pos + ref.raw.length)
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    toast.info(`已定位并选中第 ${index + 1} 块的引用`)
+  }
+
+  const handleMediaAction = (
+    index: number,
+    field: 'front' | 'back',
+    action: MediaAction,
+    ref: MediaRef,
+  ) => {
+    const ctx = `第 ${index + 1} 块 · ${field === 'front' ? '核心论点' : '完整内容'}`
+    switch (action) {
+      case 'detail':
+        setMediaDetailCtx(ctx)
+        setMediaDetailLocate({ index, field })
+        setMediaDetail(ref)
+        break
+      case 'locate':
+        locateMedia(index, field, ref)
+        break
+      case 'copy':
+        void navigator.clipboard.writeText(ref.raw).then(
+          () => toast.success('引用已复制，粘贴到任意文本框即可插入'),
+          () => toast.error('复制失败，请手动复制'),
+        )
+        break
+      case 'remove':
+        replaceInBlock(index, field, ref.raw, '')
+        toast.success('已删除该引用')
+        break
+      case 'replace':
+        replaceTargetRef.current = { index, field, raw: ref.raw }
+        replaceInputRef.current?.click()
+        break
+      case 'crop':
+        setCropTarget({ index, field, raw: ref.raw })
+        setImgZoom(1)
+        setImgOffset({ x: 0, y: 0 })
+        setImgCrop(null)
+        imgCropNaturalRef.current = null
+        setImgEdit(ref.src)
+        break
+      case 'edit':
+        setMediaEditTarget({ index, field })
+        setMediaEditRef(ref)
+        break
+      default:
+        break
+    }
+  }
+
+  /** 替换图片：新图压缩 → 上传云端 → 替换原引用。 */
+  const handleReplaceFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    const target = replaceTargetRef.current
+    replaceTargetRef.current = null
+    if (!file || !target) return
+    if (!file.type.startsWith('image/')) {
+      toast.error('请选择图片文件')
+      return
+    }
+    const tid = toast.loading('正在替换图片…')
+    try {
+      const dataUrl = await compressImage(file)
+      const url = await uploadImageRef(dataUrl)
+      replaceInBlock(target.index, target.field, target.raw, `![图片](${url})`)
+      toast.success('图片已替换（云端同步）', { id: tid })
+    } catch (err) {
+      toast.error('替换失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+    }
+  }
+
+  /** 可视化编辑应用：按类型包裹回完整标记后替换原引用。 */
+  const handleMediaApply = (ref: MediaRef, newSrc: string) => {
+    if (!mediaEditTarget) return
+    let next = newSrc
+    if (ref.kind === 'formula') next = `$$${newSrc}$$`
+    else if (ref.kind === 'mermaid' || ref.kind === 'svg' || ref.kind === 'code')
+      next = '```' + (ref.lang || ref.kind) + '\n' + newSrc + '\n```'
+    replaceInBlock(mediaEditTarget.index, mediaEditTarget.field, ref.raw, next)
+    setMediaEditRef(null)
+    toast.success('已应用修改（可撤销）')
+  }
+
+  // ---- AI 自动标记（编辑器内手动触发：对当前内容块执行，走 /api/automark，可撤销） ----
+  const [aiMarkOpen, setAiMarkOpen] = React.useState(false)
+  const [aiMarking, setAiMarking] = React.useState(false)
+
+  const runAiMark = async (options: AiMarkOptions) => {
+    const current = blocksRef.current.filter((b) => (b.back || '').trim())
+    if (current.length === 0) {
+      toast.warning('当前没有可标记的内容')
+      setAiMarkOpen(false)
+      return
+    }
+    setAiMarking(true)
+    const tid = toast.loading('AI 正在标记当前内容…')
+    try {
+      const res = await fetch('/api/automark', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          blocks: current.map((b) => ({ front: b.front, back: b.back })),
+          options,
+        }),
+      })
+      const data = (await res.json().catch(() => ({}))) as {
+        blocks?: { front: string; back: string }[]
+        error?: string
+      }
+      if (!res.ok || !data.blocks?.length) throw new Error(data.error || '标记失败')
+      const marked = data.blocks
+      let mi = 0
+      commit((prev) => {
+        const next = [...prev]
+        for (let i = 0; i < next.length && mi < marked.length; i++) {
+          if (!(next[i].back || '').trim()) continue
+          const mb = marked[mi++]
+          next[i] = { ...next[i], back: mb.back, front: mb.front || next[i].front }
+        }
+        return next
+      })
+      toast.success('AI 标记完成，可撤销或继续手动调整', { id: tid })
+      setAiMarkOpen(false)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'AI 标记失败', { id: tid })
+    } finally {
+      setAiMarking(false)
+    }
   }
 
   const toggleHidden = (index: number) => {
@@ -1150,8 +1309,13 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     try {
       const dataUrl = await compressImage(file)
       if (direct) {
-        insertMarkdown(`![图片](${dataUrl})`, '', '')
-        toast.success('图片已插入')
+        const tid = toast.loading('正在上传图片…')
+        const url = await uploadImageRef(dataUrl)
+        insertMarkdown(`![图片](${url})`, '', '')
+        toast.success(
+          url.startsWith('/api/upload/') ? '图片已上传云端并插入' : '图片已插入（云端暂不可用，已内嵌）',
+          { id: tid },
+        )
       } else {
         setImgZoom(1)
         setImgOffset({ x: 0, y: 0 })
@@ -1183,9 +1347,9 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     try {
       const urls: string[] = []
       for (let i = 0; i < imgs.length; i++) {
-        toast.loading(`正在处理 ${i + 1}/${imgs.length} 张…`, { id: tid })
+        toast.loading(`正在上传 ${i + 1}/${imgs.length} 张…`, { id: tid })
         const dataUrl = await compressImage(imgs[i])
-        urls.push(dataUrl)
+        urls.push(await uploadImageRef(dataUrl))
       }
       const md = urls.map((d) => `![图片](${d})`).join('\n\n')
       insertMarkdown(md, '', '')
@@ -1204,12 +1368,24 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     setImgEdit(dataUrl)
   }, [])
 
-  // 在线相机连拍多张 → 直接全部插入正文（每张已在相机内裁剪好）
+  // 在线相机连拍多张 → 逐张上传云端 → 插入短引用（每张已在相机内裁剪好）
   const handleCameraPhotos = (dataUrls: string[]) => {
     if (dataUrls.length === 0) return
-    const md = dataUrls.map((d) => `![图片](${d})`).join('\n\n')
-    insertMarkdown(md, '', '')
-    toast.success(`已插入 ${dataUrls.length} 张照片`)
+    void (async () => {
+      const tid = toast.loading(`正在上传 ${dataUrls.length} 张照片…`)
+      try {
+        const urls: string[] = []
+        for (let i = 0; i < dataUrls.length; i++) {
+          toast.loading(`正在上传 ${i + 1}/${dataUrls.length} 张…`, { id: tid })
+          urls.push(await uploadImageRef(dataUrls[i]))
+        }
+        const md = urls.map((d) => `![图片](${d})`).join('\n\n')
+        insertMarkdown(md, '', '')
+        toast.success(`已插入 ${urls.length} 张照片（云端同步）`, { id: tid })
+      } catch (err) {
+        toast.error('照片上传失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+      }
+    })()
   }
 
   // 独立相机页（新标签页 /?cam=1）拍完后 postMessage 回传
@@ -1275,8 +1451,17 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     try {
       const box = boxOverride ?? imgCropNaturalRef.current ?? imgCrop
       const out = box ? await cropDataUrl(imgEdit, box) : imgEdit
-      insertMarkdown(`![图片](${out})`, '', '')
-      toast.success('图片已插入')
+      const tid = toast.loading('正在上传图片…')
+      const url = await uploadImageRef(out)
+      if (cropTarget) {
+        // 二次裁剪：替换块内的原引用
+        replaceInBlock(cropTarget.index, cropTarget.field, cropTarget.raw, `![图片](${url})`)
+        setCropTarget(null)
+        toast.success('已裁剪并替换（云端同步）', { id: tid })
+      } else {
+        insertMarkdown(`![图片](${url})`, '', '')
+        toast.success('图片已插入（云端同步）', { id: tid })
+      }
       setImgEdit(null)
     } catch (err) {
       toast.error('裁剪失败：' + (err instanceof Error ? err.message : '未知错误'))
@@ -1692,7 +1877,23 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 <span className="text-[11px] leading-none">管理</span>
               </button>
 
-              {/* 图片：本地上传（压缩≤800px 转 dataURL）/ 插入图片链接 */}
+              {/* AI 自动标记：挖空 / 重点标注 / 富媒体图表（当前内容，可撤销） */}
+              <button
+                type="button"
+                aria-label="AI 自动标记"
+                disabled={aiMarking}
+                onClick={() => setAiMarkOpen(true)}
+                className={TOOLBAR_BTN}
+              >
+                {aiMarking ? (
+                  <Loader2 className="size-5 animate-spin" strokeWidth={1.75} aria-hidden />
+                ) : (
+                  <Highlighter className="size-5" strokeWidth={1.75} aria-hidden />
+                )}
+                <span className="text-[11px] leading-none">AI标记</span>
+              </button>
+
+              {/* 图片：本地上传（压缩≤800px 自动上传云端插入短引用）/ 插入图片链接 */}
               <Popover>
                 <PopoverTrigger asChild>
                   <button
@@ -1753,7 +1954,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                     插入图片链接
                   </button>
                   <p className="px-2.5 pb-1.5 pt-1 text-[11px] text-muted-foreground">
-                    图片压缩到 800px 宽后内嵌；链接图片可选保存到图片服务器
+                    图片自动压缩并上传云端，正文只保留短引用；块顶媒体条可查看 / 编辑 / 替换
                   </p>
                 </PopoverContent>
               </Popover>
@@ -2358,11 +2559,12 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
 
                     {/* 完整内容（背面）：编辑 / Markdown 预览 */}
                     <span className="block text-sm text-muted-foreground">完整内容（背面）：</span>
-                    {/* 编辑态：把 back 中的图片以缩略图条展示（避免文本框里看到 base64） */}
+                    {/* 编辑态：块顶富媒体引用条（图片缩略图/表格/导图/公式卡片；
+                        点击详情放大，⋮ 或长按：定位/复制/替换/裁剪/可视化编辑/删除） */}
                     {!isPreview && (
-                      <BlockImageStrip
+                      <MediaRefStrip
                         content={block.back}
-                        onRemove={(raw) => removeImageFromBlock(i, raw)}
+                        onAction={(action, ref) => handleMediaAction(i, 'back', action, ref)}
                       />
                     )}
                     {isPreview ? (
@@ -2460,10 +2662,61 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
         src={imgEdit ?? ''}
         open={!!imgEdit}
         onOpenChange={(v) => {
-          if (!v) setImgEdit(null)
+          if (!v) {
+            setImgEdit(null)
+            setCropTarget(null)
+          }
         }}
         onConfirm={(box) => void insertCropped(box)}
         onSrcChange={(next) => setImgEdit(next)}
+      />
+
+      {/* 替换图片（MediaRefStrip「替换」→ 隐藏 input） */}
+      <input
+        ref={replaceInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        aria-hidden
+        tabIndex={-1}
+        onChange={(e) => void handleReplaceFile(e)}
+      />
+
+      {/* 富媒体详情：放大/缩小/下载保存/复制引用/定位引用 */}
+      <MediaDetailDialog
+        mediaRef={mediaDetail}
+        contextLabel={mediaDetailCtx}
+        onOpenChange={(o) => {
+          if (!o) {
+            setMediaDetail(null)
+            setMediaDetailLocate(null)
+          }
+        }}
+        onLocate={(ref) => {
+          if (mediaDetailLocate) {
+            setMediaDetail(null)
+            locateMedia(mediaDetailLocate.index, mediaDetailLocate.field, ref)
+          }
+        }}
+      />
+
+      {/* 富媒体可视化编辑：表格网格 / 公式 KaTeX / 思维导图树 ⇄ 源码双模式 */}
+      <MediaEditDialog
+        mediaRef={mediaEditRef}
+        onOpenChange={(o) => {
+          if (!o) setMediaEditRef(null)
+        }}
+        onApply={handleMediaApply}
+      />
+
+      {/* AI 自动标记（编辑器内） */}
+      <AiMarkDialog
+        open={aiMarkOpen}
+        onOpenChange={setAiMarkOpen}
+        context="editor"
+        loading={aiMarking}
+        onConfirm={(o) => void runAiMark(o)}
+        onSkip={() => setAiMarkOpen(false)}
       />
       {/* 插入图片链接弹窗（询问是否保存图片到服务器） */}
       <Dialog open={imgUrlOpen} onOpenChange={(v) => { setImgUrlOpen(v); if (!v) setImgUrlValue('') }}>

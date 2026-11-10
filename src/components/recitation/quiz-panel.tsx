@@ -45,6 +45,26 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 
+// ---------- AI 输出富媒体统一渲染 ----------
+// RichContent 懒加载（模块级定义一次，参照 cloze-text.tsx 的写法）：
+// markdown / LaTeX / mermaid / 表格 / SVG / HTML / 代码块统一渲染，纯文本同样兼容；
+// 懒加载避免给纯文字作答场景增加首屏体积。
+const RichContentLazy = React.lazy(
+  () => import('@/components/recitation/rich-content').then((m) => ({ default: m.RichContent })),
+)
+
+/** AI 生成文本统一富媒体渲染入口（Suspense 兜底 + RichContentLazy）。 */
+function RichAI({ content, className }: { content: string; className?: string }) {
+  if (!content) return null
+  return (
+    <React.Suspense
+      fallback={<div className="py-2 text-center text-xs text-muted-foreground">渲染中…</div>}
+    >
+      <RichContentLazy content={content} className={className} />
+    </React.Suspense>
+  )
+}
+
 // ---------- 扩展题型：两步出题新增 多选(multi) / 判断(judge) ----------
 export type QuizTypeX = QuizQuestion['type'] | 'multi' | 'judge'
 
@@ -550,6 +570,8 @@ export function QuizPanel({
   // 改判覆盖（手动或 AI 改题后翻转判定，覆盖规则匹配结果）
   const [override, setOverride] = React.useState<Record<number, boolean>>({})
   const [aiJudging, setAiJudging] = React.useState<Set<number>>(new Set())
+  /** AI 改题（grade）返回的判定理由 — 题目卡片内富媒体展示（可含 LaTeX/表格）。 */
+  const [aiReasons, setAiReasons] = React.useState<Record<number, string>>({})
   /** 「我不会」标记的题号 — 立即按答错上报并强制计错。 */
   const [dontKnow, setDontKnow] = React.useState<Set<number>>(new Set())
   const [quizStart, setQuizStart] = React.useState<number>(Date.now())
@@ -625,6 +647,7 @@ export function QuizPanel({
       setReported(new Set())
       setDontKnow(new Set())
       setOverride({})
+      setAiReasons({})
       setAiJudging(new Set())
       setQuizStart(Date.now())
       setStep('answering')
@@ -836,6 +859,7 @@ export function QuizPanel({
     setSelfJudge({})
     setReported(new Set())
     setDontKnow(new Set())
+    setAiReasons({})
     setQuizStart(Date.now())
     setStep('answering')
     toast.success('已恢复上次作答')
@@ -905,6 +929,7 @@ export function QuizPanel({
       setSelfJudge({})
       setReported(new Set())
       setDontKnow(new Set())
+      setAiReasons({})
       setQuizStart(Date.now())
       clearDraftStorage()
       setStep('answering')
@@ -983,6 +1008,8 @@ export function QuizPanel({
   // ---- 改判：规则批改过严时手动翻转对/错（覆盖原判定，静默重报） ----
   const manualOverride = (idx: number, right: boolean) => {
     setOverride((prev) => ({ ...prev, [idx]: right }))
+    // 手动改判后清掉旧 AI 理由，避免展示与当前判定矛盾的说明
+    setAiReasons((prev) => ({ ...prev, [idx]: '' }))
     if (!reported.has(idx)) {
       setReported((prev) => new Set(prev).add(idx))
     }
@@ -1016,6 +1043,8 @@ export function QuizPanel({
       }
       const data = (await res.json()) as { right: boolean; reason: string }
       setOverride((prev) => ({ ...prev, [idx]: data.right }))
+      // AI 判定理由落状态 → 答案卡片内富媒体展示
+      setAiReasons((prev) => ({ ...prev, [idx]: data.reason || '' }))
       if (!reported.has(idx)) {
         setReported((prev) => new Set(prev).add(idx))
       }
@@ -1111,6 +1140,7 @@ export function QuizPanel({
     setReported(new Set())
     setDontKnow(new Set())
     setOverride({})
+    setAiReasons({})
     setAiJudging(new Set())
     setQuizStart(Date.now())
   }
@@ -1223,6 +1253,7 @@ export function QuizPanel({
         <IdleView
           canStart={!!content.trim() || pointImages.length > 0}
           onStart={() => setStep('points')}
+          onOpenPapers={() => setPapersOpen(true)}
           extra={
             !content.trim() ? (
               <PointImagesRow
@@ -1243,25 +1274,37 @@ export function QuizPanel({
             title="选择知识点"
             onBack={() => setStep('idle')}
             right={
-              points.length > 0 && !pointsLoading ? (
-                <div className="flex items-center gap-2 text-xs">
-                  <button
-                    type="button"
-                    onClick={toggleAllPoints}
-                    className="text-muted-foreground transition-colors hover:text-foreground"
-                  >
-                    {allSelected ? '取消全选' : '全选'}
-                  </button>
-                  <span className="text-muted-foreground/40">·</span>
-                  <button
-                    type="button"
-                    onClick={invertPoints}
-                    className="text-muted-foreground transition-colors hover:text-foreground"
-                  >
-                    反选
-                  </button>
-                </div>
-              ) : null
+              <div className="flex items-center gap-2 text-xs">
+                {/* 试卷夹入口：知识点步骤右上角直接可见 */}
+                <button
+                  type="button"
+                  aria-label="试卷夹"
+                  title="打开试卷夹"
+                  onClick={() => setPapersOpen(true)}
+                  className="rounded-full p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <FolderOpen className="size-4" />
+                </button>
+                {points.length > 0 && !pointsLoading ? (
+                  <>
+                    <button
+                      type="button"
+                      onClick={toggleAllPoints}
+                      className="text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      {allSelected ? '取消全选' : '全选'}
+                    </button>
+                    <span className="text-muted-foreground/40">·</span>
+                    <button
+                      type="button"
+                      onClick={invertPoints}
+                      className="text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      反选
+                    </button>
+                  </>
+                ) : null}
+              </div>
             }
           />
           <PointImagesRow
@@ -1608,6 +1651,12 @@ export function QuizPanel({
                     ? selfJudge[idx] === true
                     : gradeAnswer(q, userAnswer) === true
               const multiCorrect = isMulti ? parseMultiCorrect(q) : null
+              // 展示用参考答案（判断归一 / 多选拼接）— 供 RichAI 富媒体渲染
+              const answerText = isJudge
+                ? normJudge(q.answer)
+                : isMulti
+                  ? (multiCorrect ?? []).join('、')
+                  : q.answer
 
               return (
                 <li key={idx}>
@@ -1617,9 +1666,11 @@ export function QuizPanel({
                         <span className="shrink-0 pt-0.5 text-xs font-semibold text-muted-foreground">
                           {idx + 1}.
                         </span>
-                        <p className="min-w-0 flex-1 break-words text-sm leading-relaxed">
-                          {renderQuestionText(q.question)}
-                        </p>
+                        {/* 题干富媒体渲染（LaTeX/表格/加粗等；____ 填空位转虚线空位） */}
+                        <RichAI
+                          content={renderQuestionRich(q.question)}
+                          className="min-w-0 flex-1"
+                        />
                       </div>
                       <Badge variant="secondary" className={cn('shrink-0', badgeTone(q.type))}>
                         {TYPE_LABEL[q.type]}
@@ -1816,14 +1867,12 @@ export function QuizPanel({
                       <div className="min-w-0 overflow-hidden break-words rounded-md border bg-muted/30 px-3 py-2 text-sm">
                         <p className="break-words">
                           <span className="text-muted-foreground">参考答案：</span>
-                          <span className="break-words font-medium text-emerald-700 dark:text-emerald-300">
-                            {isJudge
-                              ? normJudge(q.answer)
-                              : isMulti
-                                ? parseMultiCorrect(q).join('、')
-                                : q.answer}
-                          </span>
                         </p>
+                        {/* 参考答案富媒体渲染（AI 答案可含 LaTeX/表格/加粗等） */}
+                        <RichAI
+                          content={answerText}
+                          className="break-words font-medium text-emerald-700 dark:text-emerald-300"
+                        />
                         {isMulti && (
                           <p className="mt-1 break-words text-xs text-muted-foreground">
                             你的选择：
@@ -1835,6 +1884,15 @@ export function QuizPanel({
                             简答题请对照参考答案，自评对错
                           </p>
                         )}
+                        {/* AI 改题（grade）判定理由 — 富媒体展示（可含 LaTeX 公式/表格） */}
+                        {aiReasons[idx] ? (
+                          <div className="mt-2 min-w-0 rounded-md border border-emerald-300/60 bg-emerald-500/5 px-2.5 py-2 dark:border-emerald-800/60">
+                            <p className="mb-1 flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+                              <Sparkles className="size-3" /> AI 改题理由
+                            </p>
+                            <RichAI content={aiReasons[idx]} className="text-xs" />
+                          </div>
+                        ) : null}
                       </div>
                     )}
 
@@ -2217,7 +2275,8 @@ function PointCard({
           <Check className="size-3" strokeWidth={3} />
         </button>
         <div className="min-w-0 flex-1 cursor-pointer select-none" onClick={onToggle}>
-          <p className="text-sm leading-relaxed">{point.text}</p>
+          {/* AI 提炼的知识点同样走富媒体渲染（纯文本兼容） */}
+          <RichAI content={point.text} />
           <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
             <span className="rounded-md bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
               {point.source === 'ai' ? 'AI生成' : '手动添加'}
@@ -2366,10 +2425,13 @@ function ErrorView({
 function IdleView({
   canStart,
   onStart,
+  onOpenPapers,
   extra,
 }: {
   canStart: boolean
   onStart: () => void
+  /** 打开试卷夹（AI 出题主界面显眼的次级入口） */
+  onOpenPapers?: () => void
   /** 附加内容（如图片出题上传行） */
   extra?: React.ReactNode
 }) {
@@ -2391,6 +2453,17 @@ function IdleView({
       >
         <Sparkles className="size-4" /> 开始出题
       </Button>
+      {/* 试卷夹入口：主按钮正下方的显眼次级按钮（历史试卷搜索/排序/批量管理/重练） */}
+      {onOpenPapers && (
+        <Button
+          type="button"
+          variant="outline"
+          onClick={onOpenPapers}
+          className="h-11 w-full max-w-[17rem] rounded-2xl border-border bg-card text-sm font-medium shadow-sm"
+        >
+          <FolderOpen className="size-4" /> 试卷夹 · 历史试卷
+        </Button>
+      )}
       {!canStart && <p className="text-xs text-destructive">当前背书卡内容为空，无法出题</p>}
       {extra}
     </div>
@@ -2500,21 +2573,13 @@ function badgeTone(t: QuizTypeX): string {
   }
 }
 
-function renderQuestionText(text: string): React.ReactNode {
-  // Highlight ____ fill placeholders
-  if (!text) return null
-  const parts = text.split(/_{2,}/)
-  if (parts.length === 1) return text
-  return (
-    <>
-      {parts.map((p, i) => (
-        <React.Fragment key={i}>
-          {p}
-          {i < parts.length - 1 && (
-            <span className="mx-1 inline-block min-w-[3rem] border-b-2 border-dashed border-foreground/40 align-baseline" />
-          )}
-        </React.Fragment>
-      ))}
-    </>
+/** 题干传入 RichContent 前的预处理：
+ *  ____ 填空占位 → 内联 HTML 虚线空位（RichContent 内 rehypeRaw 会原样渲染），
+ *  其余内容（LaTeX/表格/加粗等）交给 RichContent 富媒体渲染。 */
+function renderQuestionRich(text: string): string {
+  if (!text) return ''
+  return text.replace(
+    /_{2,}/g,
+    '<span class="mx-1 inline-block min-w-[3rem] border-b-2 border-dashed border-foreground/40 align-baseline"></span>',
   )
 }
