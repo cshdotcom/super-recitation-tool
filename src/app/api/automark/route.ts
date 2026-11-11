@@ -56,10 +56,10 @@ function syntaxSpec(o: MarkOptions): string {
   }
   if (o.highlight) {
     lines.push(
-      '- 荧光重点：==重点句== — 句子级重点（论点句/主旨句/定义），全文 5-12 处。',
-      '- 下划线：%%u|重点词%% — 词级关键点，全文 8-20 处。',
-      '- 红色强调：%%#dc2626|极重要词%% — 全文最多 3 处，仅用于最核心概念。',
-      '- 加粗：**术语** — 学科术语/关键人物，少量使用。',
+      '- 荧光重点：==重点句== — 句子级重点（论点句/主旨句/定义），全文 5-12 处。示例：==国破山河在==。',
+      '- 下划线：%%u|重点词%% — 词级关键点，全文 8-20 处。示例：%%u|烽火连三月%%。',
+      '- 红色强调：%%#dc2626|极重要词%% — 全文最多 3 处，仅用于最核心概念。示例：%%#dc2626|春望%%。',
+      '- 加粗：**术语** — 学科术语/关键人物，少量使用。示例：**杜甫**。',
     )
   }
   if (o.media) {
@@ -73,14 +73,87 @@ function syntaxSpec(o: MarkOptions): string {
   return lines.length > 0 ? lines.join('\n') : '-（本次无需任何标记，原样返回）'
 }
 
+/** 标记配对语法硬规则与正反例（防止 AI 产出错乱嵌套如 `*#7c3aed|词%%*%%`） */
+const SYNTAX_HARD_RULES = `
+标记配对硬规则（违反会导致渲染错乱，必须严格遵守）：
+1. 每个标记的起止符必须成对出现，不允许半个。
+   - 正确：**术语** / ==重点== / %%u|词%% / %%#dc2626|词%% / {{词}}
+   - 错误：*术语* （单个*）/ ==重点 （缺结束）/ %%u|词 （缺%%结束）/ %%#7c3aed|词%%*%% （多余%%）
+2. %% 指令的标准格式严格为：%%<样式键>|<原文>%% 。样式键只能是：u、#十六进制色、fs:数字、或它们的组合（如 #dc2626,fs:18）。样式键里绝不能出现 * = { } 等标记字符。
+   - 正确：%%u|烽火连三月%% / %%#dc2626|春望%% / %%fs:18|标题%%
+   - 错误：%%*#7c3aed|词%%*%% （样式键里有*）/ %%#7c3aed词%% （缺|）/ %%|词%% （缺样式键）
+3. 嵌套规则（只允许以下几种，其他一律不嵌套）：
+   - 允许：%%u|**词**%% （下划线包裹加粗）、%%#dc2626|**词**%% （红色包裹加粗）、%%u|==词==%% 、%%#hex|==词==%%
+   - 允许：==**词**== 、 **==词==**
+   - 禁止：**%%u|词%%** （加粗包裹指令——会错乱）、 %%u|%%fs:18|词%%%%%% （指令套指令）、 {{**词**}} （挖空套加粗）、 {{==词==}}
+4. 不同标记默认不叠加；同一处只用一种标记，除非用上方明确允许的嵌套组合。
+5. 富媒体块（代码围栏/表格/公式）独立成段（前后各留一个空行），不插在句子中间。
+6. 原文逐字保留：标记只包裹原文子串，绝不改写、增删、调换、翻译、纠正原文任何字符；输入若为无意义的测试文本（如 "test123456"）则原样返回不加任何标记。
+`
+
+/**
+ * 服务端标记清洗器：检测并修复/剥离 AI 产出的错乱标记。
+ * 处理：孤立的 %%（不成对）、%%指令格式错误（缺|/样式键含非法字符）、
+ * 禁止的嵌套（**%%...%%** 加粗包裹指令）、未闭合的 ** == {{ }}。
+ * 策略：能修复的修复（剥多余符号），不能修复的剥离标记符保留原文文字。
+ */
+function sanitizeMarks(text: string): string {
+  if (!text) return text
+  let s = text
+  // 1) 剥离禁止的嵌套：**%%...%%** → %%...%%（加粗包裹指令）；同理 ==%%...%%== / *%%...%%*
+  s = s.replace(/\*\*(%%[^%\n]*?\|[^%]*?%%)\*\*/g, '$1')
+  s = s.replace(/==(%%[^%\n]*?\|[^%]*?%%)==/g, '$1')
+  // 2) 校验每个 %%...%% 指令：合法格式 = %%<keys>|<text>%%，keys 不含 * = { } % | 且非空，text 不含 %
+  //    非法的整段 %%...%% 配对 → 剥掉 %% 与 | 留文字；孤立 %% → 删除
+  //    先处理成对的 %%...%%（贪婪匹配最短配对，text 内不含 %）
+  s = s.replace(/%%([^%\n]*?)\|([^%]*?)%%/g, (whole, keys: string, inner: string) => {
+    // keys 合法性：仅允许 u / #hex / fs:N / 以及逗号分号组合
+    const k = String(keys).trim()
+    const validKeys = /^[u#]?$|^#[0-9a-fA-F]{3,8}$|^fs:\d+$|^u[,;]?$|^#[0-9a-fA-F]{3,8}[,;](fs:\d+|u)?$|^(fs:\d+|u)([,;]#[0-9a-fA-F]{3,8}|[,;]u)?$|^#[0-9a-fA-F]{3,8},fs:\d+$/.test(k) || /^(u|#[0-9a-fA-F]{3,8}|fs:\d+)([,;](u|#[0-9a-fA-F]{3,8}|fs:\d+))*$/.test(k)
+    if (!validKeys || !inner) return inner // 剥标记留文字
+    return `%%${k}|${inner}%%`
+  })
+  // 3) 剩余的孤立 %%（未配对）→ 删除（避免渲染时把后续文字整段吞掉）
+  //    先统计：若 %% 出现次数为奇数，删最后一个
+  const count = (s.match(/%%/g) || []).length
+  if (count % 2 !== 0) {
+    const idx = s.lastIndexOf('%%')
+    s = s.slice(0, idx) + s.slice(idx + 2)
+  }
+  // 4) 修未闭合的 ** ：奇数个 ** → 删最后一个（防整段加粗）
+  const starCount = (s.match(/\*\*/g) || []).length
+  if (starCount % 2 !== 0) {
+    const idx = s.lastIndexOf('**')
+    s = s.slice(0, idx) + s.slice(idx + 2)
+  }
+  // 5) 修未闭合的 == ：奇数个 → 删最后一个
+  const eqCount = (s.match(/==/g) || []).length
+  if (eqCount % 2 !== 0) {
+    const idx = s.lastIndexOf('==')
+    s = s.slice(0, idx) + s.slice(idx + 2)
+  }
+  // 6) 修未闭合的 {{ }}：分别计数，奇数个删最后
+  const lbCount = (s.match(/{{/g) || []).length
+  const rbCount = (s.match(/}}/g) || []).length
+  if (lbCount > rbCount) {
+    const idx = s.lastIndexOf('{{')
+    s = s.slice(0, idx) + s.slice(idx + 2)
+  } else if (rbCount > lbCount) {
+    const idx = s.lastIndexOf('}}')
+    s = s.slice(0, idx) + s.slice(idx + 2)
+  }
+  return s
+}
+
 function buildSystemPrompt(o: MarkOptions, mode: 'content' | 'blocks'): string {
   const base =
     '你是「背书吧」App 的编辑器自动标记引擎。用户给你课文/背诵材料，你用编辑器标记语法输出标记后的文本。' +
     '最高规则：原文必须逐字保留（标记只是原样包裹原文子串），绝不改写、增删、调换原文文字；标记符号本身要配对完整。\n\n' +
     '可用标记语法：\n' +
     syntaxSpec(o) +
-    '\n\n通用规则：\n' +
-    '- 不同标记不要嵌套（{{==x==}} 不允许）；同一处只用一种标记。\n' +
+    SYNTAX_HARD_RULES +
+    '\n通用规则：\n' +
+    '- 不同标记默认不嵌套；同一处只用一种标记，除非使用硬规则中明确允许的嵌套组合。\n' +
     '- 富媒体块独立成段（前后各留一个空行），不插在句子中间。\n'
   if (mode === 'content') {
     return (
@@ -203,10 +276,13 @@ export async function POST(req: NextRequest) {
     const mindmapMd = mindmap ? `\n\n\`\`\`mermaid\n${mindmap}\n\`\`\`` : ''
 
     if (mode === 'blocks') {
-      let marked = sanitizeBlocks(parsed?.blocks)
+      let marked = sanitizeBlocks(parsed?.blocks).map((b) => ({
+        front: b.front,
+        back: sanitizeMarks(b.back),
+      }))
       if (marked.length === 0 && parseFailed && /\{\{|==|%%|\*\*/.test(rawText)) {
         // 兜底：AI 直接输出了标记后的整段文本 → 整体作为一块
-        marked = [{ front: '', back: rawText.trim().slice(0, MAX_CHARS) }]
+        marked = [{ front: '', back: sanitizeMarks(rawText.trim().slice(0, MAX_CHARS)) }]
       }
       if (marked.length === 0) {
         return NextResponse.json(
@@ -224,11 +300,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ blocks: marked })
     }
 
-    let markedContent = typeof parsed?.content === 'string' ? parsed.content : ''
-    let markedBlocks = sanitizeBlocks(parsed?.blocks)
+    let markedContent = typeof parsed?.content === 'string' ? sanitizeMarks(parsed.content) : ''
+    let markedBlocks = sanitizeBlocks(parsed?.blocks).map((b) => ({
+      front: b.front,
+      back: sanitizeMarks(b.back),
+    }))
     if (!markedContent.trim() && parseFailed && /\{\{|==|%%|\*\*/.test(rawText)) {
       // 兜底：原文即标记结果
-      markedContent = rawText.trim().slice(0, MAX_CHARS)
+      markedContent = sanitizeMarks(rawText.trim().slice(0, MAX_CHARS))
       markedBlocks = [{ front: '', back: markedContent }]
     }
     if (!markedContent.trim()) {

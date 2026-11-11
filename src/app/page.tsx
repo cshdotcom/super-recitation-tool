@@ -474,8 +474,12 @@ export default function Page() {
   const importMarkAskedRef = React.useRef(false)
 
   const aiMarkDefaults = React.useMemo(
-    () => ({ cloze: settings?.aiAutoCloze ?? true, highlight: true, media: true }),
-    [settings?.aiAutoCloze],
+    () => ({
+      cloze: settings?.aiAutoCloze ?? true,
+      highlight: settings?.aiAutoHighlight ?? true,
+      media: settings?.aiAutoMedia ?? true,
+    }),
+    [settings?.aiAutoCloze, settings?.aiAutoHighlight, settings?.aiAutoMedia],
   )
 
   /** 导入路径确认：先（可选）AI 智能排版，再 AI 标记，带标记内容+分块进入编辑器 */

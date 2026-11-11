@@ -149,6 +149,14 @@ export async function PATCH(req: NextRequest) {
     if (typeof body?.aiAutoCloze === 'boolean') {
       data.aiAutoCloze = body.aiAutoCloze
     }
+    // 导入时 AI 重点标注
+    if (typeof body?.aiAutoHighlight === 'boolean') {
+      data.aiAutoHighlight = body.aiAutoHighlight
+    }
+    // 导入时 AI 智能图表
+    if (typeof body?.aiAutoMedia === 'boolean') {
+      data.aiAutoMedia = body.aiAutoMedia
+    }
     // 导入时 AI 智能排版
     if (typeof body?.aiAutoFormat === 'boolean') {
       data.aiAutoFormat = body.aiAutoFormat

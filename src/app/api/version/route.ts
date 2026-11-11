@@ -10,7 +10,7 @@ export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 /** 应用版本（发版时更新，与 git tag 一致） */
-const APP_VERSION = 'v2.6.0'
+const APP_VERSION = 'v2.7.0'
 
 export async function GET() {
   let buildId: string | null = null

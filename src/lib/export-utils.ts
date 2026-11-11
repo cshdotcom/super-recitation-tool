@@ -11,6 +11,13 @@
 //   - 打印/PDF：浏览器原生打印（用户选「另存为 PDF」），中文由系统字体渲染，
 //           不引入 jsPDF 内嵌 CJK 字体方案，天然零乱码
 //   - Markdown / JSON：标准 UTF-8
+//
+// 导出选项（CardExportOpts，默认全开）：
+//   includeMedia=false 时，图片 ![](url) → ［图片］占位、[[audio|video:..]] → ［音频/视频］
+//   includeMarks=false 时，剥掉 加粗 / 高亮 / 挖空 / 样式指令 等富文本标记只留纯文字
+//   两选项互相独立，组合后先剥标记、再去媒体占位。
+
+import { stripRecitationMarks } from './inline-style'
 
 /** 记忆素材问答块（与 MaterialBlock 兼容） */
 export interface ExportBlock {
@@ -37,6 +44,92 @@ export interface ExportCard {
 export interface BuildHtmlOptions {
   /** 写入 iframe 后自动调起浏览器打印窗口（打印·导出 PDF 用） */
   autoPrint?: boolean
+  /** 是否包含富媒体（图片 ![](url) / [[audio|video:..]]）；默认 true */
+  includeMedia?: boolean
+  /** 是否包含富文本标记（加粗/高亮/挖空/样式指令 等）；默认 true */
+  includeMarks?: boolean
+}
+
+/** 卡片导出选项（TXT/MD/HTML/PDF/PNG 共用；JSON 备份不受影响，原样输出） */
+export interface CardExportOpts {
+  /** 是否包含富媒体（图片 / 音频 / 视频引用）；默认 true */
+  includeMedia?: boolean
+  /** 是否包含富文本标记（加粗、高亮、挖空、样式指令 等）；默认 true */
+  includeMarks?: boolean
+}
+
+/** PNG 导出额外可选项（与 CardExportOpts 合并使用） */
+export interface CardPngOptions {
+  /** 卡片渲染宽度（px，默认 720） */
+  width?: number
+  /** 像素倍率（默认 2，即 2x 高清图） */
+  pixelRatio?: number
+  /** 底色（默认纯白 #ffffff） */
+  background?: string
+  /** 是否包含富媒体（图片 / 音频 / 视频引用）；默认 true */
+  includeMedia?: boolean
+  /** 是否包含富文本标记；默认 true */
+  includeMarks?: boolean
+}
+
+// ---------------------------------------------------------------------------
+// 富文本 / 富媒体 剥层纯函数（共享：export-utils + conversation-export 复用）
+// ---------------------------------------------------------------------------
+
+/**
+ * 剥掉富文本标记，只留纯文字。
+ *   • 剥：**bold** / *italic* / ~~strike~~ / ==highlight==
+ *   • 剥：%%u|x%% / %%#hex|x%% / %%fs:N|x%% / %%color:x;fs:N|x%% 等样式指令
+ *   • 剥：{{cloze}} 挖空定界符（保留内部文字）
+ *   • 剥：`code` 行内代码定界符（保留 code 文本）
+ *   • 保留：$tex$ / $$tex$$ 数学公式（task 未列入剥离范围）
+ *   • 保留：![alt](src) 图片 / [[audio|video:..]] 引用（媒体由 includeMedia 单独控制）
+ *   • 保留：标题 # / 列表 - / 引用 > / 围栏 ``` 等块级 markdown（结构由各格式自行渲染）
+ *
+ * 实现：复用 inline-style 的 stripRecitationMarks 剥 %% / == / {{}}（嵌套安全），
+ * 再迭代剥 ** / * / ~~ / ` 等剩余 markdown 强调定界符（最多 5 趟收敛嵌套）。
+ */
+export function stripRichMarks(text: string): string {
+  let s = stripRecitationMarks(String(text ?? ''))
+  for (let iter = 0; iter < 5; iter++) {
+    const before = s
+    s = s
+      .replace(/\*\*\*([^*\n]+)\*\*\*/g, '$1')
+      .replace(/\*\*([^*\n]+)\*\*/g, '$1')
+      .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1$2')
+      .replace(/~~([^~\n]+)~~/g, '$1')
+      .replace(/`([^`\n]+)`/g, '$1')
+    if (s === before) break
+  }
+  return s
+}
+
+/**
+ * 把富媒体引用替换为全角文字占位（不下载不内嵌）：
+ *   • ![alt](url) → ［图片：alt］（无 alt 时 ［图片］）
+ *   • [[audio:id|title]] → ［音频：title］（无标题时 ［音频］）
+ *   • [[video:id|title]] → ［视频：title］（无标题时 ［视频］）
+ * 与 imageToTextPlaceholder 等价并复用 mediaRefsToText，导出供对话导出复用。
+ */
+export function stripMediaToPlaceholder(text: string): string {
+  return mediaRefsToText(
+    String(text ?? '').replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m: string, alt: string) =>
+      alt.trim() ? `［图片：${alt.trim()}］` : '［图片］',
+    ),
+  )
+}
+
+/**
+ * 按 CardExportOpts 处理一段文本：
+ *   includeMarks=false → 先剥富文本标记
+ *   includeMedia=false → 再替换富媒体为占位
+ * 顺序固定为「先标记、后媒体」，保证嵌套（如 **%%u|![](x)%%**）也能正确处理。
+ */
+export function applyCardExportOpts(text: string, opts: CardExportOpts = {}): string {
+  let s = String(text ?? '')
+  if (opts.includeMarks === false) s = stripRichMarks(s)
+  if (opts.includeMedia === false) s = stripMediaToPlaceholder(s)
+  return s
 }
 
 // ---------------------------------------------------------------------------
@@ -95,13 +188,10 @@ function fmtDate(d?: string | null): string {
   return `${date.getFullYear()} 年 ${date.getMonth() + 1} 月 ${date.getDate()} 日`
 }
 
-/** 纯文本导出时，图片 markdown 语法换成全角占位符（dataURL 太长会污染文本）。 */
+/** 纯文本导出时，图片 markdown 语法换成全角占位符（dataURL 太长会污染文本）。
+ *  等价于 stripMediaToPlaceholder，保留旧名供既有调用点继续使用。 */
 function imageToTextPlaceholder(src: string): string {
-  return mediaRefsToText(
-    src.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m: string, alt: string) =>
-      alt.trim() ? `［图片：${alt.trim()}］` : '［图片］',
-    ),
-  )
+  return stripMediaToPlaceholder(src)
 }
 
 /** 音视频引用标记 → 全角占位（纯文本导出/朗读友好）：[[audio:uuid|标题]] → ［音频：标题］（无标题时 ［音频］）。 */
@@ -308,14 +398,24 @@ export function renderMarkdown(src: string): string {
 // TXT 导出
 // ---------------------------------------------------------------------------
 
-/** 导出 TXT（UTF-8 + BOM，Windows 记事本零乱码）。返回所用文件名。 */
-export function exportCardTxt(card: ExportCard): string {
+/** 导出 TXT（UTF-8 + BOM，Windows 记事本零乱码）。
+ *  opts.includeMedia=false → 图片/音视频引用转全角占位（默认行为：TXT 总是转占位，避免 dataURL 污染文本）
+ *  opts.includeMarks=false → 剥富文本标记，只留纯文字
+ *  返回所用文件名。 */
+export function exportCardTxt(card: ExportCard, opts: CardExportOpts = {}): string {
   const title = (card.title ?? '').trim() || '未命名背诵'
-  const content = (card.content ?? '').trim()
-  const blocks = normalizeBlocks(card).filter((b) => b.front.trim() || b.back.trim())
+  const content = applyCardExportOpts((card.content ?? '').trim(), opts)
+  const blocks = normalizeBlocks(card)
+    .filter((b) => b.front.trim() || b.back.trim())
+    .map((b) => ({
+      ...b,
+      front: applyCardExportOpts(b.front.trim(), opts),
+      back: applyCardExportOpts(b.back.trim(), opts),
+    }))
 
   const lines: string[] = [title, '='.repeat(24), '']
   if (content) {
+    // TXT 总是把图片 markdown 转占位（dataURL 太长会污染文本），与 opts.includeMedia 无关
     lines.push(imageToTextPlaceholder(content), '')
   }
   if (blocks.length) {
@@ -338,11 +438,19 @@ export function exportCardTxt(card: ExportCard): string {
 // Markdown 导出
 // ---------------------------------------------------------------------------
 
-/** 导出 Markdown（与超级编辑器导出格式对齐且为其超集：含标题/正文/记忆素材/页脚）。 */
-export function exportCardMarkdown(card: ExportCard): string {
+/** 导出 Markdown（与超级编辑器导出格式对齐且为其超集：含标题/正文/记忆素材/页脚）。
+ *  opts.includeMedia=false → 图片/音视频引用转 ［图片］/［音频］/［视频］ 占位
+ *  opts.includeMarks=false → 剥富文本标记，只留纯文字（** 加粗 ** → 加粗） */
+export function exportCardMarkdown(card: ExportCard, opts: CardExportOpts = {}): string {
   const title = (card.title ?? '').trim() || '未命名背诵'
-  const content = (card.content ?? '').trim()
-  const blocks = normalizeBlocks(card).filter((b) => b.front.trim() || b.back.trim())
+  const content = applyCardExportOpts((card.content ?? '').trim(), opts)
+  const blocks = normalizeBlocks(card)
+    .filter((b) => b.front.trim() || b.back.trim())
+    .map((b) => ({
+      ...b,
+      front: applyCardExportOpts(b.front.trim(), opts),
+      back: applyCardExportOpts(b.back.trim(), opts),
+    }))
 
   const out: string[] = [`# ${title}`, '']
   if (content) out.push(content, '')
@@ -350,7 +458,9 @@ export function exportCardMarkdown(card: ExportCard): string {
     out.push('---', '', `## 记忆素材（${blocks.length} 条）`, '')
     blocks.forEach((b, idx) => {
       if (idx > 0) out.push('---', '')
-      if (b.front.trim()) out.push(`**${b.front.trim()}**`, '')
+      // includeMarks=false 时已剥掉 **，这里再包一层会重复；用前置判断避免重复包装
+      const frontLine = opts.includeMarks === false ? b.front.trim() : `**${b.front.trim()}**`
+      if (b.front.trim()) out.push(frontLine, '')
       if (b.back.trim()) out.push(b.back.trim(), '')
     })
     out.push('')
@@ -430,11 +540,24 @@ footer.doc-footer { margin-top: 56px; padding-top: 18px; border-top: 1px solid #
  * 构建完整独立 HTML 文档字符串（<!DOCTYPE html> + charset + viewport + 内嵌样式）。
  * 正文 Markdown 渲染（图片/代码块/表格/引用/列表），blocks 渲染为问答卡片，
  * 所有文本均正确转义 HTML 实体；含 no-print 打印按钮与 @media print 打印规则。
+ *
+ * opts.includeMedia=false → 图片/音视频引用转 ［图片］/［音频］/［视频］ 占位
+ * opts.includeMarks=false → 剥富文本标记，只留纯文字
  */
 export function buildCardHtml(card: ExportCard, opts: BuildHtmlOptions = {}): string {
   const title = (card.title ?? '').trim() || '未命名背诵'
-  const content = (card.content ?? '').trim()
-  const blocks = normalizeBlocks(card).filter((b) => b.front.trim() || b.back.trim())
+  const cardOpts: CardExportOpts = {
+    includeMedia: opts.includeMedia,
+    includeMarks: opts.includeMarks,
+  }
+  const content = applyCardExportOpts((card.content ?? '').trim(), cardOpts)
+  const blocks = normalizeBlocks(card)
+    .filter((b) => b.front.trim() || b.back.trim())
+    .map((b) => ({
+      ...b,
+      front: applyCardExportOpts(b.front.trim(), cardOpts),
+      back: applyCardExportOpts(b.back.trim(), cardOpts),
+    }))
   const charCount = (content + blocks.map((b) => `${b.front}${b.back}`).join('')).replace(/\s/g, '')
     .length
 
@@ -477,12 +600,13 @@ export function buildCardHtml(card: ExportCard, opts: BuildHtmlOptions = {}): st
 </html>`
 }
 
-/** 导出 HTML（下载 .html 完整独立文档）。返回所用文件名。 */
-export function exportCardHtml(card: ExportCard): string {
+/** 导出 HTML（下载 .html 完整独立文档）。
+ *  opts 同 buildCardHtml；返回所用文件名。 */
+export function exportCardHtml(card: ExportCard, opts: CardExportOpts = {}): string {
   const filename = `${safeFilename(card.title)}.html`
   downloadBlob(
     filename,
-    new Blob([buildCardHtml(card)], { type: 'text/html;charset=utf-8' }),
+    new Blob([buildCardHtml(card, opts)], { type: 'text/html;charset=utf-8' }),
   )
   return filename
 }
@@ -527,10 +651,11 @@ export function printHtmlDocument(html: string): void {
   setTimeout(cleanup, 10 * 60 * 1000)
 }
 
-/** 打印 / 导出 PDF（背诵卡）：buildCardHtml → 隐藏 iframe 打印链路。 */
-export function printCard(card: ExportCard): void {
+/** 打印 / 导出 PDF（背诵卡）：buildCardHtml → 隐藏 iframe 打印链路。
+ *  opts.includeMedia/includeMarks 同 buildCardHtml。 */
+export function printCard(card: ExportCard, opts: CardExportOpts = {}): void {
   if (typeof document === 'undefined') return
-  printHtmlDocument(buildCardHtml(card, { autoPrint: true }))
+  printHtmlDocument(buildCardHtml(card, { autoPrint: true, ...opts }))
 }
 
 // ---------------------------------------------------------------------------
@@ -564,16 +689,6 @@ export function exportCardJson(card: ExportCard): string {
 // ---------------------------------------------------------------------------
 // PNG 图片导出（html-to-image，离屏白底卡片）
 // ---------------------------------------------------------------------------
-
-/** exportCardPng 可选项 */
-export interface CardPngOptions {
-  /** 卡片渲染宽度（px，默认 720） */
-  width?: number
-  /** 像素倍率（默认 2，即 2x 高清图） */
-  pixelRatio?: number
-  /** 底色（默认纯白 #ffffff） */
-  background?: string
-}
 
 /** PNG 导出用卡片样式（选择器全部限定在 #bs-card-png 容器内，临时注入不污染页面）。 */
 const CARD_PNG_STYLES = `#bs-card-png { box-sizing: border-box; padding: 48px 40px 40px; color: #26262a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif; font-size: 17px; line-height: 1.9; -webkit-font-smoothing: antialiased; }
@@ -612,6 +727,7 @@ const CARD_PNG_STYLES = `#bs-card-png { box-sizing: border-box; padding: 48px 40
  *
  * @param card  卡片（ExportCard 宽松子集，blocks 兼容数组或 JSON 字符串）
  * @param opts  width 渲染宽度（默认 720）/ pixelRatio 倍率（默认 2）/ background 底色（默认白）
+ *              includeMedia=false / includeMarks=false 同其他卡片导出
  * @returns 实际下载的文件名（<安全化标题>.png）
  */
 export async function exportCardPng(card: ExportCard, opts: CardPngOptions = {}): Promise<string> {
@@ -621,9 +737,19 @@ export async function exportCardPng(card: ExportCard, opts: CardPngOptions = {})
   const pixelRatio = Math.max(1, opts.pixelRatio ?? 2)
   const background = opts.background ?? '#ffffff'
 
+  const cardOpts: CardExportOpts = {
+    includeMedia: opts.includeMedia,
+    includeMarks: opts.includeMarks,
+  }
   const title = (card.title ?? '').trim() || '未命名背诵'
-  const content = (card.content ?? '').trim()
-  const blocks = normalizeBlocks(card).filter((b) => b.front.trim() || b.back.trim())
+  const content = applyCardExportOpts((card.content ?? '').trim(), cardOpts)
+  const blocks = normalizeBlocks(card)
+    .filter((b) => b.front.trim() || b.back.trim())
+    .map((b) => ({
+      ...b,
+      front: applyCardExportOpts(b.front.trim(), cardOpts),
+      back: applyCardExportOpts(b.back.trim(), cardOpts),
+    }))
   const charCount = (content + blocks.map((b) => `${b.front}${b.back}`).join('')).replace(/\s/g, '')
     .length
 

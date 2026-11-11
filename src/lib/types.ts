@@ -274,6 +274,10 @@ export interface SettingsData {
   quizAutoRemove: 1 | 2 | 3 | 5
   /** 导入时是否开启 AI 自动挖空 */
   aiAutoCloze: boolean
+  /** 导入时是否开启 AI 重点标注（高亮/下划线/红强调/加粗） */
+  aiAutoHighlight: boolean
+  /** 导入时是否开启 AI 智能图表（思维导图/表格/公式） */
+  aiAutoMedia: boolean
   /** 导入时是否开启 AI 智能排版（整理混乱段落/标题/列表，原文逐字保留） */
   aiAutoFormat: boolean
   /** AI 出题完成后自动存入试卷夹（默认开） */

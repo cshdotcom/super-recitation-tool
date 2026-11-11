@@ -14,6 +14,7 @@ import {
   FileJson,
   FileOutput,
   FileText,
+  Image as ImageIcon,
   Printer,
   Timer,
   Sparkles,
@@ -25,8 +26,10 @@ import {
   exportCardHtml,
   exportCardJson,
   exportCardMarkdown,
+  exportCardPng,
   exportCardTxt,
   printCard,
+  type CardExportOpts,
 } from '@/lib/export-utils'
 import type { CardData, ClozeStyle, PageMode, SettingsData, ThemeName } from '@/lib/types'
 import { THEME_OPTIONS } from '@/lib/types'
@@ -36,6 +39,25 @@ import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import { getFocusState, startFocus } from '@/components/recitation/focus-bus'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
+
+// ---- 导出选项持久化（卡片导出独立 key，与对话/试卷导出互不干扰） ----
+const CARD_OPTS_KEY = 'bb-export-card-opts'
+const DEFAULT_CARD_OPTS: CardExportOpts = { includeMedia: true, includeMarks: true }
+
+function loadCardOpts(): CardExportOpts {
+  if (typeof window === 'undefined') return DEFAULT_CARD_OPTS
+  try {
+    const raw = window.localStorage.getItem(CARD_OPTS_KEY)
+    if (!raw) return DEFAULT_CARD_OPTS
+    const p = JSON.parse(raw) as Partial<CardExportOpts>
+    return {
+      includeMedia: typeof p.includeMedia === 'boolean' ? p.includeMedia : true,
+      includeMarks: typeof p.includeMarks === 'boolean' ? p.includeMarks : true,
+    }
+  } catch {
+    return DEFAULT_CARD_OPTS
+  }
+}
 
 export type ClozeTemplate = 'sentence-start' | 'numbers' | 'rule3'
 
@@ -271,27 +293,50 @@ export function MoreSheet({
     }
   }
 
-  // ---- 导出（与超级编辑器导出对齐且为其超集：TXT / MD / HTML / 打印PDF / JSON） ----
+  // ---- 导出（与超级编辑器导出对齐且为其超集：TXT / MD / HTML / 打印PDF / PNG / JSON） ----
+  // 卡片导出选项（includeMedia/includeMarks）：从 localStorage 读取，变更时写回
+  const [cardOpts, setCardOpts] = React.useState<CardExportOpts>(DEFAULT_CARD_OPTS)
+  React.useEffect(() => {
+    if (open) setCardOpts(loadCardOpts())
+  }, [open])
+  React.useEffect(() => {
+    if (!open) return
+    try {
+      window.localStorage.setItem(CARD_OPTS_KEY, JSON.stringify(cardOpts))
+    } catch {
+      /* 隐私模式忽略 */
+    }
+  }, [open, cardOpts])
 
   const handleExportTxt = () => {
-    toast.success(`已导出 ${exportCardTxt(card)}`)
+    toast.success(`已导出 ${exportCardTxt(card, cardOpts)}`)
   }
 
   const handleExportMarkdown = () => {
-    toast.success(`已导出 ${exportCardMarkdown(card)}`)
+    toast.success(`已导出 ${exportCardMarkdown(card, cardOpts)}`)
   }
 
   const handleExportHtml = () => {
-    toast.success(`已导出 ${exportCardHtml(card)}`)
+    toast.success(`已导出 ${exportCardHtml(card, cardOpts)}`)
   }
 
   const handlePrintPdf = () => {
-    printCard(card)
+    printCard(card, cardOpts)
     toast.info('已打开打印窗口，目标打印机选「另存为 PDF」即可导出 PDF')
   }
 
   const handleExportCardJson = () => {
     toast.success(`已导出 ${exportCardJson(card)}`)
+  }
+
+  const handleExportPng = async () => {
+    const tid = toast.loading('正在生成图片…')
+    try {
+      const name = await exportCardPng(card, cardOpts)
+      toast.success(`已导出 ${name}`, { id: tid })
+    } catch (err) {
+      toast.error('导出图片失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+    }
   }
 
   const handleExportJson = async () => {
@@ -620,6 +665,38 @@ export function MoreSheet({
         {/* ---------------- 导出（与超级编辑器导出功能对齐且超集） ---------------- */}
         {tab === 'export' && (
           <div className="space-y-4">
+            {/* 导出选项：富媒体 / 富文本标记 开关（影响 TXT/MD/HTML/PDF/PNG；JSON 备份原样输出） */}
+            <div className="rounded-2xl border border-border bg-card">
+              <div className="flex items-center justify-between gap-3 border-b border-border/60 px-4 py-3.5">
+                <div>
+                  <p className="text-sm font-bold">包含富媒体</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    图片 / 音频 / 视频（关闭后转文字占位）
+                  </p>
+                </div>
+                <Switch
+                  checked={cardOpts.includeMedia !== false}
+                  onCheckedChange={(v) => setCardOpts((prev) => ({ ...prev, includeMedia: v }))}
+                  aria-label="包含富媒体"
+                  className="data-[state=checked]:bg-emerald-600"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-3 px-4 py-3.5">
+                <div>
+                  <p className="text-sm font-bold">包含富文本标记</p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    加粗 / 高亮 / 挖空 / 下划线（关闭后只留纯文字）
+                  </p>
+                </div>
+                <Switch
+                  checked={cardOpts.includeMarks !== false}
+                  onCheckedChange={(v) => setCardOpts((prev) => ({ ...prev, includeMarks: v }))}
+                  aria-label="包含富文本标记"
+                  className="data-[state=checked]:bg-emerald-600"
+                />
+              </div>
+            </div>
+
             <p className="px-1 text-xs font-medium text-muted-foreground">当前背书卡</p>
             <div className="overflow-hidden rounded-2xl border border-border bg-card">
               <ExportRow
@@ -653,9 +730,15 @@ export function MoreSheet({
                 onClick={handlePrintPdf}
               />
               <ExportRow
+                icon={ImageIcon}
+                title="导出 PNG 图片"
+                subtitle="白底卡片长图 · 2x 高清 · 适合分享"
+                onClick={() => void handleExportPng()}
+              />
+              <ExportRow
                 icon={FileJson}
                 title="导出 JSON 备份"
-                subtitle="当前卡完整数据（含记忆素材）"
+                subtitle="当前卡完整数据（含记忆素材，原样输出不受选项影响）"
                 onClick={handleExportCardJson}
               />
             </div>

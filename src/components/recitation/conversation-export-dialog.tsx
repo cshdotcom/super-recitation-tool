@@ -3,9 +3,13 @@
 // ConversationExportDialog — 消息导出选项对话框（ChatTool 多选导出 / 侧边栏
 // 单条与批量导出 / 分享页多选导出 共用）。
 //   • 格式选择（图标网格）：Markdown / HTML / TXT / PDF / 图片 / 剪贴板 / JSON
-//   • 开关「包含图片」（图片以 dataURL 内嵌；关闭后仅记录张数）
+//   • 富媒体总开关：图片 / 音频 / 视频引用（关闭后 ![](url)/[[audio|video:..]] → 文字占位）
+//   • 富文本标记开关：**加粗** / ==高亮== / %%u|..%% / {{挖空}} 等（关闭后只留纯文字）
+//   • 元数据开关：导出时间 / 对话标题 / 消息计数（关闭后仅导消息正文）
+//   • 只导用户消息：过滤掉 AI 消息（用于导出 prompt 集等）
 //   • MD 格式时选择「源码形式 / HTML 形式」（富媒体块是否包成内联 HTML）
 //   • 勾选要导出的消息列表（默认全选）
+// 选项持久化到 localStorage（key=bb-export-conv-opts），下次打开沿用。
 import * as React from 'react'
 import {
   Braces,
@@ -53,9 +57,76 @@ const FORMAT_OPTIONS: {
   { value: 'json', label: 'JSON', icon: <Braces className="size-5" />, desc: '结构化数据' },
 ]
 
+const CONV_OPTS_KEY = 'bb-export-conv-opts'
+
+interface ConvExportOptsState {
+  format: ExportFormat
+  includeMedia: boolean
+  includeMarks: boolean
+  includeMeta: boolean
+  onlyUser: boolean
+  mdMode: 'source' | 'html'
+}
+
+const DEFAULT_OPTS: ConvExportOptsState = {
+  format: 'md',
+  includeMedia: true,
+  includeMarks: true,
+  includeMeta: true,
+  onlyUser: false,
+  mdMode: 'source',
+}
+
+function loadOpts(): ConvExportOptsState {
+  if (typeof window === 'undefined') return DEFAULT_OPTS
+  try {
+    const raw = window.localStorage.getItem(CONV_OPTS_KEY)
+    if (!raw) return DEFAULT_OPTS
+    const p = JSON.parse(raw) as Partial<ConvExportOptsState>
+    const format: ExportFormat =
+      p.format && (FORMAT_OPTIONS.some((o) => o.value === p.format))
+        ? (p.format as ExportFormat)
+        : DEFAULT_OPTS.format
+    return {
+      format,
+      includeMedia: typeof p.includeMedia === 'boolean' ? p.includeMedia : true,
+      includeMarks: typeof p.includeMarks === 'boolean' ? p.includeMarks : true,
+      includeMeta: typeof p.includeMeta === 'boolean' ? p.includeMeta : true,
+      onlyUser: typeof p.onlyUser === 'boolean' ? p.onlyUser : false,
+      mdMode: p.mdMode === 'html' ? 'html' : 'source',
+    }
+  } catch {
+    return DEFAULT_OPTS
+  }
+}
+
 function snippet(text: string): string {
   const t = text.replace(/\s+/g, ' ').trim()
   return t.length > 60 ? t.slice(0, 60) + '…' : t || '（无文字内容）'
+}
+
+function OptionRow({
+  label,
+  hint,
+  checked,
+  onChange,
+  id,
+}: {
+  label: string
+  hint?: string
+  checked: boolean
+  onChange: (v: boolean) => void
+  id: string
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-xl border border-border px-3 py-2.5">
+      <Label htmlFor={id} className="cursor-pointer text-sm font-normal">
+        {label}
+        {hint && <span className="ml-1 text-[11px] text-muted-foreground">{hint}</span>}
+      </Label>
+      <Switch id={id} checked={checked} onCheckedChange={onChange} />
+    </div>
+  )
 }
 
 export function ConversationExportDialog({
@@ -77,9 +148,7 @@ export function ConversationExportDialog({
   /** DialogContent 附加 className（如全屏对话层内抬高 z）。 */
   contentClassName?: string
 }) {
-  const [format, setFormat] = React.useState<ExportFormat>('md')
-  const [includeImages, setIncludeImages] = React.useState(true)
-  const [mdMode, setMdMode] = React.useState<'source' | 'html'>('source')
+  const [opts, setOpts] = React.useState<ConvExportOptsState>(DEFAULT_OPTS)
   const [checked, setChecked] = React.useState<Set<string>>(new Set())
   const [busy, setBusy] = React.useState(false)
 
@@ -91,15 +160,26 @@ export function ConversationExportDialog({
   const allMessagesRef = React.useRef(allMessages)
   allMessagesRef.current = allMessages
 
-  // 打开时重置：默认全选
+  // 打开时：从 localStorage 读取上次选项；勾选默认全选
   React.useEffect(() => {
     if (open) {
-      setFormat('md')
-      setIncludeImages(true)
-      setMdMode('source')
+      setOpts(loadOpts())
       setChecked(new Set(allMessagesRef.current.map((m) => m.id)))
     }
   }, [open])
+
+  // 选项变化 → 持久化（仅在打开时写入，避免初始 DEFAULT_OPTS 覆盖存量）
+  React.useEffect(() => {
+    if (!open) return
+    try {
+      window.localStorage.setItem(CONV_OPTS_KEY, JSON.stringify(opts))
+    } catch {
+      /* 隐私模式忽略 */
+    }
+  }, [open, opts])
+
+  const patchOpts = (patch: Partial<ConvExportOptsState>) =>
+    setOpts((prev) => ({ ...prev, ...patch }))
 
   const toggleChecked = (id: string) => {
     setChecked((prev) => {
@@ -124,12 +204,21 @@ export function ConversationExportDialog({
         .filter((s) => s.messages.length > 0)
       const baseName =
         title || (sections.length === 1 ? sections[0].title : '') || 'AI对话导出'
+      // 富媒体总开关同时驱动 includeImages（图片内嵌）与 includeMedia（音视频引用）
       await exportMessages(
         picked,
-        { format, includeImages, mdMode },
+        {
+          format: opts.format,
+          includeImages: opts.includeMedia,
+          includeMedia: opts.includeMedia,
+          includeMarks: opts.includeMarks,
+          includeMeta: opts.includeMeta,
+          onlyUserMessages: opts.onlyUser,
+          mdMode: opts.mdMode,
+        },
         baseName,
       )
-      if (format !== 'pdf') onOpenChange(false)
+      if (opts.format !== 'pdf') onOpenChange(false)
     } finally {
       setBusy(false)
     }
@@ -165,11 +254,11 @@ export function ConversationExportDialog({
                 <button
                   key={opt.value}
                   type="button"
-                  onClick={() => setFormat(opt.value)}
-                  aria-pressed={format === opt.value}
+                  onClick={() => patchOpts({ format: opt.value })}
+                  aria-pressed={opts.format === opt.value}
                   className={cn(
                     'flex flex-col items-center gap-1 rounded-xl border px-1.5 py-2.5 text-center transition-colors',
-                    format === opt.value
+                    opts.format === opt.value
                       ? 'border-emerald-500/60 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
                       : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground',
                   )}
@@ -184,22 +273,37 @@ export function ConversationExportDialog({
 
           {/* 选项开关 */}
           <div className="flex flex-col gap-2.5">
-            <div className="flex items-center justify-between gap-3 rounded-xl border border-border px-3 py-2.5">
-              <Label htmlFor="conv-export-images" className="cursor-pointer text-sm font-normal">
-                包含图片
-                <span className="ml-1 text-[11px] text-muted-foreground">
-                  （关闭后仅记录张数）
-                </span>
-              </Label>
-              <Switch
-                id="conv-export-images"
-                checked={includeImages}
-                onCheckedChange={setIncludeImages}
-              />
-            </div>
-            {format === 'md' && (
+            <OptionRow
+              id="conv-export-media"
+              label="包含富媒体"
+              hint="（图片 / 音频 / 视频）"
+              checked={opts.includeMedia}
+              onChange={(v) => patchOpts({ includeMedia: v })}
+            />
+            <OptionRow
+              id="conv-export-marks"
+              label="包含富文本标记"
+              hint="（加粗 / 高亮 / 挖空）"
+              checked={opts.includeMarks}
+              onChange={(v) => patchOpts({ includeMarks: v })}
+            />
+            <OptionRow
+              id="conv-export-meta"
+              label="包含元数据"
+              hint="（时间 / 标题 / 计数）"
+              checked={opts.includeMeta}
+              onChange={(v) => patchOpts({ includeMeta: v })}
+            />
+            <OptionRow
+              id="conv-export-only-user"
+              label="只导用户消息"
+              hint="（过滤 AI 回复）"
+              checked={opts.onlyUser}
+              onChange={(v) => patchOpts({ onlyUser: v })}
+            />
+            {opts.format === 'md' && (
               <div className="flex items-center justify-between gap-3 rounded-xl border border-border px-3 py-2.5">
-                <span className="text-sm">富媒体形式</span>
+                <span className="text-sm">Markdown 形式</span>
                 <div className="flex items-center gap-1 rounded-full border border-border p-0.5">
                   {(
                     [
@@ -210,11 +314,11 @@ export function ConversationExportDialog({
                     <button
                       key={o.v}
                       type="button"
-                      onClick={() => setMdMode(o.v)}
-                      aria-pressed={mdMode === o.v}
+                      onClick={() => patchOpts({ mdMode: o.v })}
+                      aria-pressed={opts.mdMode === o.v}
                       className={cn(
                         'rounded-full px-3 py-1 text-xs font-medium transition-colors',
-                        mdMode === o.v
+                        opts.mdMode === o.v
                           ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
                           : 'text-muted-foreground hover:text-foreground',
                       )}

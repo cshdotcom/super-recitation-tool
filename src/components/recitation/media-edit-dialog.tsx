@@ -26,25 +26,41 @@ import katex from 'katex'
 import 'katex/contrib/mhchem'
 import {
   AlertTriangle,
+  AlignCenter,
+  AlignLeft,
+  AlignRight,
   ArrowDown,
+  ArrowLeft,
   ArrowLeftRight,
+  ArrowRight,
   ArrowUp,
+  ArrowUpDown,
+  Bold,
   Check,
   ChevronDown,
   ChevronRight,
+  ClipboardPaste,
   Code2,
+  Combine,
   Copy,
+  Eraser,
   Eye,
   Hand,
+  Highlighter,
+  Italic,
+  Link as LinkIcon,
   Loader2,
   Magnet,
   Maximize2,
+  MoreVertical,
   MousePointer2,
   MoveRight,
   Pencil,
+  Pin,
   Plus,
   Redo2,
   Sparkles,
+  Split,
   Trash2,
   Type,
   Undo2,
@@ -74,17 +90,23 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import { Switch } from '@/components/ui/switch'
+import {
   MEDIA_KIND_LABEL,
   isMindmap,
   parseMindmap,
-  parseTable,
   serializeMindmap,
-  serializeTable,
   type MediaKind,
   type MediaRef,
   type MediaRefKind,
   type MindNode,
-  type TableGrid,
 } from '@/components/recitation/media-refs'
 import { AiAssistPopover } from '@/components/recitation/ai-assist-popover'
 import { SvgVisualEditor } from '@/components/recitation/media-svg-editor'
@@ -93,106 +115,1339 @@ const RichContentLazy = React.lazy(() =>
   import('@/components/recitation/rich-content').then((m) => ({ default: m.RichContent })),
 )
 
-// ---------- 表格网格编辑器 ----------
+// ---------- 表格网格编辑器（完整版：横向滚动 / 表头 / 对齐 / 合并 /
+//   行列增删移 / 富文本 / 批量 / 粘贴导入 / 排序 / 双向同步） ----------
+//
+// 完整可视化表格编辑器（v2.7）：
+//   1. 横向滚动：容器 overflow-x-auto + 触控滑动；「冻结首列」开关把首列 sticky left-0
+//   2. 表头设置：首行可标记为表头（<th> 加粗居中背景）；切换实时反映到 Markdown 输出
+//   3. 单元格对齐：每列左/中/右；输出 :--- / :---: / ---: 语法
+//   4. 合并单元格：选中 → 菜单「向右/向下合并」；Markdown 不支持合并 → 自动转 HTML table 输出
+//      编辑器识别 HTML td 的 colspan/rowspan 还原网格；可拆分
+//   5. 行列操作：每行/列尽头 + 加按钮；行头/列头 ⋮ 菜单含 上移/下移 / 左移/右移 / 删除 / 复制
+//   6. 单元格富文本：**加粗** / *斜体* / ==高亮== / `代码` / [文字](链接)；Shift+Enter 多行 → <br>
+//   7. 批量操作：Shift+点选多单元格 → 批量清空 / 批量填充 / 批量设对齐
+//   8. 导入兼容：粘贴 Markdown 表格 / HTML <table> 自动解析进网格
+//   9. 排序：点表头列按该列升/降序（文本/数字自动判断），原序可恢复
+//   10. 双向同步：parseRichTable ⇄ serializeRichTable；Markdown（无合并）或 HTML table（有合并 / 无表头）输出
 
-function TableGridEditor({ grid, onChange }: { grid: TableGrid; onChange: (g: TableGrid) => void }) {
-  const setCell = (ri: number, ci: number, v: string) => {
-    onChange({
-      head: grid.head,
+/** 单元格对齐方式 */
+type CellAlign = 'left' | 'center' | 'right'
+
+/** 单元格 span 信息（colspan / rowspan） */
+interface CellSpan {
+  colspan: number
+  rowspan: number
+}
+
+/**
+ * 富表格网格：在原 TableGrid 基础上扩展对齐 / 表头开关 / 冻结首列 / 合并 span。
+ * 序列化时若无 span 且 headerRow=true → Markdown 表格；否则 HTML <table>。
+ */
+interface RichTableGrid {
+  /** 表头列名（每列） */
+  head: string[]
+  /** body 单元格文本（可能含 markdown inline / <br> / 显式 HTML） */
+  rows: string[][]
+  /** 每列对齐（长度与 head 同步） */
+  aligns: CellAlign[]
+  /** 首行是否作为表头（<th> 渲染） */
+  headerRow: boolean
+  /** 冻结首列（sticky left-0） */
+  freezeFirstCol: boolean
+  /**
+   * 每个 body 单元格的 span（与 rows 同形状）；null 表示被同行 / 上方 cell 覆盖（不渲染）。
+   * 默认 { colspan: 1, rowspan: 1 }。
+   */
+  spans: (CellSpan | null)[][]
+}
+
+const DEFAULT_SPAN: CellSpan = { colspan: 1, rowspan: 1 }
+
+/** 生成 rowsCount×colsCount 的默认 span 矩阵（全部 1×1） */
+function uniformSpans(rowsCount: number, colsCount: number): (CellSpan | null)[][] {
+  return Array.from({ length: rowsCount }, () =>
+    Array.from({ length: colsCount }, () => ({ ...DEFAULT_SPAN })),
+  )
+}
+
+/** 生成 colsCount 个左对齐 */
+function defaultAligns(colsCount: number): CellAlign[] {
+  return Array.from({ length: Math.max(1, colsCount) }, () => 'left')
+}
+
+/** Markdown 分隔行 → 列对齐数组；非分隔行返回 null */
+function parseAlignFromSeparator(line: string): CellAlign[] | null {
+  const t = line.trim()
+  if (!/^\|[\s:|-]+\|$/.test(t)) return null
+  const parts = t.replace(/^\|/, '').replace(/\|$/, '').split('|').map((s) => s.trim())
+  const aligns: CellAlign[] = []
+  for (const p of parts) {
+    if (/^:.*:$/.test(p)) aligns.push('center')
+    else if (/:$/.test(p)) aligns.push('right')
+    else aligns.push('left')
+  }
+  return aligns
+}
+
+/** HTML 单元格文本转义（< > &） */
+function escapeHtmlCell(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+/** Markdown 单元格管道符转义 */
+function escapeMdCell(s: string): string {
+  return s.replace(/\|/g, '\\|')
+}
+
+/**
+ * 单元格内 markdown inline → HTML 片段（用于 HTML 输出模式；保留 <br> 多行）。
+ * 支持 ==高亮== / **加粗** / *斜体* / `代码` / [文字](链接) / 显式 <br>。
+ */
+function mdInlineToHtml(s: string): string {
+  let t = escapeHtmlCell(s)
+  t = t.replace(/==([^=]+)==/g, '<mark>$1</mark>')
+  t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  t = t.replace(/(^|[^*])\*([^*]+)\*(?!\*)/g, '$1<em>$2</em>')
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>')
+  t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2">$1</a>')
+  t = t.replace(/&lt;br\s*\/?&gt;/g, '<br/>')
+  t = t.replace(/\n/g, '<br/>')
+  return t
+}
+
+/** Markdown 表格源码 → RichTableGrid */
+function parseMarkdownTable(src: string): RichTableGrid | null {
+  const lines = src
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => /^\|.+\|$/.test(l))
+  if (lines.length < 2) return null
+  const splitRow = (l: string) =>
+    l.replace(/^\|/, '').replace(/\|$/, '').split('|').map((c) => c.trim())
+  const head = splitRow(lines[0])
+  let aligns = defaultAligns(head.length)
+  let bodyStart = 1
+  const sepAligns = parseAlignFromSeparator(lines[1])
+  if (sepAligns) {
+    aligns = sepAligns.slice(0, head.length)
+    while (aligns.length < head.length) aligns.push('left')
+    bodyStart = 2
+  }
+  const rows: string[][] = []
+  for (let i = bodyStart; i < lines.length; i++) {
+    if (/^\|[\s:|-]+\|$/.test(lines[i])) continue
+    const cells = splitRow(lines[i])
+    while (cells.length < head.length) cells.push('')
+    rows.push(cells.slice(0, head.length))
+  }
+  return {
+    head,
+    rows,
+    aligns,
+    headerRow: true,
+    freezeFirstCol: false,
+    spans: uniformSpans(rows.length, head.length),
+  }
+}
+
+/**
+ * HTML <table> 源码 → RichTableGrid：识别 thead / th / td / colspan / rowspan。
+ * 解析失败（无 <table> / 无行 / 无单元格）返回 null。
+ */
+function parseHtmlTable(src: string): RichTableGrid | null {
+  if (!/<table[\s>]/i.test(src)) return null
+  let doc: Document
+  try {
+    doc = new DOMParser().parseFromString(src, 'text/html')
+  } catch {
+    return null
+  }
+  const tbl = doc.querySelector('table')
+  if (!tbl) return null
+  const allRows = Array.from(tbl.querySelectorAll('tr'))
+  if (allRows.length === 0) return null
+  // 确定最大列数（按 colspan 累加）
+  let maxCols = 0
+  for (const tr of allRows) {
+    const cells = Array.from(tr.children).filter((c) => /^(td|th)$/i.test(c.tagName))
+    let span = 0
+    for (const c of cells) {
+      span += Math.max(1, parseInt(c.getAttribute('colspan') ?? '1', 10) || 1)
+    }
+    if (span > maxCols) maxCols = span
+  }
+  if (maxCols === 0) return null
+
+  // 表头检测：thead 存在 或 首行含 <th>
+  let headerRow = false
+  if (tbl.querySelector('thead')) headerRow = true
+  else if (allRows[0]?.querySelector('th')) headerRow = true
+
+  // 首行 → head（thead 内 / 或首行 th）
+  const firstRowCells = Array.from(allRows[0].children).filter((c) =>
+    /^(td|th)$/i.test(c.tagName),
+  ) as HTMLElement[]
+  const head: string[] = new Array(maxCols).fill('')
+  let hIdx = 0
+  for (const c of firstRowCells) {
+    const cs = Math.max(1, parseInt(c.getAttribute('colspan') ?? '1', 10) || 1)
+    const text = (c.textContent ?? '').trim()
+    for (let k = 0; k < cs && hIdx < maxCols; k++, hIdx++) head[hIdx] = text
+  }
+
+  // 其余行 → rows + spans；同时跟踪上方 rowspan 覆盖
+  const rows: string[][] = []
+  const spans: (CellSpan | null)[][] = []
+  const pendingRowsLeft: number[] = new Array(maxCols).fill(0)
+  for (let r = 1; r < allRows.length; r++) {
+    const cells = Array.from(allRows[r].children).filter((c) =>
+      /^(td|th)$/i.test(c.tagName),
+    ) as HTMLElement[]
+    const rowTexts: string[] = new Array(maxCols).fill('')
+    const rowSpans: (CellSpan | null)[] = new Array(maxCols).fill(null)
+    let c = 0
+    for (const cell of cells) {
+      while (c < maxCols && pendingRowsLeft[c] > 0) c++
+      if (c >= maxCols) break
+      const cs = Math.max(1, parseInt(cell.getAttribute('colspan') ?? '1', 10) || 1)
+      const rs = Math.max(1, parseInt(cell.getAttribute('rowspan') ?? '1', 10) || 1)
+      rowTexts[c] = (cell.textContent ?? '').trim()
+      rowSpans[c] = { colspan: cs, rowspan: rs }
+      // 同行右侧 colspan 覆盖
+      for (let x = 1; x < cs && c + x < maxCols; x++) rowSpans[c + x] = null
+      // 下方 rowspan 覆盖登记
+      if (rs > 1) {
+        for (let x = 0; x < cs && c + x < maxCols; x++) pendingRowsLeft[c + x] = rs - 1
+      }
+      c += cs
+    }
+    for (let x = 0; x < maxCols; x++) {
+      if (pendingRowsLeft[x] > 0) pendingRowsLeft[x]--
+    }
+    rows.push(rowTexts)
+    spans.push(rowSpans)
+  }
+  if (rows.length === 0) {
+    rows.push(new Array(maxCols).fill(''))
+    spans.push(Array.from({ length: maxCols }, () => ({ ...DEFAULT_SPAN })))
+  }
+  return {
+    head,
+    rows,
+    aligns: defaultAligns(maxCols),
+    headerRow,
+    freezeFirstCol: false,
+    spans,
+  }
+}
+
+/** 源码 → RichTableGrid：优先 HTML <table>，否则 Markdown 表格 */
+function parseRichTable(src: string): RichTableGrid | null {
+  const t = (src || '').trim()
+  if (!t) return null
+  if (/^<table[\s>]/i.test(t)) {
+    const ht = parseHtmlTable(t)
+    if (ht) return ht
+  }
+  return parseMarkdownTable(t)
+}
+
+/** 是否含 colspan/rowspan > 1 */
+function hasComplexSpans(g: RichTableGrid): boolean {
+  for (const row of g.spans) {
+    for (const s of row) {
+      if (s && (s.colspan > 1 || s.rowspan > 1)) return true
+    }
+  }
+  return false
+}
+
+/** 序列化为 Markdown 表格（仅在无 span 且 headerRow=true 时可用） */
+function serializeRichAsMarkdown(g: RichTableGrid): string {
+  const n = Math.max(g.head.length, 1)
+  const head = g.head.slice(0, n)
+  while (head.length < n) head.push('')
+  const esc = escapeMdCell
+  const sep = Array.from({ length: n }, (_, i) => {
+    const a = g.aligns[i] ?? 'left'
+    if (a === 'center') return ':---:'
+    if (a === 'right') return '---:'
+    return '---'
+  })
+  const lines = [
+    `| ${head.map(esc).join(' | ')} |`,
+    `| ${sep.join(' | ')} |`,
+    ...g.rows.map((r) => {
+      const cells = r.slice(0, n)
+      while (cells.length < n) cells.push('')
+      return `| ${cells.map(esc).join(' | ')} |`
+    }),
+  ]
+  return lines.join('\n')
+}
+
+/** 序列化为 HTML <table>（带 colspan/rowspan，可选 thead） */
+function serializeRichAsHtml(g: RichTableGrid): string {
+  const n = Math.max(g.head.length, 1)
+  const head = g.head.slice(0, n)
+  while (head.length < n) head.push('')
+  const lines: string[] = ['<table>']
+  if (g.headerRow) {
+    lines.push('  <thead>', '    <tr>')
+    for (let i = 0; i < n; i++) lines.push(`      <th>${mdInlineToHtml(head[i])}</th>`)
+    lines.push('    </tr>', '  </thead>', '  <tbody>')
+  } else {
+    lines.push('  <tbody>', '    <tr>')
+    for (let i = 0; i < n; i++) lines.push(`      <td>${mdInlineToHtml(head[i])}</td>`)
+    lines.push('    </tr>')
+  }
+  for (let r = 0; r < g.rows.length; r++) {
+    lines.push('    <tr>')
+    for (let c = 0; c < n; c++) {
+      const s = g.spans[r]?.[c]
+      if (!s) continue
+      const text = mdInlineToHtml(g.rows[r][c] ?? '')
+      const csAttr = s.colspan > 1 ? ` colspan="${s.colspan}"` : ''
+      const rsAttr = s.rowspan > 1 ? ` rowspan="${s.rowspan}"` : ''
+      lines.push(`      <td${csAttr}${rsAttr}>${text}</td>`)
+    }
+    lines.push('    </tr>')
+  }
+  lines.push('  </tbody>', '</table>')
+  return lines.join('\n')
+}
+
+/** 序列化：无合并 + 表头 → Markdown；否则 HTML table */
+function serializeRichTable(g: RichTableGrid): string {
+  if (g.headerRow && !hasComplexSpans(g)) return serializeRichAsMarkdown(g)
+  return serializeRichAsHtml(g)
+}
+
+/** 单元格选中状态："r,c" 字符串集合 */
+type CellSel = Set<string>
+
+/** 把 r,c 编码为选中 key */
+const cellKey = (r: number, c: number) => `${r},${c}`
+
+/** 把 "r,c" 解码 */
+function parseCellKey(k: string): [number, number] | null {
+  const [r, c] = k.split(',').map((n) => parseInt(n, 10))
+  if (Number.isNaN(r) || Number.isNaN(c)) return null
+  return [r, c]
+}
+
+/** 把选中 key 集合展开成 r,c 数组 */
+function expandSel(sel: CellSel): Array<[number, number]> {
+  const out: Array<[number, number]> = []
+  for (const k of sel) {
+    const p = parseCellKey(k)
+    if (p) out.push(p)
+  }
+  return out
+}
+
+/** 把选中范围扩展为矩形（取 min/max 包络） */
+function selRect(sel: CellSel): { r0: number; r1: number; c0: number; c1: number } | null {
+  const pts = expandSel(sel)
+  if (pts.length === 0) return null
+  let r0 = pts[0][0], r1 = pts[0][0], c0 = pts[0][1], c1 = pts[0][1]
+  for (const [r, c] of pts) {
+    r0 = Math.min(r0, r)
+    r1 = Math.max(r1, r)
+    c0 = Math.min(c0, c)
+    c1 = Math.max(c1, c)
+  }
+  return { r0, r1, c0, c1 }
+}
+
+/** 文本 → 数字判断（用于排序：纯数字列按数字排序） */
+function isNumericCol(values: string[]): boolean {
+  let cnt = 0
+  for (const v of values) {
+    if (v.trim() === '') continue
+    if (!Number.isNaN(Number(v.replace(/[,，%]/g, '')))) cnt++
+  }
+  return cnt >= Math.max(1, values.filter((v) => v.trim()).length)
+}
+
+/** 单元格内 markdown inline → 安全 HTML 片段（用于编辑器内只读渲染预览） */
+function renderCellPreview(s: string): string {
+  return mdInlineToHtml(s)
+}
+
+/**
+ * 完整表格可视化编辑器：横向滚动 + 冻结首列 + 表头 + 列对齐 + 合并 +
+ *   行列增删移复制 + 单元格富文本工具条 + 批量操作 + 粘贴导入 + 排序。
+ */
+function TableGridEditor({
+  grid,
+  onChange,
+}: {
+  grid: RichTableGrid
+  onChange: (g: RichTableGrid) => void
+}) {
+  const cols = Math.max(grid.head.length, 1)
+  const rows = grid.rows
+  const [sel, setSel] = React.useState<CellSel>(new Set())
+  const [anchor, setAnchor] = React.useState<[number, number] | null>(null)
+  const [editing, setEditing] = React.useState<[number, number] | null>(null)
+  const [pasteOpen, setPasteOpen] = React.useState(false)
+  const [pasteText, setPasteText] = React.useState('')
+  /** 排序状态：{ col, dir: 'asc'|'desc'|null }；null = 恢复原序 */
+  const [sortState, setSortState] = React.useState<{
+    col: number
+    dir: 'asc' | 'desc' | null
+  } | null>(null)
+  /** 行序：当 sortState.dir=null 时按 grid.rows 原序；排序时用映射 */
+  const [rowOrder, setRowOrder] = React.useState<number[] | null>(null)
+  const editRef = React.useRef<HTMLTextAreaElement | null>(null)
+
+  // 行/列数变化时清空选中 / 编辑态，避免越界
+  React.useEffect(() => {
+    setSel(new Set())
+    setAnchor(null)
+    setEditing(null)
+  }, [rows.length, cols])
+
+  // 编辑态进入时聚焦 textarea
+  React.useEffect(() => {
+    if (editing) {
+      requestAnimationFrame(() => {
+        editRef.current?.focus()
+        const len = editRef.current?.value.length ?? 0
+        editRef.current?.setSelectionRange(len, len)
+      })
+    }
+  }, [editing])
+
+  /** 当前显示行序（null = 原序 0..n-1；非空 = 按映射） */
+  const displayRows: number[] =
+    rowOrder && sortState?.dir !== null ? rowOrder : rows.map((_, i) => i)
+
+  /** 不可变更新（带 span/aligns/head 同步） */
+  const update = (next: RichTableGrid) => {
+    onChange(next)
+  }
+
+  const setCellText = (ri: number, ci: number, v: string) => {
+    update({
+      ...grid,
       rows: grid.rows.map((r, i) => (i === ri ? r.map((c, j) => (j === ci ? v : c)) : r)),
     })
   }
+
   const setHead = (ci: number, v: string) => {
-    onChange({ head: grid.head.map((c, i) => (i === ci ? v : c)), rows: grid.rows })
+    update({ ...grid, head: grid.head.map((c, i) => (i === ci ? v : c)) })
   }
-  const addRow = () => onChange({ head: grid.head, rows: [...grid.rows, grid.head.map(() => '')] })
-  const addCol = () =>
-    onChange({ head: [...grid.head, '新列'], rows: grid.rows.map((r) => [...r, '']) })
-  const delRow = (ri: number) =>
-    onChange({ head: grid.head, rows: grid.rows.filter((_, i) => i !== ri) })
-  const delCol = (ci: number) => {
-    if (grid.head.length <= 1) {
-      toast.warning('至少保留 1 列')
-      return
-    }
-    onChange({
-      head: grid.head.filter((_, i) => i !== ci),
-      rows: grid.rows.map((r) => r.filter((_, i) => i !== ci)),
+
+  const setAlign = (ci: number, a: CellAlign) => {
+    update({ ...grid, aligns: grid.aligns.map((x, i) => (i === ci ? a : x)) })
+  }
+
+  const addRowAt = (ri: number, dir: 0 | 1 = 1) => {
+    const idx = dir === 1 ? ri + 1 : ri
+    const newRow = grid.head.map(() => '')
+    const newSpan: CellSpan = { ...DEFAULT_SPAN }
+    update({
+      ...grid,
+      rows: [...grid.rows.slice(0, idx), newRow, ...grid.rows.slice(idx)],
+      spans: [
+        ...grid.spans.slice(0, idx),
+        Array.from({ length: cols }, () => ({ ...newSpan })),
+        ...grid.spans.slice(idx),
+      ],
     })
   }
 
+  const addColAt = (ci: number, dir: 0 | 1 = 1) => {
+    const idx = dir === 1 ? ci + 1 : ci
+    update({
+      ...grid,
+      head: [...grid.head.slice(0, idx), '新列', ...grid.head.slice(idx)],
+      aligns: [...grid.aligns.slice(0, idx), 'left', ...grid.aligns.slice(idx)],
+      rows: grid.rows.map((r) => [...r.slice(0, idx), '', ...r.slice(idx)]),
+      spans: grid.spans.map((row) => [
+        ...row.slice(0, idx),
+        { ...DEFAULT_SPAN },
+        ...row.slice(idx),
+      ]),
+    })
+  }
+
+  const delRow = (ri: number) => {
+    if (grid.rows.length <= 1) {
+      toast.warning('至少保留 1 行')
+      return
+    }
+    update({
+      ...grid,
+      rows: grid.rows.filter((_, i) => i !== ri),
+      spans: grid.spans.filter((_, i) => i !== ri),
+    })
+  }
+
+  const delCol = (ci: number) => {
+    if (cols <= 1) {
+      toast.warning('至少保留 1 列')
+      return
+    }
+    update({
+      ...grid,
+      head: grid.head.filter((_, i) => i !== ci),
+      aligns: grid.aligns.filter((_, i) => i !== ci),
+      rows: grid.rows.map((r) => r.filter((_, i) => i !== ci)),
+      spans: grid.spans.map((row) => row.filter((_, i) => i !== ci)),
+    })
+  }
+
+  const moveRow = (ri: number, dir: -1 | 1) => {
+    const j = ri + dir
+    if (j < 0 || j >= grid.rows.length) return
+    const rows = [...grid.rows]
+    const spans = [...grid.spans]
+    ;[rows[ri], rows[j]] = [rows[j], rows[ri]]
+    ;[spans[ri], spans[j]] = [spans[j], spans[ri]]
+    update({ ...grid, rows, spans })
+  }
+
+  const moveCol = (ci: number, dir: -1 | 1) => {
+    const j = ci + dir
+    if (j < 0 || j >= cols) return
+    const head = [...grid.head]
+    const aligns = [...grid.aligns]
+    ;[head[ci], head[j]] = [head[j], head[ci]]
+    ;[aligns[ci], aligns[j]] = [aligns[j], aligns[ci]]
+    const rows = grid.rows.map((r) => {
+      const x = [...r]
+      ;[x[ci], x[j]] = [x[j], x[ci]]
+      return x
+    })
+    const spans = grid.spans.map((row) => {
+      const x = [...row]
+      ;[x[ci], x[j]] = [x[j], x[ci]]
+      return x
+    })
+    update({ ...grid, head, aligns, rows, spans })
+  }
+
+  const copyRow = (ri: number) => {
+    const r = grid.rows[ri]
+    const s = grid.spans[ri]
+    update({
+      ...grid,
+      rows: [...grid.rows, [...r]],
+      spans: [...grid.spans, s.map((c) => (c ? { ...c } : null))],
+    })
+    toast.success('已复制行到末尾')
+  }
+
+  const copyCol = (ci: number) => {
+    update({
+      ...grid,
+      head: [...grid.head, `${grid.head[ci] ?? ''} 副本`],
+      aligns: [...grid.aligns, grid.aligns[ci] ?? 'left'],
+      rows: grid.rows.map((r) => [...r, r[ci] ?? '']),
+      spans: grid.spans.map((row) => [...row, row[ci] ? { ...row[ci]! } : { ...DEFAULT_SPAN }]),
+    })
+    toast.success('已复制列到末尾')
+  }
+
+  /** 向右合并：把 (r,c) 与 (r,c+1) 合并（要求 c+1<cols 且 (r,c+1) 的 span 非 null） */
+  const mergeRight = (r: number, c: number) => {
+    if (c + 1 >= cols) {
+      toast.warning('已是最右列')
+      return
+    }
+    const span = grid.spans[r]?.[c]
+    const right = grid.spans[r]?.[c + 1]
+    if (!span || !right) {
+      toast.warning('相邻单元格已被合并覆盖，无法继续合并')
+      return
+    }
+    const nextSpans = grid.spans.map((row, ri) =>
+      ri === r
+        ? row.map((s, ci) => {
+            if (ci === c) return { colspan: span.colspan + right.colspan, rowspan: span.rowspan }
+            if (ci >= c + 1 && ci < c + 1 + right.colspan) return null
+            return s
+          })
+        : row.slice(),
+    )
+    const nextRows = grid.rows.map((row, ri) =>
+      ri === r
+        ? row.map((v, ci) =>
+            ci === c
+              ? (grid.rows[r][c] + ' ' + grid.rows[r][c + 1]).trim()
+              : ci === c + 1
+                ? ''
+                : v,
+          )
+        : row.slice(),
+    )
+    update({ ...grid, rows: nextRows, spans: nextSpans })
+  }
+
+  /** 向下合并 */
+  const mergeDown = (r: number, c: number) => {
+    if (r + 1 >= grid.rows.length) {
+      toast.warning('已是最下行')
+      return
+    }
+    const span = grid.spans[r]?.[c]
+    const below = grid.spans[r + 1]?.[c]
+    if (!span || !below) {
+      toast.warning('下方单元格已被合并覆盖，无法继续合并')
+      return
+    }
+    const nextSpans = grid.spans.map((row, ri) => {
+      if (ri === r) {
+        return row.map((s, ci) =>
+          ci === c ? { colspan: span.colspan, rowspan: span.rowspan + below.rowspan } : s,
+        )
+      }
+      if (ri >= r + 1 && ri < r + 1 + below.rowspan) {
+        return row.map((s, ci) =>
+          ci >= c && ci < c + span.colspan ? null : s,
+        )
+      }
+      return row.slice()
+    })
+    const nextRows = grid.rows.map((row, ri) =>
+      ri === r
+        ? row.map((v, ci) =>
+            ci === c
+              ? (grid.rows[r][c] + ' ' + grid.rows[r + 1][c]).trim()
+              : v,
+          )
+        : ri === r + 1
+          ? row.map((v, ci) => (ci === c ? '' : v))
+          : row.slice(),
+    )
+    update({ ...grid, rows: nextRows, spans: nextSpans })
+  }
+
+  /** 拆分本单元格：colspan/rowspan 全恢复 1×1，被覆盖的单元格复原默认 span */
+  const splitCell = (r: number, c: number) => {
+    const span = grid.spans[r]?.[c]
+    if (!span || (span.colspan <= 1 && span.rowspan <= 1)) {
+      toast.info('当前单元格未合并')
+      return
+    }
+    const nextSpans = grid.spans.map((row) => row.map((s) => (s ? { ...s } : null)))
+    // 主单元格 → 1×1
+    nextSpans[r][c] = { ...DEFAULT_SPAN }
+    // 还原被它覆盖的同行右侧 / 下方行
+    for (let dr = 0; dr < span.rowspan; dr++) {
+      for (let dc = 0; dc < span.colspan; dc++) {
+        if (dr === 0 && dc === 0) continue
+        const rr = r + dr
+        const cc = c + dc
+        if (rr < nextSpans.length && cc < cols) {
+          nextSpans[rr][cc] = { ...DEFAULT_SPAN }
+        }
+      }
+    }
+    update({ ...grid, spans: nextSpans })
+  }
+
+  /** 单元格富文本工具条：包裹选区 */
+  const wrapSelection = (left: string, right: string = left) => {
+    if (!editing) return
+    const [r, c] = editing
+    const el = editRef.current
+    const val = grid.rows[r]?.[c] ?? ''
+    if (!el) {
+      setCellText(r, c, left + val + right)
+      return
+    }
+    const start = el.selectionStart ?? val.length
+    const end = el.selectionEnd ?? start
+    const selText = val.slice(start, end)
+    const next =
+      val.slice(0, start) +
+      left +
+      (selText || '文字') +
+      right +
+      val.slice(end)
+    setCellText(r, c, next)
+    requestAnimationFrame(() => {
+      el.focus()
+      const s = start + left.length
+      el.setSelectionRange(s, s + (selText || '文字').length)
+    })
+  }
+
+  const insertLink = () => {
+    if (!editing) return
+    const [r, c] = editing
+    const el = editRef.current
+    const val = grid.rows[r]?.[c] ?? ''
+    const start = el?.selectionStart ?? val.length
+    const end = el?.selectionEnd ?? start
+    const selText = val.slice(start, end) || '链接文字'
+    const next = val.slice(0, start) + `[${selText}](https://)` + val.slice(end)
+    setCellText(r, c, next)
+  }
+
+  /** 批量：清空选中 */
+  const batchClear = () => {
+    if (sel.size === 0) {
+      toast.info('请先选中单元格（Shift+点选多格）')
+      return
+    }
+    const pts = expandSel(sel)
+    const rows = grid.rows.map((row) => row.slice())
+    for (const [r, c] of pts) {
+      if (rows[r]) rows[r][c] = ''
+    }
+    update({ ...grid, rows })
+    toast.success(`已清空 ${pts.length} 个单元格`)
+  }
+
+  /** 批量：填充选中（prompt 输入） */
+  const batchFill = () => {
+    if (sel.size === 0) {
+      toast.info('请先选中单元格（Shift+点选多格）')
+      return
+    }
+    const v = window.prompt('输入要批量填充的内容')
+    if (v == null) return
+    const pts = expandSel(sel)
+    const rows = grid.rows.map((row) => row.slice())
+    for (const [r, c] of pts) {
+      if (rows[r]) rows[r][c] = v
+    }
+    update({ ...grid, rows })
+    toast.success(`已填充 ${pts.length} 个单元格`)
+  }
+
+  /** 批量：设对齐（取选中涉及的列统一对齐） */
+  const batchAlign = (a: CellAlign) => {
+    if (sel.size === 0) {
+      toast.info('请先选中单元格（Shift+点选多格）')
+      return
+    }
+    const rect = selRect(sel)
+    if (!rect) return
+    const aligns = grid.aligns.slice()
+    for (let c = rect.c0; c <= rect.c1; c++) aligns[c] = a
+    update({ ...grid, aligns })
+    toast.success(`已对选中列设为「${a === 'left' ? '左' : a === 'center' ? '中' : '右'}对齐」`)
+  }
+
+  /** 排序：点表头列循环 升序 → 降序 → 取消（原序） */
+  const sortCol = (ci: number) => {
+    if (sortState?.col === ci && sortState.dir === 'asc') {
+      setSortState({ col: ci, dir: 'desc' })
+    } else if (sortState?.col === ci && sortState.dir === 'desc') {
+      setSortState(null)
+      setRowOrder(null)
+      return
+    } else {
+      setSortState({ col: ci, dir: 'asc' })
+    }
+    const dir = sortState?.col === ci ? (sortState.dir === 'asc' ? 'desc' : 'asc') : 'asc'
+    const values = grid.rows.map((r) => r[ci] ?? '')
+    const numeric = isNumericCol(values)
+    const idxs = grid.rows.map((_, i) => i)
+    idxs.sort((a, b) => {
+      const va = grid.rows[a][ci] ?? ''
+      const vb = grid.rows[b][ci] ?? ''
+      let cmp: number
+      if (numeric) {
+        const na = Number(va.replace(/[,，%]/g, '')) || 0
+        const nb = Number(vb.replace(/[,，%]/g, '')) || 0
+        cmp = na - nb
+      } else {
+        cmp = va.localeCompare(vb, 'zh-Hans-CN')
+      }
+      return dir === 'asc' ? cmp : -cmp
+    })
+    setRowOrder(idxs)
+  }
+
+  /** 粘贴导入：尝试 parseRichTable，成功替换 */
+  const applyPaste = () => {
+    const g = parseRichTable(pasteText)
+    if (!g) {
+      toast.error('未识别出 Markdown 表格或 HTML <table>')
+      return
+    }
+    update(g)
+    setPasteOpen(false)
+    setPasteText('')
+    toast.success('已导入表格')
+  }
+
+  /** 单元格点击：单选 / Shift 范围选 */
+  const onCellClick = (r: number, c: number, e: React.MouseEvent) => {
+    // 点在按钮 / 菜单触发上不触发选中
+    const tgt = e.target as HTMLElement | null
+    if (tgt && tgt.closest('button, a, input, textarea, [role="menuitem"]')) return
+    if (e.shiftKey && anchor) {
+      const next = new Set<string>()
+      const r0 = Math.min(anchor[0], r)
+      const r1 = Math.max(anchor[0], r)
+      const c0 = Math.min(anchor[1], c)
+      const c1 = Math.max(anchor[1], c)
+      for (let rr = r0; rr <= r1; rr++) {
+        for (let cc = c0; cc <= c1; cc++) {
+          // 跳过被合并覆盖的单元格
+          if (grid.spans[rr]?.[cc] !== null && grid.spans[rr]?.[cc] !== undefined) {
+            next.add(cellKey(rr, cc))
+          }
+        }
+      }
+      setSel(next)
+      setEditing(null)
+    } else {
+      setSel(new Set([cellKey(r, c)]))
+      setAnchor([r, c])
+      setEditing([r, c])
+    }
+  }
+
+  // 顶部工具条
   return (
     <div className="flex flex-col gap-2">
+      {/* 工具条：表头开关 / 冻结首列 / 粘贴导入 / 批量操作 / 排序状态 */}
+      <div className="flex flex-wrap items-center gap-2 rounded-xl bg-muted/40 px-2.5 py-2 text-xs">
+        <label className="flex items-center gap-1.5">
+          <Switch
+            checked={grid.headerRow}
+            onCheckedChange={(v) => update({ ...grid, headerRow: v })}
+            aria-label="表头行开关"
+            className="scale-90"
+          />
+          <span className="text-muted-foreground">表头行</span>
+        </label>
+        <label className="flex items-center gap-1.5">
+          <Switch
+            checked={grid.freezeFirstCol}
+            onCheckedChange={(v) => update({ ...grid, freezeFirstCol: v })}
+            aria-label="冻结首列开关"
+            className="scale-90"
+          />
+          <Pin className="size-3.5 text-muted-foreground" />
+          <span className="text-muted-foreground">冻结首列</span>
+        </label>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 rounded-full text-xs"
+          onClick={() => setPasteOpen((v) => !v)}
+        >
+          <ClipboardPaste className="size-3.5" /> 粘贴导入
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 rounded-full text-xs"
+          onClick={batchClear}
+          disabled={sel.size === 0}
+        >
+          <Eraser className="size-3.5" /> 批量清空
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 rounded-full text-xs"
+          onClick={batchFill}
+          disabled={sel.size === 0}
+        >
+          <Type className="size-3.5" /> 批量填充
+        </Button>
+        <div className="flex items-center gap-0.5 rounded-full border border-border bg-background p-0.5">
+          {(['left', 'center', 'right'] as CellAlign[]).map((a) => {
+            const Icon = a === 'center' ? AlignCenter : a === 'right' ? AlignRight : AlignLeft
+            return (
+              <button
+                key={a}
+                type="button"
+                aria-label={`批量${a === 'left' ? '左' : a === 'center' ? '居中' : '右'}对齐`}
+                onClick={() => batchAlign(a)}
+                disabled={sel.size === 0}
+                className="rounded-full p-1.5 text-muted-foreground transition-colors hover:bg-muted disabled:opacity-40"
+              >
+                <Icon className="size-3.5" />
+              </button>
+            )
+          })}
+        </div>
+        {sortState && sortState.dir !== null && (
+          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] text-amber-900 dark:bg-amber-500/20 dark:text-amber-300">
+            按「{grid.head[sortState.col] || `第${sortState.col + 1}列`}」
+            {sortState.dir === 'asc' ? '升序' : '降序'} · 点表头取消
+          </span>
+        )}
+        <span className="ml-auto text-[11px] text-muted-foreground">
+          {rows.length} 行 × {cols} 列
+          {hasComplexSpans(grid) ? ' · 含合并（HTML 输出）' : ''}
+        </span>
+      </div>
+
+      {/* 粘贴导入面板 */}
+      {pasteOpen && (
+        <div className="rounded-xl border border-border bg-muted/30 p-2.5">
+          <p className="text-[11px] text-muted-foreground">
+            粘贴 Markdown 表格或 HTML &lt;table&gt; 源码，点「导入」替换当前网格。
+          </p>
+          <Textarea
+            value={pasteText}
+            onChange={(e) => setPasteText(e.target.value)}
+            placeholder={'| 列1 | 列2 |\n| --- | --- |\n| 值1 | 值2 |'}
+            className="mt-1.5 min-h-24 resize-none rounded-lg bg-background font-mono text-xs"
+          />
+          <div className="mt-1.5 flex gap-2">
+            <Button size="sm" className="h-7 rounded-full text-xs" onClick={applyPaste}>
+              <Check className="size-3.5" /> 导入
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 rounded-full text-xs"
+              onClick={() => {
+                setPasteOpen(false)
+                setPasteText('')
+              }}
+            >
+              取消
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* 富文本工具条（仅编辑态显示） */}
+      {editing && (
+        <div className="flex flex-wrap items-center gap-1 rounded-full border border-border bg-background px-1.5 py-1 text-xs shadow-sm">
+          <span className="px-1 text-[11px] text-muted-foreground">
+            单元格 {editing[0] + 1}-{editing[1] + 1}
+          </span>
+          <button
+            type="button"
+            aria-label="加粗"
+            onClick={() => wrapSelection('**')}
+            className="rounded p-1.5 text-muted-foreground hover:bg-muted"
+          >
+            <Bold className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            aria-label="斜体"
+            onClick={() => wrapSelection('*')}
+            className="rounded p-1.5 text-muted-foreground hover:bg-muted"
+          >
+            <Italic className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            aria-label="高亮"
+            onClick={() => wrapSelection('==')}
+            className="rounded p-1.5 text-muted-foreground hover:bg-muted"
+          >
+            <Highlighter className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            aria-label="行内代码"
+            onClick={() => wrapSelection('`')}
+            className="rounded p-1.5 text-muted-foreground hover:bg-muted"
+          >
+            <Code2 className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            aria-label="链接"
+            onClick={insertLink}
+            className="rounded p-1.5 text-muted-foreground hover:bg-muted"
+          >
+            <LinkIcon className="size-3.5" />
+          </button>
+          <span className="px-1 text-[10px] text-muted-foreground/70">
+            Shift+Enter 换行（输出 &lt;br&gt;）
+          </span>
+        </div>
+      )}
+
+      {/* 表格：横向滚动 + 冻结首列 */}
       <div className="overflow-x-auto rounded-xl border border-border">
         <table className="w-full border-collapse text-sm">
           <thead>
-            <tr className="bg-muted/60">
-              {grid.head.map((h, ci) => (
-                <th key={ci} className="min-w-24 border-b border-border p-1">
-                  <div className="flex items-center gap-1">
-                    <Input
-                      value={h}
-                      aria-label={`表头 ${ci + 1}`}
-                      onChange={(e) => setHead(ci, e.target.value)}
-                      className="h-8 border-0 bg-transparent px-1.5 text-xs font-semibold focus-visible:ring-1"
-                    />
-                    <button
-                      type="button"
-                      aria-label={`删除列 ${ci + 1}`}
-                      onClick={() => delCol(ci)}
-                      className="shrink-0 rounded p-0.5 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
-                    >
-                      <Trash2 className="size-3" />
-                    </button>
-                  </div>
-                </th>
-              ))}
+            <tr className={cn(grid.headerRow ? 'bg-muted/70' : 'bg-muted/40')}>
+              {/* 行号列（固定左上角） */}
+              <th
+                className="sticky left-0 z-20 w-9 min-w-9 border-b border-r border-border bg-muted/70 p-1 text-center text-[10px] font-semibold text-muted-foreground"
+                aria-label="列菜单"
+              >
+                #
+              </th>
+              {grid.head.map((h, ci) => {
+                const isFrozen = grid.freezeFirstCol && ci === 0
+                const isSorted = sortState?.col === ci && sortState.dir !== null
+                return (
+                  <th
+                    key={ci}
+                    className={cn(
+                      'min-w-28 border-b border-r border-border p-1',
+                      isFrozen && 'sticky z-10',
+                      isFrozen && (ci === 0 ? 'left-9' : 'left-0'),
+                      grid.headerRow ? 'bg-muted/70' : 'bg-muted/40',
+                    )}
+                  >
+                    <div className="flex items-center gap-0.5">
+                      <Input
+                        value={h}
+                        aria-label={`表头 ${ci + 1}`}
+                        onChange={(e) => setHead(ci, e.target.value)}
+                        className="h-8 min-w-0 flex-1 border-0 bg-transparent px-1.5 text-xs font-semibold focus-visible:ring-1"
+                      />
+                      {/* 排序按钮 */}
+                      <button
+                        type="button"
+                        aria-label={`按第 ${ci + 1} 列排序`}
+                        onClick={() => sortCol(ci)}
+                        className={cn(
+                          'shrink-0 rounded p-1 text-muted-foreground hover:bg-muted',
+                          isSorted && 'bg-amber-100 text-amber-900 dark:bg-amber-500/20 dark:text-amber-300',
+                        )}
+                      >
+                        <ArrowUpDown className="size-3.5" />
+                      </button>
+                      {/* 列 ⋮ 菜单 */}
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            aria-label={`列 ${ci + 1} 菜单`}
+                            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted"
+                          >
+                            <MoreVertical className="size-3.5" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="w-44">
+                          <DropdownMenuLabel className="text-xs text-muted-foreground">
+                            第 {ci + 1} 列
+                          </DropdownMenuLabel>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            onClick={() => moveCol(ci, -1)}
+                            disabled={ci === 0}
+                          >
+                            <ArrowLeft className="size-3.5" /> 左移
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => moveCol(ci, 1)}
+                            disabled={ci === cols - 1}
+                          >
+                            <ArrowRight className="size-3.5" /> 右移
+                          </DropdownMenuItem>
+                          <DropdownMenuItem onClick={() => copyCol(ci)}>
+                            <Copy className="size-3.5" /> 复制列
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuLabel className="text-xs text-muted-foreground">
+                            对齐
+                          </DropdownMenuLabel>
+                          {(['left', 'center', 'right'] as CellAlign[]).map((a) => {
+                            const AIcon = a === 'center' ? AlignCenter : a === 'right' ? AlignRight : AlignLeft
+                            return (
+                              <DropdownMenuItem
+                                key={a}
+                                onClick={() => setAlign(ci, a)}
+                                className={cn(grid.aligns[ci] === a && 'bg-accent')}
+                              >
+                                <AIcon className="size-3.5" />{' '}
+                                {a === 'left' ? '左对齐' : a === 'center' ? '居中' : '右对齐'}
+                              </DropdownMenuItem>
+                            )
+                          })}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            onClick={() => delCol(ci)}
+                            className="text-destructive focus:text-destructive"
+                          >
+                            <Trash2 className="size-3.5" /> 删除列
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                      {/* 加列按钮 */}
+                      <button
+                        type="button"
+                        aria-label="右侧加列"
+                        onClick={() => addColAt(ci, 1)}
+                        className="shrink-0 rounded p-1 text-emerald-600 hover:bg-emerald-500/10"
+                      >
+                        <Plus className="size-3.5" />
+                      </button>
+                    </div>
+                  </th>
+                )
+              })}
+              {/* 末尾加列按钮 */}
+              <th className="sticky right-0 z-10 w-9 border-b border-border bg-muted/70 p-1">
+                <button
+                  type="button"
+                  aria-label="末尾加列"
+                  onClick={() => addColAt(cols - 1, 1)}
+                  className="flex size-7 items-center justify-center rounded-full text-emerald-600 hover:bg-emerald-500/10"
+                >
+                  <Plus className="size-4" />
+                </button>
+              </th>
             </tr>
           </thead>
           <tbody>
-            {grid.rows.map((row, ri) => (
-              <tr key={ri}>
-                {row.map((c, ci) => (
-                  <td key={ci} className="border-b border-border/50 p-1 align-top">
-                    {ci === 0 ? (
-                      <div className="flex items-center gap-1">
-                        <Input
-                          value={c}
-                          aria-label={`单元格 ${ri + 1}-${ci + 1}`}
-                          onChange={(e) => setCell(ri, ci, e.target.value)}
-                          className="h-8 border-0 bg-transparent px-1.5 text-xs focus-visible:ring-1"
-                        />
-                        <button
-                          type="button"
-                          aria-label={`删除行 ${ri + 1}`}
-                          onClick={() => delRow(ri)}
-                          className="shrink-0 rounded p-0.5 text-muted-foreground/60 hover:bg-destructive/10 hover:text-destructive"
-                        >
-                          <Trash2 className="size-3" />
-                        </button>
-                      </div>
-                    ) : (
-                      <Input
-                        value={c}
-                        aria-label={`单元格 ${ri + 1}-${ci + 1}`}
-                        onChange={(e) => setCell(ri, ci, e.target.value)}
-                        className="h-8 border-0 bg-transparent px-1.5 text-xs focus-visible:ring-1"
-                      />
+            {displayRows.map((rIdx, displayIdx) => {
+              const row = grid.rows[rIdx]
+              const spanRow = grid.spans[rIdx] ?? []
+              return (
+                <tr key={rIdx} className="group">
+                  {/* 行号 + 行 ⋮ 菜单 */}
+                  <td
+                    className={cn(
+                      'sticky left-0 z-10 w-9 border-b border-r border-border bg-muted/30 p-1 text-center align-middle',
                     )}
+                  >
+                    <div className="flex items-center justify-center gap-0.5">
+                      <span className="text-[10px] text-muted-foreground">{rIdx + 1}</span>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            aria-label={`行 ${rIdx + 1} 菜单`}
+                            className="rounded p-0.5 text-muted-foreground/70 hover:bg-muted hover:text-foreground"
+                          >
+                            <MoreVertical className="size-3" />
+                          </button>
+                        </DropdownMenuTrigger>
+                      <DropdownMenuContent align="start" className="w-44">
+                        <DropdownMenuLabel className="text-xs text-muted-foreground">
+                          第 {rIdx + 1} 行
+                        </DropdownMenuLabel>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onClick={() => moveRow(rIdx, -1)}
+                          disabled={rIdx === 0}
+                        >
+                          <ArrowUp className="size-3.5" /> 上移
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => moveRow(rIdx, 1)}
+                          disabled={rIdx === grid.rows.length - 1}
+                        >
+                          <ArrowDown className="size-3.5" /> 下移
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => copyRow(rIdx)}>
+                          <Copy className="size-3.5" /> 复制行
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={() => addRowAt(rIdx, 0)}
+                        >
+                          <Plus className="size-3.5" /> 上方加行
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => addRowAt(rIdx, 1)}>
+                          <Plus className="size-3.5" /> 下方加行
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          onClick={() => delRow(rIdx)}
+                          className="text-destructive focus:text-destructive"
+                        >
+                          <Trash2 className="size-3.5" /> 删除行
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                    </div>
                   </td>
-                ))}
-              </tr>
-            ))}
+                  {grid.head.map((_, ci) => {
+                    const span = spanRow[ci]
+                    const isFrozen = grid.freezeFirstCol && ci === 0
+                    const isEditing = editing && editing[0] === rIdx && editing[1] === ci
+                    const isSelected = sel.has(cellKey(rIdx, ci))
+                    // 被覆盖的单元格不渲染（colspan/rowspan 占位）
+                    if (!span) {
+                      return (
+                        <td
+                          key={ci}
+                          className={cn(
+                            'border-b border-r border-border/50 p-0',
+                            isFrozen && 'sticky z-10',
+                            isFrozen && (ci === 0 ? 'left-9' : 'left-0'),
+                          )}
+                          aria-hidden
+                        />
+                      )
+                    }
+                    return (
+                      <td
+                        key={ci}
+                        colSpan={span.colspan > 1 ? span.colspan : undefined}
+                        rowSpan={span.rowspan > 1 ? span.rowspan : undefined}
+                        className={cn(
+                          'relative border-b border-r border-border/50 p-0 align-top',
+                          isFrozen && 'sticky z-10',
+                          isFrozen && (ci === 0 ? 'left-9' : 'left-0'),
+                          isSelected
+                            ? 'bg-primary/10 ring-1 ring-inset ring-primary/40'
+                            : 'hover:bg-muted/30',
+                        )}
+                        onClick={(e) => onCellClick(rIdx, ci, e)}
+                      >
+                        {isEditing ? (
+                          <textarea
+                            ref={editRef}
+                            value={grid.rows[rIdx][ci] ?? ''}
+                            onChange={(e) => setCellText(rIdx, ci, e.target.value)}
+                            onBlur={() => setEditing(null)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter' && !e.shiftKey) {
+                                e.preventDefault()
+                                setEditing(null)
+                              }
+                              if (e.key === 'Escape') {
+                                e.preventDefault()
+                                setEditing(null)
+                              }
+                            }}
+                            aria-label={`单元格 ${rIdx + 1}-${ci + 1}`}
+                            rows={1}
+                            className={cn(
+                              'block w-full resize-y bg-transparent px-2 py-1.5 text-xs outline-none',
+                              grid.headerRow && rIdx === -1 && 'font-semibold',
+                            )}
+                          />
+                        ) : (
+                          <div
+                            className={cn(
+                              'min-h-9 cursor-text px-2 py-1.5 text-xs',
+                              grid.aligns[ci] === 'center' && 'text-center',
+                              grid.aligns[ci] === 'right' && 'text-right',
+                              span.colspan > 1 || span.rowspan > 1
+                                ? 'bg-emerald-50/40 dark:bg-emerald-500/5'
+                                : '',
+                            )}
+                            // 单元格内 markdown inline 渲染（只读预览，编辑时切 textarea）
+                            dangerouslySetInnerHTML={{
+                              __html:
+                                renderCellPreview(grid.rows[rIdx][ci] ?? '') ||
+                                '<span class="text-muted-foreground/40">点击编辑</span>',
+                            }}
+                          />
+                        )}
+                        {/* 单元格 ⋮ 菜单（右上角） */}
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={`单元格 ${rIdx + 1}-${ci + 1} 菜单`}
+                              className="absolute right-0.5 top-0.5 rounded p-0.5 text-muted-foreground/0 transition-colors group-hover:text-muted-foreground/60 hover:bg-muted hover:text-foreground"
+                            >
+                              <MoreVertical className="size-3" />
+                            </button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end" className="w-48">
+                            <DropdownMenuLabel className="text-xs text-muted-foreground">
+                              单元格 {rIdx + 1}-{ci + 1}
+                            </DropdownMenuLabel>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onClick={() => mergeRight(rIdx, ci)}
+                              disabled={ci >= cols - 1}
+                            >
+                              <Combine className="size-3.5" /> 向右合并
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() => mergeDown(rIdx, ci)}
+                              disabled={rIdx >= grid.rows.length - 1}
+                            >
+                              <Combine className="size-3.5 rotate-90" /> 向下合并
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() => splitCell(rIdx, ci)}
+                              disabled={!span || (span.colspan <= 1 && span.rowspan <= 1)}
+                            >
+                              <Split className="size-3.5" /> 拆分单元格
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onClick={() => {
+                                setEditing([rIdx, ci])
+                                setSel(new Set([cellKey(rIdx, ci)]))
+                              }}
+                            >
+                              <Pencil className="size-3.5" /> 编辑内容
+                            </DropdownMenuItem>
+                            <DropdownMenuItem
+                              onClick={() => {
+                                setCellText(rIdx, ci, '')
+                                toast.success('已清空')
+                              }}
+                            >
+                              <Eraser className="size-3.5" /> 清空内容
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onClick={() =>
+                                void navigator.clipboard
+                                  .writeText(grid.rows[rIdx][ci] ?? '')
+                                  .then(() => toast.success('单元格已复制'))
+                                  .catch(() => toast.error('复制失败'))
+                              }
+                            >
+                              <Copy className="size-3.5" /> 复制单元格
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </td>
+                    )
+                  })}
+                  {/* 末尾加行按钮（仅在该行显示） */}
+                  {displayIdx === 0 && (
+                    <td
+                      rowSpan={displayRows.length}
+                      className="sticky right-0 z-10 w-9 border-b border-border bg-muted/30 p-1 align-top"
+                    >
+                      <button
+                        type="button"
+                        aria-label="末尾加行"
+                        onClick={() => addRowAt(grid.rows.length - 1, 1)}
+                        className="flex size-7 items-center justify-center rounded-full text-emerald-600 hover:bg-emerald-500/10"
+                      >
+                        <Plus className="size-4" />
+                      </button>
+                    </td>
+                  )}
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>
-      <div className="flex gap-2">
-        <Button variant="outline" size="sm" className="h-8 rounded-full text-xs" onClick={addRow}>
+
+      {/* 底部加行 / 选中提示 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 rounded-full text-xs"
+          onClick={() => addRowAt(grid.rows.length - 1, 1)}
+        >
           <Plus className="size-3.5" /> 加行
         </Button>
-        <Button variant="outline" size="sm" className="h-8 rounded-full text-xs" onClick={addCol}>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 rounded-full text-xs"
+          onClick={() => addColAt(cols - 1, 1)}
+        >
           <Plus className="size-3.5" /> 加列
         </Button>
+        {sel.size > 0 && (
+          <span className="text-[11px] text-muted-foreground">
+            已选 {sel.size} 格 · Shift+点选多格 · 点 ⋮ 单元格菜单
+          </span>
+        )}
       </div>
     </div>
   )
@@ -222,6 +1477,54 @@ const SYMBOLS: { label: string; insert: string }[] = [
   { label: '→', insert: '\\to' },
   { label: '∈', insert: '\\in' },
   { label: '化学', insert: '\\ce{H2O}' },
+]
+
+/** 常用公式模板（多行环境：矩阵 / 分段函数 / 方程组 / 化学反应方程式等） */
+const TEMPLATES: { label: string; insert: string; desc?: string }[] = [
+  {
+    label: '2×2 矩阵',
+    insert: '\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}',
+    desc: '圆括号矩阵',
+  },
+  {
+    label: '3×3 矩阵',
+    insert: '\\begin{pmatrix} a_{11} & a_{12} & a_{13} \\\\ a_{21} & a_{22} & a_{23} \\\\ a_{31} & a_{32} & a_{33} \\end{pmatrix}',
+    desc: '圆括号矩阵',
+  },
+  {
+    label: '方括号矩阵',
+    insert: '\\begin{bmatrix} a & b \\\\ c & d \\end{bmatrix}',
+    desc: '中括号矩阵',
+  },
+  {
+    label: '行列式',
+    insert: '\\begin{vmatrix} a & b \\\\ c & d \\end{vmatrix}',
+    desc: '竖线行列式',
+  },
+  {
+    label: '分段函数',
+    insert: 'f(x) = \\begin{cases} x^2, & x > 0 \\\\ -x, & x \\le 0 \\end{cases}',
+    desc: 'cases 分段',
+  },
+  {
+    label: '方程组',
+    insert: '\\begin{cases} 2x + y = 5 \\\\ x - y = 1 \\end{cases}',
+    desc: 'cases 方程组',
+  },
+  {
+    label: '多行对齐',
+    insert: '\\begin{aligned} y &= (x+1)^2 \\\\ &= x^2 + 2x + 1 \\end{aligned}',
+    desc: 'aligned 推导',
+  },
+  {
+    label: '极限',
+    insert: '\\lim_{x \\to 0} \\frac{\\sin x}{x} = 1',
+  },
+  {
+    label: '化学反应',
+    insert: '\\ce{2H2 + O2 -> 2H2O}',
+    desc: 'mhchem 化学方程式',
+  },
 ]
 
 function FormulaEditor({
@@ -292,6 +1595,20 @@ function FormulaEditor({
             className="shrink-0 rounded-lg border border-border px-2.5 py-1.5 text-xs transition-colors hover:bg-muted"
           >
             {s.label}
+          </button>
+        ))}
+      </div>
+      {/* 模板（多行环境：矩阵 / 分段 / 方程组 / 化学反应） */}
+      <div className="flex flex-wrap gap-1.5">
+        {TEMPLATES.map((t) => (
+          <button
+            key={t.label}
+            type="button"
+            title={t.desc}
+            onClick={() => insertSymbol(t.insert)}
+            className="shrink-0 rounded-lg border border-emerald-400/60 bg-emerald-50/40 px-2.5 py-1.5 text-xs text-emerald-800 transition-colors hover:bg-emerald-100 dark:border-emerald-500/40 dark:bg-emerald-500/10 dark:text-emerald-300"
+          >
+            {t.label}
           </button>
         ))}
       </div>
@@ -3679,7 +4996,7 @@ export function MediaEditDialog({
 }) {
   const [tab, setTab] = React.useState<EditTab>('visual')
   const [src, setSrc] = React.useState('')
-  const [grid, setGrid] = React.useState<TableGrid | null>(null)
+  const [grid, setGrid] = React.useState<RichTableGrid | null>(null)
   const [tree, setTree] = React.useState<MindNode | null>(null)
   const [flowDoc, setFlowDoc] = React.useState<FlowDoc | null>(null)
   const [flowWarn, setFlowWarn] = React.useState<string | null>(null)
@@ -3687,7 +5004,12 @@ export function MediaEditDialog({
   // 容错 + AI
   const [check, setCheck] = React.useState<CheckState>({ status: 'ok' })
   const [forceOriginal, setForceOriginal] = React.useState(false)
-  const [fix, setFix] = React.useState<{ loading: boolean; code: string | null } | null>(null)
+  const [fix, setFix] = React.useState<{
+    loading: boolean
+    code: string | null
+    /** 来源标签：'fix' = AI 修复语法错误；'ai' = AI 助理生成代码（自动填入审批） */
+    source?: 'fix' | 'ai'
+  } | null>(null)
   const [applying, setApplying] = React.useState(false)
   const [aiOpen, setAiOpen] = React.useState(false)
   const checkGenRef = React.useRef(0)
@@ -3739,7 +5061,7 @@ export function MediaEditDialog({
     setCheck({ status: 'ok' })
     setFlowWarn(null)
     if (mediaRef.kind === 'table') {
-      setGrid(parseTable(mediaRef.src))
+      setGrid(parseRichTable(mediaRef.src))
       setTree(null)
       setFlowDoc(null)
     } else if (mediaRef.kind === 'mermaid' && isMindmap(mediaRef.src)) {
@@ -3815,7 +5137,7 @@ export function MediaEditDialog({
   /** 外部写入新代码（AI 助理应用 / AI 修复接纳）→ 重新解析可视化结构 */
   const reparseVisual = (code: string) => {
     if (ref.kind === 'table') {
-      setGrid(parseTable(code))
+      setGrid(parseRichTable(code))
     } else if (ref.kind === 'mermaid') {
       const t = parseMindmap(code)
       if (t) {
@@ -3835,7 +5157,7 @@ export function MediaEditDialog({
     reparseVisual(code)
     const can =
       ref.kind === 'table'
-        ? !!parseTable(code)
+        ? !!parseRichTable(code)
         : ref.kind === 'mermaid'
           ? !!(parseMindmap(code) || parseFlowDoc(code))
           : ref.kind === 'formula' || ref.kind === 'svg' || ref.kind === 'html'
@@ -3854,10 +5176,10 @@ export function MediaEditDialog({
     toast.success('已格式化（块级元素缩进重排）')
   }
 
-  /** AI 修复语法错误（结果先预览，接纳 / 撤销） */
+  /** AI 修复语法错误（结果先预览，接纳 / 撤销 / 仍用原文） */
   const startFix = async (errMsg: string) => {
     if (fix?.loading) return
-    setFix({ loading: true, code: null })
+    setFix({ loading: true, code: null, source: 'fix' })
     try {
       const res = await fetch('/api/media-ai', {
         method: 'POST',
@@ -3875,11 +5197,18 @@ export function MediaEditDialog({
       const data = (await res.json()) as { code?: string }
       const code = typeof data.code === 'string' ? data.code : ''
       if (!code.trim()) throw new Error('AI 返回为空')
-      setFix({ loading: false, code })
+      setFix({ loading: false, code, source: 'fix' })
     } catch (e) {
       setFix(null)
       toast.error('AI 修复失败：' + (e instanceof Error ? e.message : '未知错误'))
     }
+  }
+
+  /** AI 助理生成代码 → 自动填入预览审批区（不直接覆盖编辑器源码） */
+  const previewFromAi = (code: string) => {
+    if (!code.trim()) return
+    setFix({ loading: false, code, source: 'ai' })
+    toast.success('AI 代码已填入预览，请审核后接纳')
   }
 
   const acceptFix = () => {
@@ -3888,7 +5217,9 @@ export function MediaEditDialog({
     setFix(null)
     setForceOriginal(false)
     reparseVisual(fix.code)
-    toast.success('已应用 AI 修复代码（校验将自动重跑）')
+    toast.success(
+      fix.source === 'ai' ? '已应用 AI 助理代码（校验将自动重跑）' : '已应用 AI 修复代码（校验将自动重跑）',
+    )
   }
 
   /**
@@ -3908,7 +5239,7 @@ export function MediaEditDialog({
     if (applying) return
     let newSrc = src
     if (activeTab === 'visual') {
-      if (ref.kind === 'table' && grid) newSrc = serializeTable(grid)
+      if (ref.kind === 'table' && grid) newSrc = serializeRichTable(grid)
       else if (ref.kind === 'mermaid' && tree) newSrc = serializeMindmap(tree)
       else if (ref.kind === 'mermaid' && flowDoc) newSrc = serializeFlowDoc(flowDoc)
     }
@@ -4033,49 +5364,92 @@ export function MediaEditDialog({
             </div>
           )}
 
-          {/* AI 修复预览（接纳 / 撤销） */}
+          {/* AI 修复 / 助理代码预览（接纳 / 撤销 / 仍用原文） */}
           {fix && (
-            <div className="rounded-xl border border-emerald-300 bg-emerald-50/70 p-3 dark:border-emerald-500/40 dark:bg-emerald-500/10">
+            <div className="flex flex-col gap-2 rounded-xl border border-emerald-300 bg-emerald-50/70 p-3 dark:border-emerald-500/40 dark:bg-emerald-500/10">
               {fix.loading ? (
                 <p className="flex items-center gap-2 text-xs text-emerald-800 dark:text-emerald-300">
-                  <Loader2 className="size-4 animate-spin" /> AI 正在修复语法错误…
+                  <Loader2 className="size-4 animate-spin" /> AI 正在生成代码…
                 </p>
               ) : (
                 fix.code != null && (
                   <>
-                    <p className="text-xs font-medium text-emerald-800 dark:text-emerald-300">
-                      AI 修复建议（先预览，再决定）
-                    </p>
-                    <div className="mt-2 max-h-40 overflow-auto rounded-lg bg-background p-2">
-                      <React.Suspense
-                        fallback={<p className="py-2 text-center text-xs text-muted-foreground">渲染中…</p>}
-                      >
-                        <RichContentLazy content={renderableOf(asMediaKind(ref.kind), fix.code)} />
-                      </React.Suspense>
+                    <div className="flex items-center gap-1.5 text-xs font-medium text-emerald-800 dark:text-emerald-300">
+                      <Sparkles className="size-3.5" />
+                      {fix.source === 'ai'
+                        ? 'AI 助理代码（已自动填入预览，请审核）'
+                        : 'AI 修复建议（先预览，再决定）'}
                     </div>
-                    <details className="mt-1.5">
-                      <summary className="cursor-pointer text-[11px] text-muted-foreground">
+
+                    {/* 对比预览：原文（灰） vs 修复后（高亮）；小屏单列堆叠 */}
+                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                      <div className="min-w-0 rounded-lg border border-border bg-muted/30 p-2">
+                        <p className="mb-1 text-[11px] text-muted-foreground">原文（当前编辑器）</p>
+                        <div className="max-h-[40vh] overflow-auto rounded bg-background/60 p-2 opacity-70">
+                          <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">
+                            {src || '（空）'}
+                          </pre>
+                        </div>
+                      </div>
+                      <div className="min-w-0 rounded-lg border border-emerald-400 bg-background p-2 ring-1 ring-emerald-400/40">
+                        <p className="mb-1 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">
+                          修复后预览
+                        </p>
+                        <div className="max-h-[40vh] overflow-auto rounded bg-background p-2">
+                          <React.Suspense
+                            fallback={
+                              <p className="py-2 text-center text-xs text-muted-foreground">渲染中…</p>
+                            }
+                          >
+                            {/* 公式 / mermaid / svg / html / table 均经 renderableOf 包装；
+                                KaTeX 矩阵 / 化学式等扩展由 rich-content 同源渲染 */}
+                            <RichContentLazy
+                              content={renderableOf(asMediaKind(ref.kind), fix.code)}
+                            />
+                          </React.Suspense>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* 修复后源码（可折叠；宽内容横向滚动不被截断） */}
+                    <details className="group">
+                      <summary className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground">
+                        <ChevronRight className="size-3 transition-transform group-open:rotate-90" />
                         查看修复后源码
                       </summary>
-                      <pre className="mt-1 max-h-32 overflow-auto rounded-lg bg-muted/50 p-2 font-mono text-[11px]">
+                      <pre className="mt-1 max-h-32 overflow-auto rounded-lg bg-muted/60 p-2 font-mono text-[11px] leading-relaxed">
                         {fix.code}
                       </pre>
                     </details>
-                    <div className="mt-2 flex gap-2">
+
+                    {/* 操作按钮（接纳 / 撤销 / 仍用原文）固定底部不挡内容；小屏堆叠 */}
+                    <div className="flex flex-col gap-2 border-t border-emerald-300/60 pt-2 sm:flex-row sm:items-center sm:justify-end sm:gap-2 sm:border-t-0 sm:pt-0">
                       <Button
                         size="sm"
-                        className="h-8 rounded-full bg-emerald-600 px-4 text-xs font-medium text-white hover:bg-emerald-700"
+                        className="h-9 rounded-full bg-emerald-600 px-4 text-xs font-medium text-white hover:bg-emerald-700"
                         onClick={acceptFix}
                       >
-                        <Check className="size-3.5" /> 接纳
+                        <Check className="size-3.5" /> 接纳应用到编辑器
                       </Button>
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-8 rounded-full px-4 text-xs"
+                        className="h-9 rounded-full px-4 text-xs"
                         onClick={() => setFix(null)}
                       >
                         <Undo2 className="size-3.5" /> 撤销
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-9 rounded-full px-4 text-xs text-muted-foreground"
+                        onClick={() => {
+                          setFix(null)
+                          setForceOriginal(true)
+                          toast.info('已保留原文')
+                        }}
+                      >
+                        仍用原文
                       </Button>
                     </div>
                   </>
@@ -4197,6 +5571,7 @@ export function MediaEditDialog({
         kind={asMediaKind(ref.kind)}
         currentCode={src}
         onApply={applyAiCode}
+        onPreview={previewFromAi}
       />
     </>
   )

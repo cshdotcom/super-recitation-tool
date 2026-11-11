@@ -10,9 +10,18 @@
 //   • image     html-to-image 渲染隐藏 DOM（复刻气泡样式，浅色固定主题）→ PNG 下载
 //   • clipboard Markdown 文本复制到剪贴板
 //   • json      结构化 JSON（不含 dataURL 本体，仅记录张数）
+// 导出选项 ExportOpts（默认全开，可按需关闭）：
+//   includeImages  是否包含图片（dataURL 内嵌）
+//   mdMode         MD 富媒体形态：source=源码 / html=内联 HTML
+//   includeMedia   是否包含富媒体（音频/视频引用；图片由 includeImages 决定）
+//   includeMarks   是否包含富文本标记（加粗/高亮/挖空/样式指令 等）
+//   includeMeta    是否包含元数据（导出时间/标题/消息计数）
+//   onlyUserMessages 只导用户消息（true=只用户；false=用户+AI）
 // 输入支持单对话消息数组或多对话分节（批量导出合并文档）。
 
 import { toast } from 'sonner'
+
+import { stripMediaToPlaceholder, stripRichMarks } from './export-utils'
 
 // ---------- 类型 ----------
 
@@ -37,11 +46,25 @@ export type ExportFormat = 'md' | 'html' | 'txt' | 'pdf' | 'image' | 'clipboard'
 
 export interface ExportOpts {
   format: ExportFormat
-  /** 是否包含图片（dataURL 内嵌）。 */
-  includeImages: boolean
-  /** MD 的富媒体形态：source=源码原样 / html=包成内联 HTML。 */
-  mdMode: 'source' | 'html'
+  /** 是否包含图片（dataURL 内嵌）。默认 true（undefined 视为 true）。 */
+  includeImages?: boolean
+  /** MD 的富媒体形态：source=源码原样 / html=包成内联 HTML。默认 'source'。 */
+  mdMode?: 'source' | 'html'
+  /** 是否包含富媒体（音频/视频引用；图片由 includeImages 决定）。默认 true。 */
+  includeMedia?: boolean
+  /** 是否包含富文本标记（加粗、高亮、挖空、样式指令 等）。默认 true。 */
+  includeMarks?: boolean
+  /** 是否包含元数据（导出时间/标题/消息计数）。默认 true。 */
+  includeMeta?: boolean
+  /** 只导用户消息（true=只用户；false/undefined=用户+AI）。 */
+  onlyUserMessages?: boolean
 }
+
+/** 导出选项中影响「内容」的子集（messagesToMarkdown/Text/HtmlDoc/Json 共用）。 */
+export type ConversationContentOpts = Pick<
+  ExportOpts,
+  'includeImages' | 'mdMode' | 'includeMedia' | 'includeMarks' | 'includeMeta' | 'onlyUserMessages'
+>
 
 export const EXPORT_FORMAT_META: {
   value: ExportFormat
@@ -205,49 +228,78 @@ export function richBlocksToInlineHtml(md: string): string {
   return out.join('\n')
 }
 
+// ---------- 内容预处理：富文本/富媒体/消息筛选（按 ExportOpts） ----------
+
+/** 按 opts 处理单条消息正文：先剥富文本标记，再去富媒体占位，最后按 mdMode 包内联 HTML。 */
+function prepareMessageContent(content: string, opts: ConversationContentOpts): string {
+  let s = String(content ?? '')
+  if (opts.includeMarks === false) s = stripRichMarks(s)
+  if (opts.includeMedia === false) s = stripMediaToPlaceholder(s)
+  if (opts.mdMode === 'html') s = richBlocksToInlineHtml(s)
+  return s
+}
+
+/** 按 onlyUserMessages 过滤消息；空对话节自动剔除（避免空 ### 标题）。 */
+function filterSections(
+  sections: ExportSection[],
+  opts: { onlyUserMessages?: boolean },
+): ExportSection[] {
+  if (opts.onlyUserMessages !== true) return sections
+  return sections
+    .map((sec) => ({ ...sec, messages: sec.messages.filter((m) => m.role === 'user') }))
+    .filter((sec) => sec.messages.length > 0)
+}
+
 // ---------- Markdown ----------
 
 export function messagesToMarkdown(
   input: ExportMessage[] | ExportSection[],
-  opts: Pick<ExportOpts, 'includeImages' | 'mdMode'>,
+  opts: ConversationContentOpts,
   docTitle?: string,
 ): string {
-  const { single, sections } = normalizeSections(input)
+  const { single, sections: rawSections } = normalizeSections(input)
+  const sections = filterSections(rawSections, opts)
+  const incImg = opts.includeImages !== false // 默认 true
+  const incMeta = opts.includeMeta !== false // 默认 true
   const now = new Date().toLocaleString('zh-CN', { hour12: false })
   const lines: string[] = []
 
-  if (single) {
-    const sec = sections[0]
-    lines.push(`# ${docTitle || sec.title || 'AI 对话'}`)
-    lines.push('')
-    if (sec.type) lines.push(`- 类型：${sec.type}`)
-    lines.push(`- 导出时间：${now}`)
-    lines.push('')
-    lines.push('---')
-    lines.push('')
-  } else {
-    lines.push(`# ${docTitle || `AI 对话导出（${sections.length} 个）`}`)
-    lines.push('')
-    lines.push(`- 导出时间：${now}`)
-    lines.push('')
-    lines.push('---')
+  if (incMeta) {
+    if (single) {
+      const sec = sections[0] ?? { title: '', messages: [] }
+      lines.push(`# ${docTitle || sec.title || 'AI 对话'}`)
+      lines.push('')
+      if (sec.type) lines.push(`- 类型：${sec.type}`)
+      lines.push(`- 导出时间：${now}`)
+      lines.push('')
+      lines.push('---')
+      lines.push('')
+    } else {
+      lines.push(`# ${docTitle || `AI 对话导出（${sections.length} 个）`}`)
+      lines.push('')
+      lines.push(`- 导出时间：${now}`)
+      lines.push('')
+      lines.push('---')
+      lines.push('')
+    }
+  } else if (!docTitle) {
+    // 无元数据但仍要起一行作为正文起点，避免最首条消息紧贴 markdown 头部
     lines.push('')
   }
 
   for (const sec of sections) {
-    if (!single) {
+    if (!single && incMeta) {
       lines.push(`## ${sec.title || '未命名对话'}`)
       lines.push('')
     }
     const msgHead = single ? '##' : '###'
     for (const m of sec.messages) {
-      const time = m.createdAt ? `（${ts(m.createdAt)}）` : ''
+      const time = m.createdAt && incMeta ? `（${ts(m.createdAt)}）` : ''
       lines.push(`${msgHead} ${roleZh(m.role)}${time}`)
       lines.push('')
-      const body =
-        opts.mdMode === 'html' ? richBlocksToInlineHtml(m.content) : m.content
+      const body = prepareMessageContent(m.content, opts)
       lines.push(body.trim() || '（无文字内容）')
-      if (opts.includeImages && m.images && m.images.length > 0) {
+      if (incImg && opts.includeMedia !== false && m.images && m.images.length > 0) {
         lines.push('')
         m.images.forEach((src, idx) => {
           lines.push(`![附图 ${idx + 1}](${src})`)
@@ -255,7 +307,7 @@ export function messagesToMarkdown(
       }
       lines.push('')
     }
-    if (!single) {
+    if (!single && incMeta) {
       lines.push('---')
       lines.push('')
     }
@@ -268,22 +320,34 @@ export function messagesToMarkdown(
 export function messagesToText(
   input: ExportMessage[] | ExportSection[],
   docTitle?: string,
+  opts: ConversationContentOpts = {},
 ): string {
-  const { single, sections } = normalizeSections(input)
+  const { single, sections: rawSections } = normalizeSections(input)
+  const sections = filterSections(rawSections, opts)
+  const incMeta = opts.includeMeta !== false
+  const incImg = opts.includeImages !== false
+  const incMedia = opts.includeMedia !== false
   const lines: string[] = []
-  const head = docTitle || (single ? sections[0].title : '') || 'AI 对话'
-  lines.push(head)
-  lines.push(`导出时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`)
-  lines.push('')
+  if (incMeta) {
+    const head = docTitle || (single ? (sections[0]?.title ?? '') : '') || 'AI 对话'
+    lines.push(head)
+    lines.push(`导出时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`)
+    lines.push('')
+  }
   for (const sec of sections) {
-    if (!single) {
+    if (!single && incMeta) {
       lines.push(`========== ${sec.title || '未命名对话'} ==========`)
       lines.push('')
     }
     for (const m of sec.messages) {
       lines.push(`[${roleZh(m.role)}]`)
-      lines.push(m.content.trim() || '（无文字内容）')
-      if (m.images && m.images.length > 0) {
+      const body = prepareMessageContent(m.content, {
+        ...opts,
+        // TXT 不需要 mdMode 包 HTML，强制 source 形态
+        mdMode: 'source',
+      })
+      lines.push(body.trim() || '（无文字内容）')
+      if (incImg && incMedia && m.images && m.images.length > 0) {
         lines.push(`（附图 ${m.images.length} 张）`)
       }
       lines.push('')
@@ -294,21 +358,36 @@ export function messagesToText(
 
 // ---------- JSON ----------
 
-export function messagesToJson(input: ExportMessage[] | ExportSection[]): string {
-  const { single, sections } = normalizeSections(input)
+export function messagesToJson(
+  input: ExportMessage[] | ExportSection[],
+  opts: ConversationContentOpts = {},
+): string {
+  const { single, sections: rawSections } = normalizeSections(input)
+  const sections = filterSections(rawSections, opts)
+  const incMeta = opts.includeMeta !== false
   return JSON.stringify(
     {
-      title: single ? sections[0].title || 'AI 对话' : `AI 对话导出（${sections.length} 个）`,
-      exportedAt: new Date().toISOString(),
+      ...(incMeta
+        ? {
+            title: single
+              ? sections[0]?.title || 'AI 对话'
+              : `AI 对话导出（${sections.length} 个）`,
+            exportedAt: new Date().toISOString(),
+          }
+        : {}),
       conversations: sections.map((sec) => ({
-        title: sec.title,
-        type: sec.type ?? '',
-        messages: sec.messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-          ...(m.images && m.images.length > 0 ? { imageCount: m.images.length } : {}),
-          createdAt: m.createdAt ?? '',
-        })),
+        ...(incMeta ? { title: sec.title, type: sec.type ?? '' } : {}),
+        messages: sec.messages.map((m) => {
+          let content = m.content
+          if (opts.includeMarks === false) content = stripRichMarks(content)
+          if (opts.includeMedia === false) content = stripMediaToPlaceholder(content)
+          return {
+            role: m.role,
+            content,
+            ...(m.images && m.images.length > 0 ? { imageCount: m.images.length } : {}),
+            ...(incMeta ? { createdAt: m.createdAt ?? '' } : {}),
+          }
+        }),
       })),
     },
     null,
@@ -513,15 +592,25 @@ const FONT_STACK =
 /**
  * 完整独立 HTML 文档（内嵌样式，气泡风）。
  * variant：screen=浏览器查看 / print=打印(PDF) / image=图片渲染（固定宽度浅色）。
+ *
+ * opts.includeImages / includeMedia / includeMarks / includeMeta / onlyUserMessages
+ *   影响每条消息正文与图片内嵌；includeMeta=false 时省略 <h1> 与 <p.meta>。
  */
 export function messagesToHtmlDoc(
   input: ExportMessage[] | ExportSection[],
-  opts: Pick<ExportOpts, 'includeImages'>,
+  opts: ConversationContentOpts,
   variant: 'screen' | 'print' | 'image' = 'screen',
   docTitle?: string,
 ): string {
-  const { single, sections } = normalizeSections(input)
-  const title = docTitle || (single ? sections[0].title : `AI 对话导出（${sections.length} 个）`) || 'AI 对话'
+  const { single, sections: rawSections } = normalizeSections(input)
+  const sections = filterSections(rawSections, opts)
+  const incImg = opts.includeImages !== false
+  const incMedia = opts.includeMedia !== false
+  const incMeta = opts.includeMeta !== false
+  const title =
+    docTitle ||
+    (single ? (sections[0]?.title ?? '') : `AI 对话导出（${sections.length} 个）`) ||
+    'AI 对话'
   const width = variant === 'image' ? '720px' : 'max-width:720px'
   const bodyBg = variant === 'image' ? '#ffffff' : '#f8fafc'
   const printCss =
@@ -532,23 +621,25 @@ export function messagesToHtmlDoc(
       : ''
   const parts: string[] = []
   for (const sec of sections) {
-    if (!single) {
+    if (!single && incMeta) {
       parts.push(
         `<h2 style="margin:26px 0 10px;font-size:19px;border-left:4px solid #10b981;padding-left:10px">${escapeHtml(sec.title || '未命名对话')}</h2>`,
       )
     }
     for (const m of sec.messages) {
       const isUser = m.role === 'user'
-      const time = m.createdAt ? ts(m.createdAt) : ''
-      const imgs =
-        opts.includeImages && m.images && m.images.length > 0
-          ? `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">${m.images
-              .map(
-                (src) =>
-                  `<img src="${src}" alt="附图" style="max-width:180px;border-radius:10px;border:1px solid rgba(0,0,0,.08)" />`,
-              )
-              .join('')}</div>`
-          : ''
+      const time = m.createdAt && incMeta ? ts(m.createdAt) : ''
+      const showImgs = incImg && incMedia && m.images && m.images.length > 0
+      const imgs = showImgs
+        ? `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">${m.images!
+            .map(
+              (src) =>
+                `<img src="${src}" alt="附图" style="max-width:180px;border-radius:10px;border:1px solid rgba(0,0,0,.08)" />`,
+            )
+            .join('')}</div>`
+        : ''
+      // 正文：includeMarks/includeMedia 关时剥层；HTML 渲染统一用 mdToHtml（不包 mermaid 块）
+      const body = mdToHtml(prepareMessageContent(m.content, { ...opts, mdMode: 'source' }))
       parts.push(
         `<div class="msg" style="display:flex;flex-direction:column;align-items:${isUser ? 'flex-end' : 'flex-start'};margin:14px 0">` +
           `<div style="max-width:86%;padding:10px 14px;border-radius:16px;line-height:1.75;font-size:14.5px;${
@@ -556,7 +647,7 @@ export function messagesToHtmlDoc(
               ? 'background:#10b981;color:#fff;border-bottom-right-radius:6px'
               : 'background:#ffffff;color:#1f2937;border:1px solid #e5e7eb;border-bottom-left-radius:6px'
           }">` +
-          mdToHtml(m.content) +
+          body +
           imgs +
           `</div>` +
           (time
@@ -566,6 +657,9 @@ export function messagesToHtmlDoc(
       )
     }
   }
+  const headHtml = incMeta
+    ? `\n  <h1>${escapeHtml(title)}</h1>\n  <p class="meta">导出时间：${new Date().toLocaleString('zh-CN', { hour12: false })} · 由背书吧导出</p>`
+    : ''
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -585,9 +679,7 @@ export function messagesToHtmlDoc(
 </style>
 </head>
 <body>
-<main>
-  <h1>${escapeHtml(title)}</h1>
-  <p class="meta">导出时间：${new Date().toLocaleString('zh-CN', { hour12: false })} · 由背书吧导出</p>
+<main>${headHtml}
   ${parts.join('\n')}
 </main>
 </body>
@@ -757,11 +849,11 @@ export async function exportMessages(
         break
       }
       case 'txt':
-        downloadTextFile(`${name}.txt`, messagesToText(input), 'text/plain')
+        downloadTextFile(`${name}.txt`, messagesToText(input, undefined, opts), 'text/plain')
         toast.success('已导出 TXT')
         break
       case 'json':
-        downloadTextFile(`${name}.json`, messagesToJson(input), 'application/json')
+        downloadTextFile(`${name}.json`, messagesToJson(input, opts), 'application/json')
         toast.success('已导出 JSON')
         break
       case 'pdf': {

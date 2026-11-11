@@ -41,6 +41,7 @@ import {
   Printer,
   QrCode,
   Search,
+  Settings2,
   Share2,
   Sparkles,
   Square,
@@ -54,17 +55,21 @@ import { cn } from '@/lib/utils'
 import { RichContent } from '@/components/recitation/rich-content'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import {
+  applyCardExportOpts,
   escapeHtml,
   mediaRefsToText,
   printHtmlDocument,
   renderMarkdown,
+  type CardExportOpts,
 } from '@/lib/export-utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Switch } from '@/components/ui/switch'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -257,6 +262,27 @@ function downloadText(filename: string, text: string, mime: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
+/** 试卷导出选项（与 CardExportOpts 同语义；试卷导出独立 localStorage 持久化）。 */
+type PaperExportOpts = CardExportOpts
+
+const PAPER_OPTS_KEY = 'bb-export-paper-opts'
+const DEFAULT_PAPER_OPTS: PaperExportOpts = { includeMedia: true, includeMarks: true }
+
+function loadPaperOpts(): PaperExportOpts {
+  if (typeof window === 'undefined') return DEFAULT_PAPER_OPTS
+  try {
+    const raw = window.localStorage.getItem(PAPER_OPTS_KEY)
+    if (!raw) return DEFAULT_PAPER_OPTS
+    const p = JSON.parse(raw) as Partial<PaperExportOpts>
+    return {
+      includeMedia: typeof p.includeMedia === 'boolean' ? p.includeMedia : true,
+      includeMarks: typeof p.includeMarks === 'boolean' ? p.includeMarks : true,
+    }
+  } catch {
+    return DEFAULT_PAPER_OPTS
+  }
+}
+
 function safeFilename(s: string): string {
   return (s.trim() || '试卷').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60)
 }
@@ -264,8 +290,10 @@ function safeFilename(s: string): string {
 /** 导出格式：md / txt / html / pdf（打印链路，浏览器「另存为 PDF」） */
 type PaperExportFormat = 'md' | 'txt' | 'html' | 'pdf'
 
-/** 单份试卷 → Markdown（试卷标题 + 题目 + 选项 + 答案 + 解析；富媒体保留源码原样） */
-function paperToMarkdown(p: PaperData): string {
+/** 单份试卷 → Markdown（试卷标题 + 题目 + 选项 + 答案 + 解析；富媒体保留源码原样）。
+ *  opts.includeMedia=false → 题目里的 ![](url)/[[audio|video:..]] 转文字占位
+ *  opts.includeMarks=false → 剥题目标记（加粗/高亮/挖空/样式指令）只留纯文字 */
+function paperToMarkdown(p: PaperData, opts: PaperExportOpts = {}): string {
   const head: string[] = [
     `# ${p.title}`,
     '',
@@ -275,33 +303,40 @@ function paperToMarkdown(p: PaperData): string {
   const body: string[] = []
   ;(p.items ?? []).forEach((it, i) => {
     body.push(`## ${i + 1}. [${TYPE_LABEL[it.type] ?? it.type ?? '题目'}]`)
-    body.push(it.question ?? '')
+    body.push(applyCardExportOpts(it.question ?? '', opts))
     if (Array.isArray(it.options) && it.options.length > 0) {
       body.push('')
-      it.options.forEach((o, j) => body.push(`${String.fromCharCode(65 + j)}. ${o}`))
+      it.options.forEach((o, j) =>
+        body.push(`${String.fromCharCode(65 + j)}. ${applyCardExportOpts(o, opts)}`),
+      )
     }
     body.push('')
-    body.push(`**答案：** ${it.answer ?? ''}`)
+    body.push(`**答案：** ${applyCardExportOpts(it.answer ?? '', opts)}`)
     if ((it.explanation ?? '').trim()) {
       body.push('')
-      body.push(`**解析：** ${it.explanation ?? ''}`)
+      body.push(`**解析：** ${applyCardExportOpts(it.explanation ?? '', opts)}`)
     }
     body.push('')
   })
   return [...head, ...body].join('\n')
 }
 
-/** 单份试卷 → 纯文本（音视频引用转为全角占位，不裸露 [[audio:]] 语法） */
-function paperToText(p: PaperData): string {
+/** 单份试卷 → 纯文本（音视频引用转为全角占位，不裸露 [[audio:]] 语法）。
+ *  TXT 总是把音视频 [[..]] 转 ［音频/视频］ 占位（与历史行为一致，避免裸露语法）；
+ *  opts.includeMedia=false 额外把图片 ![](url) 也转 ［图片］ 占位；
+ *  opts.includeMarks=false 剥题目标记。 */
+function paperToText(p: PaperData, opts: PaperExportOpts = {}): string {
+  // 先按 opts 处理（剥标记/可选剥图片），再统一把音视频引用转占位（TXT 永不裸露 [[..]]）
+  const transform = (s: string) => mediaRefsToText(applyCardExportOpts(s, opts))
   const lines: string[] = [`试卷：${p.title}`, `共 ${p.count} 题 · ${formatDate(p.createdAt)}`, '']
   ;(p.items ?? []).forEach((it, i) => {
     lines.push(`第${i + 1}题 [${TYPE_LABEL[it.type] ?? it.type ?? '题目'}]`)
-    lines.push(mediaRefsToText(it.question ?? ''))
+    lines.push(transform(it.question ?? ''))
     if (Array.isArray(it.options) && it.options.length > 0) {
-      it.options.forEach((o, j) => lines.push(`${String.fromCharCode(65 + j)}. ${mediaRefsToText(o)}`))
+      it.options.forEach((o, j) => lines.push(`${String.fromCharCode(65 + j)}. ${transform(o)}`))
     }
-    lines.push(`答案：${mediaRefsToText(it.answer ?? '')}`)
-    if ((it.explanation ?? '').trim()) lines.push(`解析：${mediaRefsToText(it.explanation ?? '')}`)
+    lines.push(`答案：${transform(it.answer ?? '')}`)
+    if ((it.explanation ?? '').trim()) lines.push(`解析：${transform(it.explanation ?? '')}`)
     lines.push('')
   })
   return lines.join('\n')
@@ -349,10 +384,12 @@ body { margin: 0; background: #f5f5f2; color: #26262a; font-family: -apple-syste
   .doc-footer { margin-top: 24px; }
 }`
 
-/** 单份试卷正文（标题 + meta + 题目：题号题型 + 题干 + 选项 + 答案 + 解析）。 */
+/** 单份试卷正文（标题 + meta + 题目：题号题型 + 题干 + 选项 + 答案 + 解析）。
+ *  exportOpts.includeMedia/includeMarks 同试卷导出选项；opts.headingTag/breakBefore 控排版。 */
 function paperSectionHtml(
   p: PaperData,
   opts: { headingTag?: 'h1' | 'h2'; breakBefore?: boolean } = {},
+  exportOpts: PaperExportOpts = {},
 ): string {
   const items = p.items ?? []
   const h = opts.headingTag ?? 'h1'
@@ -371,15 +408,16 @@ function paperSectionHtml(
           ? `<div class="opts">${it.options
               .map(
                 (o, j) =>
-                  `<p class="opt"><span class="key">${String.fromCharCode(65 + j)}.</span> ${escapeHtml(o)}</p>`,
+                  `<p class="opt"><span class="key">${String.fromCharCode(65 + j)}.</span> ${escapeHtml(applyCardExportOpts(o, exportOpts))}</p>`,
               )
               .join('')}</div>`
           : ''
-      const answer = (it.answer ?? '').trim()
-      const explanation = (it.explanation ?? '').trim()
+      const answer = applyCardExportOpts((it.answer ?? '').trim(), exportOpts)
+      const explanation = applyCardExportOpts((it.explanation ?? '').trim(), exportOpts)
+      const question = applyCardExportOpts(it.question ?? '', exportOpts)
       return `<section class="q">
   <h3><span class="no">第 ${i + 1} 题</span><span class="tp">${escapeHtml(TYPE_LABEL[it.type] ?? it.type ?? '题目')}</span></h3>
-  <div class="stem">${renderMarkdown(it.question ?? '')}</div>${optsHtml ? `\n  ${optsHtml}` : ''}${answer ? `\n  <div class="ans"><span class="lbl">答案</span><div class="val">${renderMarkdown(answer)}</div></div>` : ''}${explanation ? `\n  <div class="exp"><span class="lbl">解析</span><div class="val">${renderMarkdown(explanation)}</div></div>` : ''}
+  <div class="stem">${renderMarkdown(question)}</div>${optsHtml ? `\n  ${optsHtml}` : ''}${answer ? `\n  <div class="ans"><span class="lbl">答案</span><div class="val">${renderMarkdown(answer)}</div></div>` : ''}${explanation ? `\n  <div class="exp"><span class="lbl">解析</span><div class="val">${renderMarkdown(explanation)}</div></div>` : ''}
 </section>`
     })
     .join('\n')
@@ -419,14 +457,23 @@ ${sections}
 }
 
 /** 单份试卷 → 独立 HTML 文档。 */
-function buildPaperHtml(p: PaperData, opts: { autoPrint?: boolean } = {}): string {
-  return buildPaperHtmlDoc(paperSectionHtml(p), { docTitle: p.title, autoPrint: opts.autoPrint })
+function buildPaperHtml(
+  p: PaperData,
+  opts: { autoPrint?: boolean; exportOpts?: PaperExportOpts } = {},
+): string {
+  return buildPaperHtmlDoc(paperSectionHtml(p, {}, opts.exportOpts ?? {}), {
+    docTitle: p.title,
+    autoPrint: opts.autoPrint,
+  })
 }
 
 /** 多份试卷 → 合并 HTML 文档（每份试卷打印时另起一页）。 */
-function buildMergedPaperHtml(list: PaperData[], opts: { autoPrint?: boolean } = {}): string {
+function buildMergedPaperHtml(
+  list: PaperData[],
+  opts: { autoPrint?: boolean; exportOpts?: PaperExportOpts } = {},
+): string {
   const sections = list
-    .map((p, i) => paperSectionHtml(p, { headingTag: 'h2', breakBefore: i > 0 }))
+    .map((p, i) => paperSectionHtml(p, { headingTag: 'h2', breakBefore: i > 0 }, opts.exportOpts ?? {}))
     .join('\n')
   return buildPaperHtmlDoc(sections, {
     docTitle: `试卷合并导出（${list.length} 份）`,
@@ -435,8 +482,8 @@ function buildMergedPaperHtml(list: PaperData[], opts: { autoPrint?: boolean } =
 }
 
 /** 打印试卷（隐藏 iframe + A4 打印样式；打印窗口选「另存为 PDF」即得 PDF）。 */
-function printPaper(p: PaperData): void {
-  printHtmlDocument(buildPaperHtml(p, { autoPrint: true }))
+function printPaper(p: PaperData, exportOpts: PaperExportOpts = {}): void {
+  printHtmlDocument(buildPaperHtml(p, { autoPrint: true, exportOpts }))
 }
 
 // ---------- 主组件 ----------
@@ -469,6 +516,19 @@ export function PapersView({
   const [deleteId, setDeleteId] = React.useState<string | null>(null)
   const [batchDeleteOpen, setBatchDeleteOpen] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
+
+  // ---- 试卷导出选项（includeMedia/includeMarks）：挂载读 localStorage，变化时写回 ----
+  const [paperOpts, setPaperOpts] = React.useState<PaperExportOpts>(DEFAULT_PAPER_OPTS)
+  React.useEffect(() => {
+    setPaperOpts(loadPaperOpts())
+  }, [])
+  React.useEffect(() => {
+    try {
+      window.localStorage.setItem(PAPER_OPTS_KEY, JSON.stringify(paperOpts))
+    } catch {
+      /* 隐私模式忽略 */
+    }
+  }, [paperOpts])
 
   // ---- 分享（「已分享」标记 + 分享面板） ----
   const [paperShares, setPaperShares] = React.useState<Map<string, PaperShareInfo>>(new Map())
@@ -724,20 +784,24 @@ export function PapersView({
     const name = safeFilename(p.title)
     switch (fmt) {
       case 'md':
-        downloadText(`${name}.md`, paperToMarkdown(p), 'text/markdown;charset=utf-8')
+        downloadText(`${name}.md`, paperToMarkdown(p, paperOpts), 'text/markdown;charset=utf-8')
         toast.success('已导出 Markdown 文件')
         break
       case 'txt':
-        downloadText(`${name}.txt`, paperToText(p), 'text/plain;charset=utf-8')
+        downloadText(`${name}.txt`, paperToText(p, paperOpts), 'text/plain;charset=utf-8')
         toast.success('已导出 TXT 文件')
         break
       case 'html':
-        downloadText(`${name}.html`, buildPaperHtml(p), 'text/html;charset=utf-8')
+        downloadText(
+          `${name}.html`,
+          buildPaperHtml(p, { exportOpts: paperOpts }),
+          'text/html;charset=utf-8',
+        )
         toast.success('已导出 HTML 文件')
         break
       case 'pdf':
         toast.info('已打开打印窗口，选择「另存为 PDF」即可导出')
-        printPaper(p)
+        printPaper(p, paperOpts)
         break
     }
   }
@@ -750,7 +814,7 @@ export function PapersView({
     }
     const stamp = new Date().toISOString().slice(0, 10)
     if (fmt === 'md') {
-      const md = selectedPapers.map((p) => paperToMarkdown(p)).join('\n\n---\n\n')
+      const md = selectedPapers.map((p) => paperToMarkdown(p, paperOpts)).join('\n\n---\n\n')
       downloadText(
         `试卷夹_合并导出_${stamp}.md`,
         md,
@@ -760,13 +824,15 @@ export function PapersView({
     } else if (fmt === 'html') {
       downloadText(
         `试卷夹_合并导出_${stamp}.html`,
-        buildMergedPaperHtml(selectedPapers),
+        buildMergedPaperHtml(selectedPapers, { exportOpts: paperOpts }),
         'text/html;charset=utf-8',
       )
       toast.success(`已合并导出 ${selectedPapers.length} 份试卷（HTML）`)
     } else {
       toast.info('已打开打印窗口，选择「另存为 PDF」即可导出')
-      printHtmlDocument(buildMergedPaperHtml(selectedPapers, { autoPrint: true }))
+      printHtmlDocument(
+        buildMergedPaperHtml(selectedPapers, { autoPrint: true, exportOpts: paperOpts }),
+      )
     }
   }
 
@@ -980,6 +1046,8 @@ export function PapersView({
                       expanded={expandedId === p.id}
                       canPractice={!!onPractice}
                       shareInfo={paperShares.get(p.id) ?? null}
+                      paperOpts={paperOpts}
+                      onPaperOptsChange={setPaperOpts}
                       onToggleSelect={() => toggleSelect(p.id)}
                       onToggleExpand={() => setExpandedId(expandedId === p.id ? null : p.id)}
                       onPractice={(items) => onPractice?.(items ?? p.items, p.title)}
@@ -1032,6 +1100,7 @@ export function PapersView({
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
+              <PaperExportOptsPopover opts={paperOpts} onChange={setPaperOpts} />
               <AlertDialog open={batchDeleteOpen} onOpenChange={setBatchDeleteOpen}>
                 <Button
                   variant="outline"
@@ -1165,6 +1234,8 @@ function PaperCard({
   expanded,
   canPractice,
   shareInfo,
+  paperOpts,
+  onPaperOptsChange,
   onToggleSelect,
   onToggleExpand,
   onPractice,
@@ -1181,6 +1252,9 @@ function PaperCard({
   canPractice: boolean
   /** 该试卷已有的分享（null = 未分享） */
   shareInfo: PaperShareInfo | null
+  /** 试卷导出选项（includeMedia/includeMarks） */
+  paperOpts: PaperExportOpts
+  onPaperOptsChange: (v: PaperExportOpts) => void
   onToggleSelect: () => void
   onToggleExpand: () => void
   /** 开始练习：不传 items = 全部题目；传入 = 只练勾选的题 */
@@ -1454,7 +1528,7 @@ function PaperCard({
                 <Play className="size-4" strokeWidth={2} /> 练习所选（{sel.size}）
               </Button>
             )}
-            {/* 分享 + 导出格式按钮排：分享 / MD / TXT / HTML / PDF（打印） */}
+            {/* 分享 + 导出格式按钮排：分享 / MD / TXT / HTML / PDF（打印）/ 选项 */}
             <div className="flex w-full flex-wrap gap-2">
               <Button
                 variant="outline"
@@ -1492,6 +1566,7 @@ function PaperCard({
               >
                 <Printer className="size-4 shrink-0" strokeWidth={1.75} /> PDF
               </Button>
+              <PaperExportOptsPopover opts={paperOpts} onChange={onPaperOptsChange} />
             </div>
           </div>
         </div>
@@ -1515,6 +1590,71 @@ function RoundCheckbox({ checked }: { checked: boolean }) {
         <path d="M20 6 9 17l-5-5" />
       </svg>
     </span>
+  )
+}
+
+// ---------- 试卷导出选项 Popover（富媒体 / 富文本标记 开关，全局影响所有试卷导出） ----------
+function PaperExportOptsPopover({
+  opts,
+  onChange,
+  triggerClassName,
+}: {
+  opts: PaperExportOpts
+  onChange: (v: PaperExportOpts) => void
+  triggerClassName?: string
+}) {
+  return (
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label="试卷导出选项"
+          className={cn(
+            'flex h-11 shrink-0 items-center justify-center rounded-full border border-border bg-card px-3 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground',
+            triggerClassName,
+          )}
+        >
+          <Settings2 className="size-4" strokeWidth={1.75} />
+          <span className="ml-1">选项</span>
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="w-72 rounded-2xl p-0">
+        <div className="border-b border-border/60 px-4 py-3">
+          <p className="text-sm font-bold">试卷导出选项</p>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            影响所有试卷的 MD / TXT / HTML / PDF 导出
+          </p>
+        </div>
+        <div className="px-4 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">包含富媒体</p>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">图片 / 音频 / 视频</p>
+            </div>
+            <Switch
+              checked={opts.includeMedia !== false}
+              onCheckedChange={(v) => onChange({ ...opts, includeMedia: v })}
+              aria-label="包含富媒体"
+              className="data-[state=checked]:bg-emerald-600"
+            />
+          </div>
+        </div>
+        <div className="border-t border-border/60 px-4 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">包含富文本标记</p>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">加粗 / 高亮 / 挖空</p>
+            </div>
+            <Switch
+              checked={opts.includeMarks !== false}
+              onCheckedChange={(v) => onChange({ ...opts, includeMarks: v })}
+              aria-label="包含富文本标记"
+              className="data-[state=checked]:bg-emerald-600"
+            />
+          </div>
+        </div>
+      </PopoverContent>
+    </Popover>
   )
 }
 

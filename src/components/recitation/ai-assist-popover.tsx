@@ -3,8 +3,12 @@
 // AiAssistPopover — 富媒体编辑器的临时 AI 助理悬浮窗（右下角，非模态）。
 //   • 临时会话：消息只存组件 state（内存），关闭即清空，绝不落库
 //   • 上下文：每次发送都带当前媒体 kind + 最新代码（POST /api/media-ai）
-//   • AI 回复：代码块带「应用到编辑器」（写入编辑器源码并切回可视化继续编辑）
-//     / 复制；消息级「朗读」（/api/tts，401 或失败回退 speechSynthesis zh-CN）+ 复制
+//   • v2.7 AI 回复代码块默认自动填入「AI 修复预览」审批区（不直接覆盖编辑器），
+//     用户在主弹窗审批（接纳 / 撤销 / 仍用原文）后才写回编辑器源码；按钮
+//     「填入预览审核」可重新触发。代码块带 朗读（/api/tts → speechSynthesis 兜底）
+//     + 复制；消息级也有 朗读 + 复制
+//   • 「查看当前源码」面板（头部 Code2 按钮）：折叠展开编辑器 currentCode 只读，
+//     让用户/AI 都能看到现在编辑器里是什么
 //   • 语音输入：浏览器原生 webkitSpeechRecognition（zh-CN，实时中间结果），
 //     识别文字填入输入框（与 voice-input.tsx 的浏览器引擎同款逻辑）
 //   • 图片上传：≤2MB、canvas 压缩到 800px，以 dataURI 附到用户消息（气泡显示
@@ -13,13 +17,14 @@
 //   • 技能清单：生成 / 修改 / 解释 / 修复 / 优化 / 转换（SVG↔mermaid↔表格）
 //     一键填入指令模板
 // 实现说明：纯 createPortal 悬浮层（z-[80]，不遮罩、无焦点陷阱），打开时不
-// 打断宿主编辑器；点击外部不关闭（防误触丢会话），仅 X / 应用后关闭。宿主
+// 打断宿主编辑器；点击外部不关闭（防误触丢会话），仅 X / 关闭后清空。宿主
 // MediaEditDialog 通过 data-ai-assist 识别本层，点击/聚焦此处不会误关编辑器。
+//
 
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import {
-  Check,
+  Code2,
   Copy,
   ImagePlus,
   Loader2,
@@ -463,7 +468,7 @@ export function useChineseSpeech(): {
   return { speak, stop, speaking }
 }
 
-// ---------- AI 回复分段（提示词要求纯代码，但模型常带围栏/解释） ----------
+// ---------- AI 回复分段（提示词要求纯代码，但模型常带围栏 / 解释） ----------
 
 function splitCodeFences(text: string): Array<{ type: 'text' | 'code'; value: string }> {
   const out: Array<{ type: 'text' | 'code'; value: string }> = []
@@ -484,6 +489,15 @@ function splitCodeFences(text: string): Array<{ type: 'text' | 'code'; value: st
   return out
 }
 
+/** 提取文本中最后一个代码块（用于 AI 回复后自动填入预览审批区） */
+function extractLastCodeBlock(text: string): string | null {
+  const segs = splitCodeFences(text)
+  for (let i = segs.length - 1; i >= 0; i--) {
+    if (segs[i].type === 'code' && segs[i].value.trim()) return segs[i].value
+  }
+  return null
+}
+
 // ---------- 主组件 ----------
 
 export function AiAssistPopover({
@@ -492,6 +506,7 @@ export function AiAssistPopover({
   kind,
   currentCode,
   onApply,
+  onPreview,
 }: {
   open: boolean
   onOpenChange: (o: boolean) => void
@@ -499,8 +514,13 @@ export function AiAssistPopover({
   kind: MediaKind
   /** 当前编辑器内的最新源码（每次发送时取） */
   currentCode: string
-  /** 把 AI 生成的代码写入编辑器（宿主负责切回可视化 tab） */
+  /** 把 AI 生成的代码直接写入编辑器（宿主负责切回可视化 tab） — 仍保留作为兼容入口 */
   onApply: (code: string) => void
+  /**
+   * 把 AI 生成的代码填入「AI 修复预览」审批区（不直接覆盖编辑器）— v2.7 起默认流程。
+   * 若未提供则回退 onApply（直接写入编辑器）。
+   */
+  onPreview?: (code: string) => void
 }) {
   const [messages, setMessages] = React.useState<ChatMsg[]>([])
   const [input, setInput] = React.useState('')
@@ -514,6 +534,8 @@ export function AiAssistPopover({
   // 对话配置（补充指令 + 温度；localStorage 持久）
   const [cfgOpen, setCfgOpen] = React.useState(false)
   const [skillsOpen, setSkillsOpen] = React.useState(false)
+  /** 「查看当前源码」面板（折叠态，展示编辑器 currentCode） */
+  const [srcOpen, setSrcOpen] = React.useState(false)
   const [extraInstruction, setExtraInstruction] = React.useState('')
   const [tempOn, setTempOn] = React.useState(false)
   const [temperature, setTemperature] = React.useState(0.7)
@@ -563,6 +585,7 @@ export function AiAssistPopover({
       setLoading(false)
       setCfgOpen(false)
       setSkillsOpen(false)
+      setSrcOpen(false)
     }
   }, [open, stopSpeech, micStop])
 
@@ -626,6 +649,12 @@ export function AiAssistPopover({
       const reply = typeof data.code === 'string' ? data.code : ''
       if (!reply.trim()) throw new Error('AI 返回为空，请重试')
       setMessages((m) => [...m, { role: 'assistant', content: reply }])
+      // v2.7：AI 回复含代码块 → 自动填入预览审批区（不直接覆盖编辑器）
+      const lastCode = extractLastCodeBlock(reply)
+      if (lastCode) {
+        if (onPreview) onPreview(lastCode)
+        else onApply(lastCode)
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : '未知错误'
       setMessages((m) => [...m, { role: 'assistant', content: `（生成失败：${msg}）` }])
@@ -635,7 +664,16 @@ export function AiAssistPopover({
     }
   }
 
-  const applyCode = (code: string) => {
+  /**
+   * 代码块 → 预览审批区（v2.7 默认流程：不直接覆盖编辑器）。
+   * 若未提供 onPreview 则回退直接 onApply + 关闭。
+   */
+  const previewCode = (code: string) => {
+    if (onPreview) {
+      onPreview(code)
+      toast.success('已填入预览，请到编辑器审批')
+      return
+    }
     onApply(code)
     onOpenChange(false)
   }
@@ -690,6 +728,21 @@ export function AiAssistPopover({
         <Button
           variant="ghost"
           size="icon"
+          aria-label={srcOpen ? '收起当前源码' : '查看当前源码'}
+          title="查看当前源码"
+          aria-expanded={srcOpen}
+          className={cn('size-8 shrink-0 rounded-full', srcOpen && 'bg-accent text-accent-foreground')}
+          onClick={() => {
+            setSrcOpen((v) => !v)
+            setSkillsOpen(false)
+            setCfgOpen(false)
+          }}
+        >
+          <Code2 className="size-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
           aria-label={skillsOpen ? '收起技能清单' : '查看技能清单'}
           title="技能清单"
           aria-expanded={skillsOpen}
@@ -697,6 +750,7 @@ export function AiAssistPopover({
           onClick={() => {
             setSkillsOpen((v) => !v)
             setCfgOpen(false)
+            setSrcOpen(false)
           }}
         >
           <Zap className="size-4" />
@@ -711,6 +765,7 @@ export function AiAssistPopover({
           onClick={() => {
             setCfgOpen((v) => !v)
             setSkillsOpen(false)
+            setSrcOpen(false)
           }}
         >
           <Settings2 className="size-4" />
@@ -725,6 +780,39 @@ export function AiAssistPopover({
           <X className="size-4" />
         </Button>
       </div>
+
+      {/* 查看当前源码（折叠面板；展示编辑器 currentCode 给用户/AI 都能看到） */}
+      {srcOpen && (
+        <div
+          className="max-h-56 shrink-0 space-y-1.5 overflow-y-auto border-b border-border bg-muted/30 px-3 py-2.5"
+          aria-label="当前编辑器源码"
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] font-medium text-muted-foreground">
+              编辑器当前源码（只读 · {MEDIA_KIND_LABEL[kind]}）
+            </p>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 rounded-full px-2 text-[10px] text-muted-foreground"
+              onClick={() =>
+                void navigator.clipboard
+                  .writeText(currentCode)
+                  .then(() => toast.success('当前源码已复制'))
+                  .catch(() => toast.error('复制失败'))
+              }
+            >
+              <Copy className="size-3" /> 复制
+            </Button>
+          </div>
+          <pre className="max-h-44 overflow-auto rounded-lg bg-background p-2 font-mono text-[11px] leading-relaxed">
+            {currentCode || '（编辑器源码为空）'}
+          </pre>
+          <p className="text-[10px] leading-relaxed text-muted-foreground/70">
+            每次发送消息时这段源码会自动随上下文带给 AI；这里仅供你查看确认。
+          </p>
+        </div>
+      )}
 
       {/* 技能清单（可点击模板 → 填入输入框） */}
       {skillsOpen && (
@@ -886,11 +974,26 @@ export function AiAssistPopover({
                       key={j}
                       className="w-full overflow-hidden rounded-2xl rounded-bl-md border border-border"
                     >
-                      <div className="flex items-center justify-between gap-2 bg-muted/70 px-2.5 py-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2 bg-muted/70 px-2.5 py-1.5">
                         <span className="text-[10px] font-medium text-muted-foreground">
                           {MEDIA_KIND_LABEL[kind]}代码
                         </span>
-                        <div className="flex gap-1">
+                        <div className="flex flex-wrap gap-1">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 rounded-full px-2 text-[11px] text-muted-foreground"
+                            aria-label={speaking ? '停止朗读' : '朗读代码'}
+                            title={speaking ? '停止朗读' : '朗读'}
+                            onClick={() => (speaking ? stopSpeech() : speak(seg.value))}
+                          >
+                            {speaking ? (
+                              <Square className="size-3" />
+                            ) : (
+                              <Volume2 className="size-3" />
+                            )}
+                            <span className="ml-0.5">朗读</span>
+                          </Button>
                           <Button
                             variant="ghost"
                             size="sm"
@@ -907,9 +1010,9 @@ export function AiAssistPopover({
                           <Button
                             size="sm"
                             className="h-7 rounded-full bg-zinc-900 px-2.5 text-[11px] font-medium text-white hover:bg-zinc-800"
-                            onClick={() => applyCode(seg.value)}
+                            onClick={() => previewCode(seg.value)}
                           >
-                            <Check className="size-3" /> 应用到编辑器
+                            <Sparkles className="size-3" /> 填入预览审核
                           </Button>
                         </div>
                       </div>

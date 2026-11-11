@@ -1153,6 +1153,18 @@ export function SettingsSheet({
               onCheckedChange={(v) => onChangeSettings({ aiAutoCloze: v })}
             />
             <ToggleRow
+              label="导入时 AI 重点标注"
+              desc="自动加荧光/下划线/红强调/加粗标记核心论点"
+              checked={settings.aiAutoHighlight}
+              onCheckedChange={(v) => onChangeSettings({ aiAutoHighlight: v })}
+            />
+            <ToggleRow
+              label="导入时 AI 智能图表"
+              desc="自动用思维导图/对比表格/公式梳理结构与归纳"
+              checked={settings.aiAutoMedia}
+              onCheckedChange={(v) => onChangeSettings({ aiAutoMedia: v })}
+            />
+            <ToggleRow
               label="导入时 AI 智能排版"
               desc="导入内容很乱时让 AI 自动整理段落与标题"
               checked={settings.aiAutoFormat}
