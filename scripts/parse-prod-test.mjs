@@ -204,7 +204,8 @@ console.log('\n✅ 全部生产解析测试通过')
   const cardBody = await cardRes.json()
   console.log(`--- POST /api/cards: HTTP ${cardRes.status}`)
   assert.ok([200, 201].includes(cardRes.status), `建卡失败: ${JSON.stringify(cardBody).slice(0, 200)}`)
-  const cardId = cardBody.card?.id
+  // serializeCard 返回扁平 CardData（不是 {card:{...}} 包装）
+  const cardId = cardBody.id || cardBody.card?.id
   assert.ok(cardId, 'cardId 缺失')
 
   // 建卷
