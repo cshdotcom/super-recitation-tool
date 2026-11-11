@@ -415,6 +415,9 @@ export function FocusApp({ onBack }: FocusAppProps) {
     // 再收起全屏遮罩。避免仅靠 useEffect 异步触发导致「点了没反应 / 看不到 pill」的体验。
     setImmersiveOpen(false)
     setOverlay(false)
+    // X = 最小化并离开专注设置页（回到之前所在页面），只留右下角浮时钟；
+    // 之前收起遮罩后仍停留在专注设置页，用户感觉「点了 X 又回到专注页面、退不出去」。
+    onBack()
     toast('专注已最小化，右下角浮时钟可随时查看', {
       description: '点击浮时钟即可回到全屏计时',
     })

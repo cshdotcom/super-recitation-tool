@@ -1137,14 +1137,8 @@ export function ChatSidebar({
           {manageMode ? <CheckSquare className="size-3.5" /> : <Square className="size-3.5" />}
           {manageMode ? '完成' : '管理'}
         </button>
-        <button
-          type="button"
-          onClick={() => onOpenChange(false)}
-          aria-label="关闭对话列表"
-          className="flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-        >
-          <X className="size-4" />
-        </button>
+        {/* 关闭：宿主 SheetContent 已自带右上角 X（shadcn 内置 Close）——
+            这里再渲染一个 X 会与之叠在右上角（「叉叉重复叠在一起」），已移除 */}
       </div>
 
       {/* 新建对话（类型选择） */}
