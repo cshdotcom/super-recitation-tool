@@ -1152,6 +1152,12 @@ export function SettingsSheet({
               checked={settings.aiAutoCloze}
               onCheckedChange={(v) => onChangeSettings({ aiAutoCloze: v })}
             />
+            <ToggleRow
+              label="导入时 AI 智能排版"
+              desc="导入内容很乱时让 AI 自动整理段落与标题"
+              checked={settings.aiAutoFormat}
+              onCheckedChange={(v) => onChangeSettings({ aiAutoFormat: v })}
+            />
             <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">已自动保存</p>
           </section>
 

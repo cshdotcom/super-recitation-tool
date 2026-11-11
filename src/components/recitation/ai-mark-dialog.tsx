@@ -2,11 +2,11 @@
 
 // AiMarkDialog — 「是否开启 AI 自动标记？」询问弹窗。
 // 导入链路（上传文件/粘贴文本/拍照/图片识别 → 创建前询问）与编辑器工具栏共用。
-// 三个能力开关（挖空 / 重点标注 / 智能图表富媒体）→ onConfirm(options)。
+// 四个能力开关（挖空 / 重点标注 / 智能图表富媒体 / 智能排版）→ onConfirm(options)。
 // 用户点「跳过」→ onSkip()。
 
 import * as React from 'react'
-import { Braces, Highlighter, Loader2, PenLine, Sparkles } from 'lucide-react'
+import { Braces, Highlighter, LayoutList, Loader2, PenLine, Sparkles } from 'lucide-react'
 
 import {
   Dialog,
@@ -23,9 +23,11 @@ export interface AiMarkOptions {
   cloze: boolean
   highlight: boolean
   media: boolean
+  /** 智能排版：AI 整理混乱的段落/标题层级/列表（原文逐字保留） */
+  format?: boolean
 }
 
-export const AI_MARK_DEFAULTS: AiMarkOptions = { cloze: true, highlight: true, media: true }
+export const AI_MARK_DEFAULTS: AiMarkOptions = { cloze: true, highlight: true, media: true, format: false }
 
 export function AiMarkDialog({
   open,
@@ -33,6 +35,7 @@ export function AiMarkDialog({
   onConfirm,
   onSkip,
   defaultOptions,
+  defaultFormat = false,
   loading = false,
   context = 'import',
   contentPreview,
@@ -44,6 +47,8 @@ export function AiMarkDialog({
   /** 跳过：不标记直接继续 */
   onSkip: () => void
   defaultOptions?: AiMarkOptions
+  /** 智能排版开关默认值（导入链路来自设置 aiAutoFormat，默认关） */
+  defaultFormat?: boolean
   loading?: boolean
   /** import=导入创建时询问；editor=编辑器内手动触发 */
   context?: 'import' | 'editor'
@@ -53,6 +58,7 @@ export function AiMarkDialog({
   const [cloze, setCloze] = React.useState(defaultOptions?.cloze ?? true)
   const [highlight, setHighlight] = React.useState(defaultOptions?.highlight ?? true)
   const [media, setMedia] = React.useState(defaultOptions?.media ?? true)
+  const [format, setFormat] = React.useState(defaultFormat)
 
   // 每次打开重置为默认
   React.useEffect(() => {
@@ -60,10 +66,11 @@ export function AiMarkDialog({
       setCloze(defaultOptions?.cloze ?? true)
       setHighlight(defaultOptions?.highlight ?? true)
       setMedia(defaultOptions?.media ?? true)
+      setFormat(defaultFormat)
     }
-  }, [open, defaultOptions?.cloze, defaultOptions?.highlight, defaultOptions?.media])
+  }, [open, defaultOptions?.cloze, defaultOptions?.highlight, defaultOptions?.media, defaultFormat])
 
-  const anyOn = cloze || highlight || media
+  const anyOn = cloze || highlight || media || format
 
   const items: {
     key: keyof AiMarkOptions
@@ -96,6 +103,14 @@ export function AiMarkDialog({
       desc: 'AI 用富媒体绘制：思维导图梳理结构 / 对比表格 / 数理公式',
       value: media,
       set: setMedia,
+    },
+    {
+      key: 'format',
+      icon: LayoutList,
+      label: '智能排版',
+      desc: 'AI 整理混乱的段落、标题层级与列表（原文逐字保留）',
+      value: format,
+      set: setFormat,
     },
   ]
 
@@ -156,7 +171,7 @@ export function AiMarkDialog({
           <Button
             className="flex-[1.4] rounded-full bg-emerald-600 font-semibold text-white hover:bg-emerald-700"
             disabled={loading || !anyOn}
-            onClick={() => onConfirm({ cloze, highlight, media })}
+            onClick={() => onConfirm({ cloze, highlight, media, format })}
           >
             {loading ? (
               <>

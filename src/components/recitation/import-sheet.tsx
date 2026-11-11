@@ -322,6 +322,8 @@ export function ImportSheet({
             {/* 支持类型提示 */}
             <p className="-mt-3 text-center text-[11px] leading-relaxed text-muted-foreground">
               文件导入支持 PDF / Word / Excel / PPT / EPUB / 图片 / 音频 / 文本
+              <br />
+              Word / EPUB / PPT / 网页导入会保留标题、加粗、列表与图片
             </p>
 
             {/* hidden inputs */}

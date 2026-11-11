@@ -37,6 +37,9 @@ import {
   Columns3,
   Eye,
   EyeOff,
+  FileAudio,
+  FileCode2,
+  FileVideo,
   FoldVertical,
   GitBranch,
   GripVertical,
@@ -62,6 +65,7 @@ import {
   Underline,
   Undo2,
   UnfoldVertical,
+  Wand2,
   Zap,
   Camera,
   Crop,
@@ -256,20 +260,31 @@ function compressImage(file: File): Promise<string> {
   })
 }
 
+/** 读取任意文件为 dataURL（音频/视频上传用） */
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader()
+    r.onerror = () => reject(new Error('文件读取失败'))
+    r.onload = () => resolve(String(r.result))
+    r.readAsDataURL(file)
+  })
+}
+
 /** 上传图片到图片服务器（POST /api/upload {dataUrl} → /api/upload/<id> 短链接）。
- * 成功后正文只保留短引用（~40 字符）而不是巨型 base64；失败回退 dataURL 内嵌（离线可用）。 */
-async function uploadImageRef(dataUrl: string): Promise<string> {
+ * 成功后正文只保留短引用（~40 字符）而不是巨型 base64；
+ * 失败返回 null —— 调用方应提示用户重试，绝不把 base64 内嵌进正文（服务端必须存完整可用）。 */
+async function uploadImageRef(dataUrl: string): Promise<string | null> {
   try {
     const res = await fetch('/api/upload', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ dataUrl }),
     })
-    if (!res.ok) return dataUrl
+    if (!res.ok) return null
     const data = (await res.json().catch(() => ({}))) as { url?: string }
-    return data.url || dataUrl
+    return data.url || null
   } catch {
-    return dataUrl
+    return null
   }
 }
 
@@ -529,6 +544,9 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
   // AI 扫描在线相机（mode='ocr'）：拍多页 → 识别合并 → 插入正文
   const [scanCameraOpen, setScanCameraOpen] = React.useState(false)
   const scanInputRef = React.useRef<HTMLInputElement | null>(null)
+  // SVG 矢量图 / 音频 / 视频上传 input（「媒体」按钮触发）
+  const svgInputRef = React.useRef<HTMLInputElement | null>(null)
+  const avInputRef = React.useRef<HTMLInputElement | null>(null)
   const [imgEdit, setImgEdit] = React.useState<string | null>(null) // 待裁剪图片 dataURL
   const [imgZoom, setImgZoom] = React.useState(1)
   const [imgOffset, setImgOffset] = React.useState<CropOffset>({ x: 0, y: 0 })
@@ -869,6 +887,10 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     try {
       const dataUrl = await compressImage(file)
       const url = await uploadImageRef(dataUrl)
+      if (!url) {
+        toast.error('图片上传云端失败，请稍后重试', { id: tid })
+        return
+      }
       replaceInBlock(target.index, target.field, target.raw, `![图片](${url})`)
       toast.success('图片已替换（云端同步）', { id: tid })
     } catch (err) {
@@ -1311,11 +1333,12 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
       if (direct) {
         const tid = toast.loading('正在上传图片…')
         const url = await uploadImageRef(dataUrl)
+        if (!url) {
+          toast.error('图片上传云端失败，请重试', { id: tid })
+          return
+        }
         insertMarkdown(`![图片](${url})`, '', '')
-        toast.success(
-          url.startsWith('/api/upload/') ? '图片已上传云端并插入' : '图片已插入（云端暂不可用，已内嵌）',
-          { id: tid },
-        )
+        toast.success('图片已上传云端并插入', { id: tid })
       } else {
         setImgZoom(1)
         setImgOffset({ x: 0, y: 0 })
@@ -1349,7 +1372,16 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
       for (let i = 0; i < imgs.length; i++) {
         toast.loading(`正在上传 ${i + 1}/${imgs.length} 张…`, { id: tid })
         const dataUrl = await compressImage(imgs[i])
-        urls.push(await uploadImageRef(dataUrl))
+        const u = await uploadImageRef(dataUrl)
+        if (!u) {
+          toast.error(`第 ${i + 1} 张上传失败，已跳过`, { id: tid })
+          continue
+        }
+        urls.push(u)
+      }
+      if (urls.length === 0) {
+        toast.error('全部图片上传失败，请重试', { id: tid })
+        return
       }
       const md = urls.map((d) => `![图片](${d})`).join('\n\n')
       insertMarkdown(md, '', '')
@@ -1377,7 +1409,16 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
         const urls: string[] = []
         for (let i = 0; i < dataUrls.length; i++) {
           toast.loading(`正在上传 ${i + 1}/${dataUrls.length} 张…`, { id: tid })
-          urls.push(await uploadImageRef(dataUrls[i]))
+          const u = await uploadImageRef(dataUrls[i])
+          if (!u) {
+            toast.error(`第 ${i + 1} 张照片上传失败，已跳过`, { id: tid })
+            continue
+          }
+          urls.push(u)
+        }
+        if (urls.length === 0) {
+          toast.error('全部照片上传失败，请重试', { id: tid })
+          return
         }
         const md = urls.map((d) => `![图片](${d})`).join('\n\n')
         insertMarkdown(md, '', '')
@@ -1445,6 +1486,168 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     }
   }
 
+  // ---- 插入 SVG 矢量图（.svg 文件直接读文本插入 ```svg 围栏，不栅格化，保留可编辑）----
+  const handleSvgFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    const tid = toast.loading('正在读取 SVG…')
+    try {
+      const text = await file.text()
+      if (!text.includes('<svg') && !text.includes('<?xml')) {
+        toast.error('该文件不是有效的 SVG 文本', { id: tid })
+        return
+      }
+      // 去掉 XML 声明与 DOCTYPE（围栏内只留 <svg>…</svg>）
+      const cleaned = text
+        .replace(/<\?xml[\s\S]*?\?>/i, '')
+        .replace(/<!DOCTYPE[^>]*>/i, '')
+        .trim()
+      insertMarkdown('\n```svg\n', '\n```\n', cleaned, true)
+      toast.success('SVG 已插入（点击块顶「可视化编辑」可修改）', { id: tid })
+    } catch (err) {
+      toast.error('SVG 读取失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+    }
+  }
+
+  // ---- 插入音频 / 视频（上传云端 → 短引用 [[audio:uuid]] / [[video:uuid]]）----
+  const handleAvFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? [])
+    e.target.value = ''
+    if (files.length === 0) return
+    const tid = toast.loading(`正在上传 ${files.length} 个文件…`)
+    try {
+      const refs: string[] = []
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i]
+        toast.loading(`正在上传 ${i + 1}/${files.length}：${f.name.slice(0, 20)}`, { id: tid })
+        const dataUrl = await fileToDataUrl(f)
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ dataUrl }),
+        })
+        const data = (await res.json().catch(() => ({}))) as { url?: string; id?: string }
+        if (!res.ok || !data.url) {
+          toast.error(`「${f.name.slice(0, 16)}」上传失败，已跳过`, { id: tid })
+          continue
+        }
+        const id = data.id || data.url.split('/').pop() || ''
+        const kind = f.type.startsWith('video/') ? 'video' : 'audio'
+        const label = f.name.replace(/\.[^.]+$/, '').slice(0, 30) || (kind === 'video' ? '视频' : '音频')
+        refs.push(`[[${kind}:${id}|${label}]]`)
+      }
+      if (refs.length === 0) {
+        toast.error('没有文件上传成功', { id: tid })
+        return
+      }
+      insertMarkdown(refs.join('\n\n'), '', '')
+      toast.success(`已插入 ${refs.length} 个音视频`, { id: tid })
+    } catch (err) {
+      toast.error('上传失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+    }
+  }
+
+  // ---- AI 智能排版（整理混乱段落/标题/列表，原文逐字保留；可撤销）----
+  const [aiFormatLoading, setAiFormatLoading] = React.useState(false)
+
+  /** 对单块 back 排版 */
+  const runAiFormatBlock = async (index: number) => {
+    const block = blocksRef.current[index]
+    const content = (block?.back || '').trim()
+    if (!content) {
+      toast.warning('该块没有内容')
+      return
+    }
+    setAiFormatLoading(true)
+    const tid = toast.loading('AI 正在排版此块…')
+    try {
+      const res = await fetch('/api/autoformat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { content?: string; error?: string }
+      if (!res.ok || !data.content) throw new Error(data.error || '排版失败')
+      const formatted = data.content
+      commit((prev) => prev.map((b, i) => (i === index ? { ...b, back: formatted } : b)))
+      toast.success('AI 排版完成，可撤销', { id: tid })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'AI 排版失败', { id: tid })
+    } finally {
+      setAiFormatLoading(false)
+    }
+  }
+
+  /** 批量排版选中块 */
+  const runAiFormatBatch = async () => {
+    const idxs = [...selected].sort((a, b) => a - b)
+    if (idxs.length === 0) {
+      toast.warning('请先选择要排版的块')
+      return
+    }
+    setAiFormatLoading(true)
+    const tid = toast.loading(`AI 排版 ${idxs.length} 块…`)
+    try {
+      let done = 0
+      const updates = new Map<number, string>()
+      for (const i of idxs) {
+        const content = (blocksRef.current[i]?.back || '').trim()
+        if (!content) continue
+        toast.loading(`AI 排版 ${++done}/${idxs.length}…`, { id: tid })
+        const res = await fetch('/api/autoformat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content }),
+        })
+        const data = (await res.json().catch(() => ({}))) as { content?: string }
+        if (res.ok && data.content) updates.set(i, data.content)
+      }
+      if (updates.size === 0) throw new Error('全部排版失败')
+      commit((prev) => prev.map((b, i) => (updates.has(i) ? { ...b, back: updates.get(i)! } : b)))
+      toast.success(`已排版 ${updates.size} 块，可撤销`, { id: tid })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'AI 排版失败', { id: tid })
+    } finally {
+      setAiFormatLoading(false)
+    }
+  }
+
+  /** 全文排版：合并所有块 back → 排版 → 按双换行重新分块（保留原 front 映射）*/
+  const runAiFormatAll = async () => {
+    const all = blocksRef.current.map((b) => (b.back || '').trim()).filter(Boolean).join('\n\n')
+    if (all.length < 20) {
+      toast.warning('内容太少，无需排版')
+      return
+    }
+    setAiFormatLoading(true)
+    const tid = toast.loading('AI 正在排版全文…')
+    try {
+      const res = await fetch('/api/autoformat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content: all.slice(0, 8000) }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { content?: string; error?: string }
+      if (!res.ok || !data.content) throw new Error(data.error || '排版失败')
+      const parts = data.content.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
+      commit((prev) => {
+        if (parts.length === 0) return prev
+        const next: MaterialBlock[] = parts.map((p) => ({ front: '', back: p, hidden: false }))
+        // 保留原 front（若有）映射到前 N 块
+        for (let i = 0; i < prev.length && i < next.length; i++) {
+          if (prev[i].front) next[i].front = prev[i].front
+        }
+        return next
+      })
+      toast.success('AI 全文排版完成，可撤销', { id: tid })
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'AI 排版失败', { id: tid })
+    } finally {
+      setAiFormatLoading(false)
+    }
+  }
+
   // 裁剪后插入
   const insertCropped = async (boxOverride?: CropBox | null) => {
     if (!imgEdit) return
@@ -1453,6 +1656,10 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
       const out = box ? await cropDataUrl(imgEdit, box) : imgEdit
       const tid = toast.loading('正在上传图片…')
       const url = await uploadImageRef(out)
+      if (!url) {
+        toast.error('图片上传云端失败，请重试', { id: tid })
+        return
+      }
       if (cropTarget) {
         // 二次裁剪：替换块内的原引用
         replaceInBlock(cropTarget.index, cropTarget.field, cropTarget.raw, `![图片](${url})`)
@@ -1591,6 +1798,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                     [
                       { label: '全选', onClick: toggleSelectAll, disabled: blocks.length === 0 },
                       { label: 'AI正面', onClick: () => void batchGenerateFront(), disabled: selected.size === 0 },
+                      { label: 'AI排版', onClick: () => void runAiFormatBatch(), disabled: selected.size === 0 },
                       { label: '合并', onClick: () => mergeSelected(), disabled: selected.size < 2 },
                       { label: '显/隐', onClick: () => toggleSelectedHidden(), disabled: selected.size === 0 },
                       { label: '删除', onClick: () => setBatchDeleteOpen(true), disabled: selected.size === 0 },
@@ -1978,6 +2186,76 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 tabIndex={-1}
                 onChange={(e) => void handleScanFile(e)}
               />
+              {/* SVG 矢量图上传（插入 ```svg 围栏，不栅格化） */}
+              <input
+                ref={svgInputRef}
+                type="file"
+                accept=".svg,image/svg+xml"
+                className="hidden"
+                aria-hidden
+                tabIndex={-1}
+                onChange={(e) => void handleSvgFile(e)}
+              />
+              {/* 音频/视频上传（插入 [[audio:id]] / [[video:id]] 短引用） */}
+              <input
+                ref={avInputRef}
+                type="file"
+                accept="audio/*,video/mp4,video/webm,video/quicktime"
+                multiple
+                className="hidden"
+                aria-hidden
+                tabIndex={-1}
+                onChange={(e) => void handleAvFile(e)}
+              />
+
+              {/* 媒体：SVG 矢量图 / 音频 / 视频（全部上传云端→短引用，不内嵌源码） */}
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="插入音视频或 SVG"
+                    onMouseDown={(e) => e.preventDefault()}
+                    className={TOOLBAR_BTN}
+                  >
+                    <FileCode2 className="size-5" strokeWidth={1.75} aria-hidden />
+                    <span className="text-[11px] leading-none">媒体</span>
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent
+                  side="bottom"
+                  align="start"
+                  onOpenAutoFocus={(e) => e.preventDefault()}
+                  className="w-48 rounded-2xl p-1.5"
+                >
+                  <button
+                    type="button"
+                    onClick={() => svgInputRef.current?.click()}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <FileCode2 className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    SVG 矢量图（上传 .svg）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => avInputRef.current?.click()}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <FileAudio className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    音频（mp3/wav/m4a…）
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => avInputRef.current?.click()}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <FileVideo className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    视频（mp4/webm…）
+                  </button>
+                  <p className="px-2.5 pb-1.5 pt-1 text-[11px] text-muted-foreground">
+                    音视频上传云端，正文只保留短引用 [[audio:id]] / [[video:id]]
+                  </p>
+                </PopoverContent>
+              </Popover>
 
               {/* 公式：行内 $..$ / 独立 $$..$$ / 常用模板（KaTeX 全量支持 + 化学扩展） */}
               <DropdownMenu>
@@ -2223,6 +2501,23 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 </DropdownMenuContent>
               </DropdownMenu>
 
+              {/* AI 智能排版（全文）：整理混乱段落/标题/列表，原文逐字保留，可撤销 */}
+              <button
+                type="button"
+                aria-label="AI 智能排版"
+                disabled={aiFormatLoading}
+                onClick={() => void runAiFormatAll()}
+                onMouseDown={(e) => e.preventDefault()}
+                className={TOOLBAR_BTN}
+              >
+                {aiFormatLoading ? (
+                  <Loader2 className="size-5 animate-spin" strokeWidth={1.75} aria-hidden />
+                ) : (
+                  <Wand2 className="size-5" strokeWidth={1.75} aria-hidden />
+                )}
+                <span className="text-[11px] leading-none">AI排版</span>
+              </button>
+
               {/* 复制 / 导出 */}
               <Popover>
                 <PopoverTrigger asChild>
@@ -2296,6 +2591,15 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                   >
                     <Merge className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
                     合并到下一块
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onClick={() => {
+                      const t = requireFocusTarget()
+                      if (t) void runAiFormatBlock(t.index)
+                    }}
+                  >
+                    <Wand2 className="size-4 text-muted-foreground" strokeWidth={1.75} aria-hidden />
+                    AI 排版此块
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onClick={() => {

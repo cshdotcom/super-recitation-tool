@@ -1,32 +1,46 @@
 // media-refs — 从编辑器块文本中检测全部富媒体引用（图片 / 表格 / mermaid /
-// SVG / 代码块 / 公式），供 MediaRefStrip（块顶预览条）、MediaDetailDialog
-// （放大详情）、MediaEditDialog（可视化编辑）共用。
+// SVG / 代码块 / 公式 / 音频 / 视频），供 MediaRefStrip（块顶预览条）、
+// MediaDetailDialog（放大详情）、MediaEditDialog（可视化编辑）共用。
 //
 // 引用机制：所有富媒体都以「文本内标记」存在（![](url) / |表格| / ```mermaid /
-// $$公式$$），块顶预览条解析渲染，点击可定位 / 替换 / 编辑 / 删除 / 复制引用。
+// $$公式$$ / [[audio:<uuid>]]），块顶预览条解析渲染，点击可定位 / 替换 /
+// 编辑 / 删除 / 复制引用。
+//
+// 音视频引用契约（与编辑器/上传链路约定）：
+//   [[audio:<uuid>]] / [[video:<uuid>]]，可选标题 [[audio:<uuid>|标题]]，
+//   播放地址固定为 /api/upload/<uuid>。
 
 export type MediaKind = 'image' | 'table' | 'mermaid' | 'svg' | 'code' | 'formula'
 
+/** MediaRef.kind 的完整集合：MediaKind 基础上扩展音视频引用（[[audio:]] / [[video:]]）。 */
+export type MediaRefKind = MediaKind | 'audio' | 'video'
+
 export interface MediaRef {
-  kind: MediaKind
+  kind: MediaRefKind
   /** 块文本中的精确子串（替换 / 定位 / 删除都用它） */
   raw: string
-  /** 图片 url 或富媒体源码 */
+  /** 图片 url、音视频播放地址（/api/upload/<uuid>）或富媒体源码 */
   src: string
   alt: string
-  /** 代码围栏语言（mermaid/svg/其他） */
+  /** 代码围栏语言（mermaid/svg/其他；音视频为 audio/video） */
   lang: string
   start: number
   end: number
+  /** 音视频播放地址（/api/upload/<uuid>）；仅 audio/video 引用提供 */
+  url?: string
+  /** 展示标题：音视频引用取自定义标题，缺省「音频」/「视频」 */
+  label?: string
 }
 
-export const MEDIA_KIND_LABEL: Record<MediaKind, string> = {
+export const MEDIA_KIND_LABEL: Record<MediaRefKind, string> = {
   image: '图片',
   table: '表格',
   mermaid: '思维导图',
   svg: 'SVG 图',
   code: '代码',
   formula: '公式',
+  audio: '音频',
+  video: '视频',
 }
 
 /** mermaid 代码块是否是 mindmap（可视化树编辑仅支持 mindmap） */
@@ -68,7 +82,28 @@ export function extractMediaRefs(text: string): MediaRef[] {
     taken.push({ start: m.index, end: m.index + m[0].length })
   }
 
-  // 2) 图片 ![](url)
+  // 2) 音视频引用 [[audio:<uuid>]] / [[video:<uuid>|标题]] → /api/upload/<uuid>
+  const avRe = /\[\[(audio|video):([a-f0-9-]+)(?:\|([^\]]*))?\]\]/g
+  while ((m = avRe.exec(text)) !== null) {
+    if (overlaps({ start: m.index, end: m.index + m[0].length }, taken)) continue
+    const kind = m[1] === 'audio' ? ('audio' as const) : ('video' as const)
+    const url = `/api/upload/${m[2]}`
+    const title = (m[3] ?? '').trim()
+    refs.push({
+      kind,
+      raw: m[0],
+      src: url,
+      alt: title,
+      lang: kind,
+      start: m.index,
+      end: m.index + m[0].length,
+      url,
+      label: title || MEDIA_KIND_LABEL[kind],
+    })
+    taken.push({ start: m.index, end: m.index + m[0].length })
+  }
+
+  // 3) 图片 ![](url)
   const imgRe = /!\[([^\]]*)\]\(([^)\s]+)\)/g
   while ((m = imgRe.exec(text)) !== null) {
     if (overlaps({ start: m.index, end: m.index + m[0].length }, taken)) continue
@@ -84,7 +119,7 @@ export function extractMediaRefs(text: string): MediaRef[] {
     taken.push({ start: m.index, end: m.index + m[0].length })
   }
 
-  // 3) 独立公式 $$...$$
+  // 4) 独立公式 $$...$$
   const fmlRe = /\$\$([\s\S]+?)\$\$/g
   while ((m = fmlRe.exec(text)) !== null) {
     if (overlaps({ start: m.index, end: m.index + m[0].length }, taken)) continue
@@ -100,7 +135,7 @@ export function extractMediaRefs(text: string): MediaRef[] {
     taken.push({ start: m.index, end: m.index + m[0].length })
   }
 
-  // 4) markdown 表格（连续 ≥2 行 |…|，且第二行是分隔行 |---|）
+  // 5) markdown 表格（连续 ≥2 行 |…|，且第二行是分隔行 |---|）
   const lineRe = /[^\n]+/g
   const tableLines: { start: number; end: number; text: string }[] = []
   while ((m = lineRe.exec(text)) !== null) {
@@ -244,8 +279,56 @@ export function serializeMindmap(root: MindNode): string {
 
 // ---------- 下载工具 ----------
 
-/** 触发浏览器下载（文本类源码 / 图片 url） */
+/** 导出文件名时间戳：20260101-120000（与思维导图/公式导出文件名约定一致）。 */
+export function fileTimestamp(d: Date = new Date()): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
+/** 触发浏览器下载 Blob（media-refs 内部轻量实现，不依赖 export-utils）。 */
+function downloadBlobFile(filename: string, blob: Blob): void {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.rel = 'noopener'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+/** 按响应 Content-Type 猜音视频扩展名（猜不出回退 mp3/mp4）。 */
+function mediaFileExt(mime: string, kind: 'audio' | 'video'): string {
+  if (/mpeg|mp3/.test(mime)) return 'mp3'
+  if (/wav/.test(mime)) return 'wav'
+  if (/ogg/.test(mime)) return 'ogg'
+  if (/webm/.test(mime)) return 'webm'
+  if (/mp4/.test(mime)) return 'mp4'
+  if (/quicktime/.test(mime)) return 'mov'
+  if (/x-m4a|aac/.test(mime)) return 'm4a'
+  return kind === 'audio' ? 'mp3' : 'mp4'
+}
+
+/** 触发浏览器下载（文本类源码 / 图片 url / 音视频文件） */
 export function downloadMedia(ref: MediaRef): void {
+  // 音视频：fetch 播放地址 → Blob 下载（拿到真实扩展名）；失败则新窗口打开手动保存
+  if (ref.kind === 'audio' || ref.kind === 'video') {
+    const kind = ref.kind
+    const url = ref.url || ref.src
+    const label = ref.label || MEDIA_KIND_LABEL[kind]
+    void (async () => {
+      try {
+        const res = await fetch(url)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const blob = await res.blob()
+        downloadBlobFile(`${label}-${fileTimestamp()}.${mediaFileExt(blob.type, kind)}`, blob)
+      } catch {
+        window.open(url, '_blank', 'noopener')
+      }
+    })()
+    return
+  }
   if (ref.kind === 'image') {
     const a = document.createElement('a')
     a.href = ref.src
@@ -259,19 +342,101 @@ export function downloadMedia(ref: MediaRef): void {
     ref.kind === 'table' ? 'md' : ref.kind === 'formula' ? 'tex' : ref.lang === 'svg' ? 'svg' : ref.kind === 'mermaid' ? 'mmd' : 'txt'
   const mime = ref.lang === 'svg' || ref.kind === 'svg' ? 'image/svg+xml' : 'text/plain;charset=utf-8'
   const blob = new Blob([ref.src], { type: mime })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `${MEDIA_KIND_LABEL[ref.kind]}-${Date.now()}.${ext}`
-  a.click()
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
+  downloadBlobFile(`${MEDIA_KIND_LABEL[ref.kind]}-${fileTimestamp()}.${ext}`, blob)
 }
 
 // ---------- 下载（无完整 MediaRef 场景：RichContent 详情态等） ----------
 
 /** 触发下载（按类型 + 源码直出；RichContent 内嵌媒体块没有完整 MediaRef，用此入口）。 */
-export function downloadMediaSrc(kind: MediaKind, src: string, lang = ''): void {
-  downloadMedia({ kind, raw: '', src, alt: '', lang, start: 0, end: 0 })
+export function downloadMediaSrc(kind: MediaRefKind, src: string, lang = ''): void {
+  downloadMedia({ kind, raw: '', src, alt: '', lang, start: 0, end: 0, url: kind === 'audio' || kind === 'video' ? src : undefined })
+}
+
+// ---------- SVG 序列化 / SVG → PNG（mermaid·SVG 图导出共用，纯客户端） ----------
+
+export interface SerializedSvg {
+  /** 独立 svg 源码（含 xmlns / 宽高 / 白底矩形） */
+  svg: string
+  width: number
+  height: number
+}
+
+/** DOM 内 svg 元素 → 独立 svg 源码：补 xmlns、显式宽高（优先 viewBox），插入白底矩形。 */
+export function serializeSvgElement(svg: SVGSVGElement, background = '#ffffff'): SerializedSvg {
+  const clone = svg.cloneNode(true) as SVGSVGElement
+  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+  clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink')
+  // 尺寸：width/height 属性（数值或 px）→ viewBox → 渲染盒，依次兜底
+  const vb = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number)
+  const hasVb = vb.length === 4 && vb.every((n) => Number.isFinite(n))
+  const attrSize = (name: string): number => {
+    const v = (svg.getAttribute(name) ?? '').trim()
+    return /^\d+(\.\d+)?(px)?$/i.test(v) ? parseFloat(v) : 0
+  }
+  let width = attrSize('width')
+  let height = attrSize('height')
+  if ((!width || !height) && hasVb) {
+    width = width || vb[2]
+    height = height || vb[3]
+  }
+  if (!width || !height) {
+    const rect = svg.getBoundingClientRect()
+    width = width || Math.ceil(rect.width)
+    height = height || Math.ceil(rect.height)
+  }
+  width = Math.max(1, Math.round(width))
+  height = Math.max(1, Math.round(height))
+  clone.setAttribute('width', String(width))
+  clone.setAttribute('height', String(height))
+  if (hasVb) clone.setAttribute('viewBox', vb.join(' '))
+  else clone.setAttribute('viewBox', `0 0 ${width} ${height}`)
+  if (background) {
+    const bg = document.createElementNS('http://www.w3.org/2000/svg', 'rect')
+    bg.setAttribute('x', '0')
+    bg.setAttribute('y', '0')
+    bg.setAttribute('width', '100%')
+    bg.setAttribute('height', '100%')
+    bg.setAttribute('fill', background)
+    clone.insertBefore(bg, clone.firstChild)
+  }
+  return { svg: new XMLSerializer().serializeToString(clone), width, height }
+}
+
+/** svg 源码 → PNG Blob（白底、scale 倍率；中文字体用系统字体，无需内嵌）。 */
+export async function svgStringToPngBlob(svg: string, width: number, height: number, scale = 2): Promise<Blob> {
+  const url = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+  const img = new Image()
+  await new Promise<void>((resolve, reject) => {
+    img.onload = () => resolve()
+    img.onerror = () => reject(new Error('SVG 渲染失败'))
+    img.src = url
+  })
+  const canvas = document.createElement('canvas')
+  canvas.width = Math.max(1, Math.round(width * scale))
+  canvas.height = Math.max(1, Math.round(height * scale))
+  const ctx = canvas.getContext('2d')
+  if (!ctx) throw new Error('Canvas 不可用')
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height)
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'))
+  if (!blob) throw new Error('PNG 编码失败')
+  return blob
+}
+
+/** 下载 DOM 内 svg 元素为 .svg 文件（带时间戳文件名）。返回所用文件名。 */
+export function downloadSvgElement(svg: SVGSVGElement, baseName: string): string {
+  const filename = `${baseName}-${fileTimestamp()}.svg`
+  downloadBlobFile(filename, new Blob([serializeSvgElement(svg).svg], { type: 'image/svg+xml;charset=utf-8' }))
+  return filename
+}
+
+/** 下载 DOM 内 svg 元素为 PNG（白底 2x，带时间戳文件名）。返回所用文件名。 */
+export async function downloadSvgElementAsPng(svg: SVGSVGElement, baseName: string, scale = 2): Promise<string> {
+  const { svg: src, width, height } = serializeSvgElement(svg)
+  const filename = `${baseName}-${fileTimestamp()}.png`
+  downloadBlobFile(filename, await svgStringToPngBlob(src, width, height, scale))
+  return filename
 }
 
 // ---------- mermaid flowchart（graph / flowchart）⇄ 节点/连线 ----------

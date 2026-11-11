@@ -470,3 +470,51 @@ export async function mediaCodegen(
   }
   return code
 }
+
+// ---------- AI 智能排版（/api/autoformat：导入内容段落/标题/列表整理） ----------
+
+/** AI 智能排版单次输入上限（超长截断，保留前 8000 字） */
+const AUTO_FORMAT_MAX_CHARS = 8000
+
+/**
+ * AI 智能排版：把混乱的导入文本（拍照识别 / 复制粘贴 / 文件解析得到的）
+ * 整理为结构清晰的 Markdown（标题层级 / 列表 / 分段）。
+ * 最高规则是原文逐字保留，只允许添加 Markdown 结构符号与换行。
+ * 直接返回整理后的文本（trim 后）；失败时 throw。
+ * 超时控制由调用方（route）用 Promise.race 实现。
+ */
+export async function autoFormatText(
+  content: string,
+  instruction?: string,
+  config?: AIConfig,
+): Promise<string> {
+  const text = (content || '').slice(0, AUTO_FORMAT_MAX_CHARS)
+  const extra = (instruction || '').trim().slice(0, 1000)
+
+  const sys = [
+    '你是排版整理专家。用户会给你一段混乱的文本（可能来自拍照识别、复制粘贴），请把它整理为结构清晰的 Markdown：',
+    '1. 识别主题句/小节主旨，转换为 # / ## / ### 标题，形成清晰的标题层级（全文主旨用一个 #，其下逐级使用 ## / ###）。',
+    '2. 并列的内容整理为 - 无序列表（一项一行）；原文自带序号（如「一、」「1.」「①」）时，序号文字按原样保留在条目里，不要再叠加 - 等多余的项目符号，避免出现「- 1. …」这类冗余双重符号。',
+    '3. 合理分段：一段只讲一件事，段落之间用空行分隔。',
+    '4. 最高规则：逐字保留原文每一个字符，绝不改写、删减、增加、翻译任何内容文字；只允许添加 Markdown 结构符号（#、-）、换行与空行。',
+    '5. 原文已有的 Markdown 语法（表格、公式、图片、围栏代码块）必须原样保留，不要嵌套破坏，也不要重新包裹。',
+    '6. 输出中的富媒体引用（如 ![图片](url)、[[audio:...]]）必须保持完整一行，绝不拆断、绝不改动其中的链接与语法。',
+    '只输出整理后的全文本身：不要任何解释、前后缀文字，不要用代码围栏（```）包裹。',
+  ].join('\n')
+
+  const userMsg = extra
+    ? `【补充要求】${extra}\n\n【待排版文本】\n${text}`
+    : `【待排版文本】\n${text}`
+
+  const reply = await chatComplete(
+    [
+      { role: 'system', content: sys },
+      { role: 'user', content: userMsg },
+    ],
+    config,
+  )
+
+  const out = (reply || '').trim()
+  if (!out) throw new Error('AI 排版返回为空，请重试')
+  return out
+}

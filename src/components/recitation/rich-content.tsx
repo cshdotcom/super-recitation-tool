@@ -15,14 +15,19 @@
 //     theme change, error fallback falls back to a plain code block)
 //   • ```svg fenced blocks render natively (sanitized), like raw <svg> segments
 //   • raw <svg>…</svg> segments in the content render natively (sanitized)
+//   • audio/video references — [[audio:<uuid>]] / [[video:<uuid>|标题]] — render
+//     as native players (rounded card with title + <audio> bar / <video max-h-72>),
+//     preprocessed into image placeholders before react-markdown (code spans
+//     untouched); detail overlay shows a bigger player + download
 //   • bordered tables with horizontal scroll on mobile
 //   • optional maxHeight → the whole container scrolls vertically
 //   • unified rich-media interactions (mediaInteractive, default true):
 //     every media block (image / mermaid / svg / table / code / display
-//     formula) gets a floating action bar (detail + download); detail opens a
+//     formula / audio / video) gets a floating action bar (detail + download +
+//     export-PNG/SVG for vector & rendered blocks); detail opens a
 //     self-contained fullscreen overlay (zoom 0.25–4x, drag-pan, download,
-//     copy-source). Detail re-renders media with mediaInteractive={false} to
-//     prevent recursion. All render sites (chat / quiz / papers / favorites /
+//     copy-source, export). Detail re-renders media with mediaInteractive={false}
+//     to prevent recursion. All render sites (chat / quiz / papers / favorites /
 //     reading view / editor previews) inherit these interactions for free.
 // Never crashes on plain text — plain paragraphs just render as paragraphs.
 import * as React from 'react'
@@ -36,11 +41,19 @@ import rehypeRaw from 'rehype-raw'
 import 'katex/contrib/mhchem'
 import 'katex/dist/katex.min.css'
 import { useTheme } from 'next-themes'
-import { Check, Copy, Download, Maximize2, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { Check, Copy, Download, FileDown, ImageDown, Maximize2, RotateCcw, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
 import { expandSpanDirectives } from '@/lib/inline-style'
-import { downloadMediaSrc, MEDIA_KIND_LABEL, type MediaKind } from '@/components/recitation/media-refs'
+import {
+  downloadMediaSrc,
+  downloadSvgElement,
+  downloadSvgElementAsPng,
+  fileTimestamp,
+  MEDIA_KIND_LABEL,
+  type MediaRefKind,
+} from '@/components/recitation/media-refs'
 import {
   Dialog,
   DialogContent,
@@ -97,6 +110,83 @@ function guardDollarsOutsideCode(md: string): string {
     .join('')
 }
 
+// ---------- 音视频引用（[[audio:<uuid>]] / [[video:<uuid>|标题]]） ----------
+
+/**
+ * 把音视频引用换成图片 markdown 占位（`![av-audio:标题](/api/upload/<uuid>)`），
+ * 由下方 img 组件映射识别前缀后渲染原生播放器。代码段（围栏/行内）内不动。
+ * 与编辑器/上传链路的引用契约：播放地址固定为 /api/upload/<uuid>。
+ */
+function mediaRefPlaceholders(md: string): string {
+  const parts = md.split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/g)
+  return parts
+    .map((p) => {
+      if (/^(```|~~~|`)/.test(p)) return p
+      return p.replace(
+        /\[\[(audio|video):([a-f0-9-]+)(?:\|([^\]]*))?\]\]/g,
+        (_m: string, kind: string, uuid: string, title: string | undefined) => {
+          const label = (title ?? '').trim() || (kind === 'audio' ? '音频' : '视频')
+          return `![av-${kind}:${label}](/api/upload/${uuid})`
+        },
+      )
+    })
+    .join('')
+}
+
+/** 音频引用块：圆角卡片（🔊 标题 + 原生 audio 条）；详情态/下载走统一媒体交互。 */
+function AudioBlock({ url, title, ctx }: { url: string; title: string; ctx: MediaCtx }) {
+  const body = (
+    <span className="my-2 flex w-full max-w-full items-center gap-2.5 rounded-xl border border-border bg-muted/40 px-3 py-2">
+      <span
+        className="flex size-8 shrink-0 items-center justify-center rounded-full bg-emerald-500/15 text-sm"
+        aria-hidden
+      >
+        🔊
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="mb-1 block truncate text-xs font-medium text-foreground">{title}</span>
+        <audio controls preload="metadata" src={url} className="h-8 w-full min-w-0" />
+      </span>
+    </span>
+  )
+  if (!ctx.interactive) return body
+  return (
+    <span className="group relative my-2 block max-w-full">
+      {body}
+      <MediaActionBar
+        onDetail={() => ctx.onDetail({ kind: 'audio', src: url, alt: title })}
+        onDownload={() => downloadMediaSrc('audio', url)}
+      />
+    </span>
+  )
+}
+
+/** 视频引用块：原生 video 播放器（限高 max-h-72，点击进详情可大屏播放）。 */
+function VideoBlock({ url, title, ctx }: { url: string; title: string; ctx: MediaCtx }) {
+  const body = (
+    <video
+      controls
+      playsInline
+      preload="metadata"
+      src={url}
+      className="my-2 max-h-72 w-full max-w-full rounded-xl border border-border bg-black"
+    />
+  )
+  if (!ctx.interactive) return body
+  return (
+    <span className="group relative my-2 block max-w-full">
+      {title && (
+        <span className="mb-1 block truncate text-xs font-medium text-muted-foreground">{title}</span>
+      )}
+      {body}
+      <MediaActionBar
+        onDetail={() => ctx.onDetail({ kind: 'video', src: url, alt: title })}
+        onDownload={() => downloadMediaSrc('video', url)}
+      />
+    </span>
+  )
+}
+
 // ---------- raw SVG handling ----------
 
 /** Extract <svg>…</svg> segments so they can bypass markdown and render natively. */
@@ -120,8 +210,8 @@ function sanitizeEmbeddedHtml(html: string): string {
 
 /** 详情态数据（自包含，不依赖 MediaRef） */
 interface MediaDetailState {
-  kind: MediaKind
-  /** 图片 url 或富媒体源码 */
+  kind: MediaRefKind
+  /** 图片 url / 音视频播放地址或富媒体源码 */
   src: string
   alt?: string
   /** 代码语言（code 块） */
@@ -133,18 +223,25 @@ interface MediaCtx {
   onDetail: (d: MediaDetailState) => void
 }
 
-/** 悬浮操作条：详情（放大）+ 下载；桌面 hover 显示，移动端常显。 */
+/** 悬浮操作条：详情（放大）+ 下载 + 导出图片（PNG/SVG）；桌面 hover 显示，移动端常显。
+ *  按钮尺寸 size-8 保证移动端触控友好；点击均阻止冒泡（容器点击 = 打开详情）。 */
 function MediaActionBar({
   onDetail,
   onDownload,
+  onExportPng,
+  onExportSvg,
   className,
 }: {
   onDetail: () => void
   onDownload?: () => void
+  /** 导出 PNG 图片（mermaid / SVG 图，带日期时间戳文件名） */
+  onExportPng?: () => void
+  /** 导出 SVG 源文件（mermaid / SVG 图） */
+  onExportSvg?: () => void
   className?: string
 }) {
   const btn =
-    'pointer-events-auto flex size-7 items-center justify-center rounded-lg border border-border bg-background/95 text-muted-foreground shadow-sm transition-colors hover:text-foreground active:scale-95'
+    'pointer-events-auto flex size-8 items-center justify-center rounded-lg border border-border bg-background/95 text-muted-foreground shadow-sm transition-colors hover:text-foreground active:scale-95'
   return (
     <span
       className={cn(
@@ -152,16 +249,125 @@ function MediaActionBar({
         className,
       )}
     >
-      <button type="button" aria-label="放大详情" title="放大详情" className={btn} onClick={onDetail}>
-        <Maximize2 className="size-3.5" strokeWidth={1.75} />
+      <button
+        type="button"
+        aria-label="放大详情"
+        title="放大详情"
+        className={btn}
+        onClick={(e) => {
+          e.stopPropagation()
+          onDetail()
+        }}
+      >
+        <Maximize2 className="size-4" strokeWidth={1.75} />
       </button>
       {onDownload && (
-        <button type="button" aria-label="下载保存" title="下载保存" className={btn} onClick={onDownload}>
-          <Download className="size-3.5" strokeWidth={1.75} />
+        <button
+          type="button"
+          aria-label="下载保存"
+          title="下载保存"
+          className={btn}
+          onClick={(e) => {
+            e.stopPropagation()
+            onDownload()
+          }}
+        >
+          <Download className="size-4" strokeWidth={1.75} />
+        </button>
+      )}
+      {onExportPng && (
+        <button
+          type="button"
+          aria-label="导出PNG"
+          title="导出PNG"
+          className={btn}
+          onClick={(e) => {
+            e.stopPropagation()
+            onExportPng()
+          }}
+        >
+          <ImageDown className="size-4" strokeWidth={1.75} />
+        </button>
+      )}
+      {onExportSvg && (
+        <button
+          type="button"
+          aria-label="导出SVG"
+          title="导出SVG"
+          className={btn}
+          onClick={(e) => {
+            e.stopPropagation()
+            onExportSvg()
+          }}
+        >
+          <FileDown className="size-4" strokeWidth={1.75} />
         </button>
       )}
     </span>
   )
+}
+
+// ---------- DOM → PNG 导出（公式/表格导出共用，html-to-image） ----------
+
+/** 页面 @font-face 内嵌 CSS（KaTeX 公式字体导出必需；一次生成全局缓存）。 */
+let fontEmbedCssCache: string | null = null
+async function cachedFontEmbedCss(): Promise<string | undefined> {
+  try {
+    if (fontEmbedCssCache === null) {
+      const { getFontEmbedCSS } = await import('html-to-image')
+      fontEmbedCssCache = await getFontEmbedCSS(document.body)
+    }
+    return fontEmbedCssCache || undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** 等待容器内图片全部解码完成（/api/upload 与 dataURL 均适用）。 */
+async function waitImagesDecoded(root: HTMLElement): Promise<void> {
+  const imgs = Array.from(root.querySelectorAll('img'))
+  await Promise.all(
+    imgs.map((im) =>
+      im.complete
+        ? undefined
+        : new Promise<void>((r) => {
+            im.addEventListener('load', () => r(), { once: true })
+            im.addEventListener('error', () => r(), { once: true })
+          }),
+    ),
+  )
+}
+
+/** 元素 → 白底 PNG 下载（2x；克隆进离屏容器加内边距，不带走操作条按钮）。 */
+async function exportElementAsPng(
+  el: Element,
+  filename: string,
+  opts: { color?: string } = {},
+): Promise<void> {
+  const { toPng } = await import('html-to-image')
+  const width = Math.max(1, Math.ceil(el.getBoundingClientRect().width))
+  const holder = document.createElement('div')
+  holder.setAttribute('aria-hidden', 'true')
+  holder.style.cssText = `position:fixed;left:-99999px;top:0;width:${width + 64}px;background:#ffffff;padding:24px 32px;`
+  if (opts.color) holder.style.color = opts.color
+  holder.appendChild(el.cloneNode(true))
+  document.body.appendChild(holder)
+  try {
+    await waitImagesDecoded(holder)
+    const dataUrl = await toPng(holder, {
+      pixelRatio: 2,
+      backgroundColor: '#ffffff',
+      fontEmbedCSS: await cachedFontEmbedCss(),
+    })
+    const a = document.createElement('a')
+    a.href = dataUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } finally {
+    holder.remove()
+  }
 }
 
 function SvgSegment({ html, ctx }: { html: string; ctx: MediaCtx }) {
@@ -286,6 +492,7 @@ function MermaidBlock({ code, ctx }: { code: string; ctx: MediaCtx }) {
   const dark = resolvedTheme === 'dark'
   const [svg, setSvg] = React.useState('')
   const [failed, setFailed] = React.useState(false)
+  const boxRef = React.useRef<HTMLDivElement>(null)
 
   // Re-renders when the source or the theme changes; keeps the previous SVG
   // visible while the new one is being produced (no flicker to loading state).
@@ -299,6 +506,8 @@ function MermaidBlock({ code, ctx }: { code: string; ctx: MediaCtx }) {
           startOnLoad: false,
           theme: dark ? 'dark' : 'neutral',
           securityLevel: 'strict',
+          // 纯 SVG 文本标签（不用 foreignObject）：导出 PNG/SVG 时跨浏览器序列化不丢文字
+          flowchart: { htmlLabels: false },
         })
         mermaidSeq += 1
         const id = `rich-mermaid-${mermaidSeq}`
@@ -316,6 +525,37 @@ function MermaidBlock({ code, ctx }: { code: string; ctx: MediaCtx }) {
     }
   }, [code, dark])
 
+  /** 容器内渲染好的 svg 元素（导出用；未渲染完成返回 null） */
+  const renderedSvg = (): SVGSVGElement | null => boxRef.current?.querySelector('svg') ?? null
+
+  const handleExportSvg = () => {
+    const el = renderedSvg()
+    if (!el) {
+      toast.error('图表尚未渲染完成，请稍后再试')
+      return
+    }
+    try {
+      toast.success(`已导出 ${downloadSvgElement(el, MEDIA_KIND_LABEL.mermaid)}`)
+    } catch {
+      toast.error('导出 SVG 失败')
+    }
+  }
+
+  const handleExportPng = async () => {
+    const el = renderedSvg()
+    if (!el) {
+      toast.error('图表尚未渲染完成，请稍后再试')
+      return
+    }
+    const tid = toast.loading('正在生成 PNG…')
+    try {
+      const name = await downloadSvgElementAsPng(el, MEDIA_KIND_LABEL.mermaid)
+      toast.success(`已导出 ${name}`, { id: tid })
+    } catch {
+      toast.error('导出 PNG 失败', { id: tid })
+    }
+  }
+
   if (failed) {
     // Graceful fallback: show the mermaid source as a plain code block.
     return <CodeBlock raw={code} ctx={ctx} kind="code" lang="mermaid"><code className="font-mono">{code}</code></CodeBlock>
@@ -329,6 +569,7 @@ function MermaidBlock({ code, ctx }: { code: string; ctx: MediaCtx }) {
   }
   const body = (
     <div
+      ref={boxRef}
       className="my-3 flex max-w-full justify-center overflow-x-auto rounded-xl border border-border bg-background p-3 [&_svg]:max-w-full"
       // Mermaid SVG string (securityLevel: 'strict').
       dangerouslySetInnerHTML={{ __html: svg }}
@@ -348,6 +589,8 @@ function MermaidBlock({ code, ctx }: { code: string; ctx: MediaCtx }) {
       <MediaActionBar
         onDetail={() => ctx.onDetail({ kind: 'mermaid', src: code })}
         onDownload={() => downloadMediaSrc('mermaid', code, 'mermaid')}
+        onExportPng={() => void handleExportPng()}
+        onExportSvg={handleExportSvg}
       />
     </div>
   )
@@ -419,8 +662,8 @@ function CodeBlock({
       <pre
         className={cn(
           'overflow-x-auto rounded-xl border border-border bg-muted/70 p-3 font-mono text-xs leading-relaxed',
-          // 右侧留出操作按钮空间（交互态有 详情+下载+复制 三个按钮）
-          ctx.interactive ? 'pr-24' : 'pr-12',
+          // 右侧留出操作按钮空间（交互态有 详情+下载+复制 三个 size-8 按钮）
+          ctx.interactive ? 'pr-30' : 'pr-14',
         )}
       >
         {children}
@@ -433,18 +676,18 @@ function CodeBlock({
               aria-label="放大详情"
               title="放大详情"
               onClick={() => ctx.onDetail({ kind: kind === 'table' ? 'table' : 'code', src: raw, lang })}
-              className="flex size-7 items-center justify-center rounded-lg border border-border bg-background/90 text-muted-foreground shadow-sm transition-colors hover:text-foreground"
+              className="flex size-8 items-center justify-center rounded-lg border border-border bg-background/90 text-muted-foreground shadow-sm transition-colors hover:text-foreground"
             >
-              <Maximize2 className="size-3.5" strokeWidth={1.75} />
+              <Maximize2 className="size-4" strokeWidth={1.75} />
             </button>
             <button
               type="button"
               aria-label="下载保存"
               title="下载保存"
               onClick={() => downloadMediaSrc(kind === 'table' ? 'table' : 'code', raw, lang)}
-              className="flex size-7 items-center justify-center rounded-lg border border-border bg-background/90 text-muted-foreground shadow-sm transition-colors hover:text-foreground"
+              className="flex size-8 items-center justify-center rounded-lg border border-border bg-background/90 text-muted-foreground shadow-sm transition-colors hover:text-foreground"
             >
-              <Download className="size-3.5" strokeWidth={1.75} />
+              <Download className="size-4" strokeWidth={1.75} />
             </button>
           </>
         )}
@@ -452,12 +695,12 @@ function CodeBlock({
           type="button"
           aria-label="复制代码"
           onClick={() => void copy()}
-          className="flex size-7 items-center justify-center rounded-lg border border-border bg-background/90 text-muted-foreground shadow-sm transition-colors hover:text-foreground"
+          className="flex size-8 items-center justify-center rounded-lg border border-border bg-background/90 text-muted-foreground shadow-sm transition-colors hover:text-foreground"
         >
           {copied ? (
-            <Check className="size-3.5 text-emerald-600" strokeWidth={2} />
+            <Check className="size-4 text-emerald-600" strokeWidth={2} />
           ) : (
-            <Copy className="size-3.5" strokeWidth={1.75} />
+            <Copy className="size-4" strokeWidth={1.75} />
           )}
         </button>
       </div>
@@ -478,12 +721,26 @@ function FormulaDisplayBlock({ children, ctx }: { children: React.ReactNode; ctx
     return <span className="block">{children}</span>
   }
   const src = () => katexSourceOf(ref.current)
+  /** KaTeX 渲染结果（含 html）→ 白底容器 → PNG */
+  const handleExportPng = async () => {
+    const node =
+      ref.current?.querySelector('.katex-display') ?? ref.current?.querySelector('.katex') ?? ref.current
+    if (!node) return
+    const tid = toast.loading('正在生成图片…')
+    try {
+      await exportElementAsPng(node, `${MEDIA_KIND_LABEL.formula}-${fileTimestamp()}.png`)
+      toast.success('已导出公式图片', { id: tid })
+    } catch {
+      toast.error('导出图片失败', { id: tid })
+    }
+  }
   return (
     <span ref={ref} className="group relative block">
       {children}
       <MediaActionBar
         onDetail={() => ctx.onDetail({ kind: 'formula', src: src(), lang: 'latex' })}
         onDownload={() => downloadMediaSrc('formula', src(), 'latex')}
+        onExportPng={() => void handleExportPng()}
       />
     </span>
   )
@@ -532,6 +789,48 @@ function hastTableToMarkdown(node?: HastNode | null): string {
     `| ${Array.from({ length: cols }, () => '---').join(' | ')} |`,
     ...body.map((r) => `| ${r.join(' | ')} |`),
   ].join('\n')
+}
+
+/** GFM 表格块：横向滚动容器 + 悬浮操作条（详情 / 下载 MD / 导出 PNG 图片）。 */
+function TableBlock({
+  node,
+  children,
+  ctx,
+}: {
+  node?: HastNode
+  children: React.ReactNode
+  ctx: MediaCtx
+}) {
+  const wrapRef = React.useRef<HTMLDivElement>(null)
+  const md = hastTableToMarkdown(node)
+  const detail = () => ctx.onDetail({ kind: 'table', src: md || reactNodeText(children), lang: 'table' })
+  /** 表格元素 → 白底容器 → PNG（白底、2x，含表头底色与边框样式） */
+  const handleExportPng = async () => {
+    const tbl = wrapRef.current?.querySelector('table')
+    if (!tbl) return
+    const tid = toast.loading('正在生成图片…')
+    try {
+      await exportElementAsPng(tbl, `${MEDIA_KIND_LABEL.table}-${fileTimestamp()}.png`)
+      toast.success('已导出表格图片', { id: tid })
+    } catch {
+      toast.error('导出图片失败', { id: tid })
+    }
+  }
+  return (
+    <div ref={wrapRef} className="group relative my-3 max-w-full">
+      <div className="max-w-full overflow-x-auto rounded-xl border border-border">
+        <table className="w-full border-collapse text-sm">{children}</table>
+      </div>
+      {ctx.interactive && (
+        <MediaActionBar
+          onDetail={detail}
+          onDownload={() => downloadMediaSrc('table', md, 'table')}
+          onExportPng={() => void handleExportPng()}
+          className="-top-2"
+        />
+      )}
+    </div>
+  )
 }
 
 function buildMarkdownComponents(ctx: MediaCtx): Components {
@@ -584,20 +883,11 @@ function buildMarkdownComponents(ctx: MediaCtx): Components {
       </blockquote>
     ),
     hr: () => <hr className="my-4 border-border" />,
-    table: ({ node, children }) => {
-      const md = hastTableToMarkdown(node as unknown as HastNode)
-      const detail = () => ctx.onDetail({ kind: 'table', src: md || reactNodeText(children), lang: 'table' })
-      return (
-        <div className="group relative my-3 max-w-full">
-          <div className="max-w-full overflow-x-auto rounded-xl border border-border">
-            <table className="w-full border-collapse text-sm">{children}</table>
-          </div>
-          {ctx.interactive && (
-            <MediaActionBar onDetail={detail} onDownload={() => downloadMediaSrc('table', md, 'table')} className="-top-2" />
-          )}
-        </div>
-      )
-    },
+    table: ({ node, children }) => (
+      <TableBlock node={node as unknown as HastNode} ctx={ctx}>
+        {children}
+      </TableBlock>
+    ),
     thead: ({ children }) => <thead className="bg-muted/70">{children}</thead>,
     th: ({ children }) => (
       <th className="whitespace-nowrap border-b border-border px-3 py-2 text-left font-semibold">
@@ -614,6 +904,14 @@ function buildMarkdownComponents(ctx: MediaCtx): Components {
     ),
     img: ({ src, alt }) => {
       const url = typeof src === 'string' ? src : ''
+      const altText = alt ?? ''
+      // 音视频引用占位（mediaRefPlaceholders 生成）→ 原生播放器卡片
+      if (url && altText.startsWith('av-audio:')) {
+        return <AudioBlock url={url} title={altText.slice('av-audio:'.length) || '音频'} ctx={ctx} />
+      }
+      if (url && altText.startsWith('av-video:')) {
+        return <VideoBlock url={url} title={altText.slice('av-video:'.length) || '视频'} ctx={ctx} />
+      }
       const body = (
         <img
           src={url}
@@ -698,6 +996,7 @@ function MediaDetailOverlay({
   const [pan, setPan] = React.useState({ x: 0, y: 0 })
   const [copied, setCopied] = React.useState(false)
   const dragRef = React.useRef<{ sx: number; sy: number; ox: number; oy: number } | null>(null)
+  const stageRef = React.useRef<HTMLDivElement>(null)
 
   React.useEffect(() => {
     setScale(1)
@@ -731,6 +1030,56 @@ function MediaDetailOverlay({
     }
   }
 
+  // ---- 详情态导出（mermaid / SVG / 表格 / 公式） ----
+  const canExportVector = detail.kind === 'mermaid' || detail.kind === 'svg'
+  const canExportPng = canExportVector || detail.kind === 'table' || detail.kind === 'formula'
+
+  const handleExportSvg = () => {
+    const el = stageRef.current?.querySelector('svg')
+    if (!el) {
+      toast.error('内容尚未渲染完成，请稍后再试')
+      return
+    }
+    try {
+      toast.success(`已导出 ${downloadSvgElement(el, MEDIA_KIND_LABEL[detail.kind])}`)
+    } catch {
+      toast.error('导出 SVG 失败')
+    }
+  }
+
+  const handleExportPng = async () => {
+    if (canExportVector) {
+      const el = stageRef.current?.querySelector('svg')
+      if (!el) {
+        toast.error('内容尚未渲染完成，请稍后再试')
+        return
+      }
+      const tid = toast.loading('正在生成 PNG…')
+      try {
+        const name = await downloadSvgElementAsPng(el, MEDIA_KIND_LABEL[detail.kind])
+        toast.success(`已导出 ${name}`, { id: tid })
+      } catch {
+        toast.error('导出 PNG 失败', { id: tid })
+      }
+      return
+    }
+    // 表格 / 公式：克隆进白底容器 → html-to-image（公式强制深色文字，避免白底白字）
+    const el =
+      detail.kind === 'table'
+        ? stageRef.current?.querySelector('table')
+        : (stageRef.current?.querySelector('.katex-display') ?? stageRef.current?.querySelector('.katex'))
+    if (!el) return
+    const tid = toast.loading('正在生成图片…')
+    try {
+      await exportElementAsPng(el, `${MEDIA_KIND_LABEL[detail.kind]}-${fileTimestamp()}.png`, {
+        color: detail.kind === 'formula' ? '#18181b' : undefined,
+      })
+      toast.success('已导出图片', { id: tid })
+    } catch {
+      toast.error('导出图片失败', { id: tid })
+    }
+  }
+
   /** 详情内容：mermaid/svg 用自身（mediaInteractive=false）渲染，防递归 */
   let content: React.ReactNode
   switch (detail.kind) {
@@ -744,23 +1093,50 @@ function MediaDetailOverlay({
         />
       )
       break
+    case 'audio':
+      content = (
+        <div className="w-[92vw] max-w-md rounded-2xl bg-white p-5">
+          <p className="mb-3 truncate text-center text-sm font-semibold text-zinc-900">
+            {detail.alt || MEDIA_KIND_LABEL.audio}
+          </p>
+          <audio controls preload="metadata" src={detail.src} className="w-full" />
+        </div>
+      )
+      break
+    case 'video':
+      content = (
+        <video
+          controls
+          playsInline
+          preload="metadata"
+          src={detail.src}
+          className="max-h-[72dvh] max-w-[92vw] rounded-xl bg-black"
+        />
+      )
+      break
     case 'mermaid':
       content = (
-        <div className="max-h-[76dvh] max-w-[92vw] overflow-auto rounded-xl bg-white p-4">
+        <div
+          ref={stageRef}
+          className="max-h-[76dvh] max-w-[92vw] overflow-auto rounded-xl bg-white p-4"
+        >
           <RichContent content={'```mermaid\n' + detail.src + '\n```'} mediaInteractive={false} />
         </div>
       )
       break
     case 'svg':
       content = (
-        <div className="max-h-[76dvh] max-w-[92vw] overflow-auto rounded-xl bg-white p-4">
+        <div ref={stageRef} className="max-h-[76dvh] max-w-[92vw] overflow-auto rounded-xl bg-white p-4">
           <RichContent content={'```svg\n' + detail.src + '\n```'} mediaInteractive={false} />
         </div>
       )
       break
     case 'table':
       content = (
-        <div className="max-h-[76dvh] max-w-[94vw] overflow-auto rounded-xl bg-background p-4 text-foreground">
+        <div
+          ref={stageRef}
+          className="max-h-[76dvh] max-w-[94vw] overflow-auto rounded-xl bg-background p-4 text-foreground"
+        >
           <RichContent content={detail.src} mediaInteractive={false} />
         </div>
       )
@@ -805,6 +1181,28 @@ function MediaDetailOverlay({
           >
             {copied ? <Check className="size-4 text-emerald-400" /> : <Copy className="size-4" />}
           </button>
+          {canExportPng && (
+            <button
+              type="button"
+              aria-label="导出PNG"
+              title="导出PNG"
+              onClick={() => void handleExportPng()}
+              className={ctrlBtn}
+            >
+              <ImageDown className="size-4" />
+            </button>
+          )}
+          {canExportVector && (
+            <button
+              type="button"
+              aria-label="导出SVG"
+              title="导出SVG"
+              onClick={handleExportSvg}
+              className={ctrlBtn}
+            >
+              <FileDown className="size-4" />
+            </button>
+          )}
           <button
             type="button"
             aria-label="下载保存"
@@ -953,8 +1351,9 @@ export const RichContent = React.memo(function RichContent({
                 rehypePlugins={[rehypeRaw, rehypeHighlight, rehypeKatex]}
                 components={components}
               >
-                {/* 先展开 %%样式|文字%% 指令（代码段内不动），再护住非数学的 $ 货币对 */}
-                {guardDollarsOutsideCode(expandSpanDirectives(sub.value))}
+                {/* 先展开 %%样式|文字%% 指令（代码段内不动），再把音视频引用换成播放器占位
+                    （img 组件映射渲染 audio/video），最后护住非数学的 $ 货币对 */}
+                {guardDollarsOutsideCode(mediaRefPlaceholders(expandSpanDirectives(sub.value)))}
               </ReactMarkdown>
             ),
           )

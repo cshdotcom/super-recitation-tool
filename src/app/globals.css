@@ -271,11 +271,15 @@
    Radix Dialog/Sheet 打开时会置 body{pointer-events:none}，而 sonner 默认样式
    只给 toaster 容器 pointer-events:none、未给单条 toast 恢复 auto —— 导致
    Sheet 内弹出的 toast 按钮（如出题后的「存入」）完全点不到，点击穿透到
-   Sheet 遮罩把整个面板关掉。这里显式恢复每条 toast 的指针事件。
+   Sheet 遮罩把整个面板关掉。这里显式恢复带按钮 toast 的指针事件。
+
+   注意：无按钮的纯提示 toast 必须 pointer-events:none —— top-center toast
+   （宽 356px）会覆盖专注全屏层左上角 X 按钮的热区，导致「X 间歇性点不到」。
 --------------------------------------------------------------------------- */
 [data-sonner-toast] {
-  pointer-events: auto;
+  pointer-events: none;
 }
+[data-sonner-toast]:has([data-button]),
 [data-sonner-toast] [data-button] {
   pointer-events: auto;
 }

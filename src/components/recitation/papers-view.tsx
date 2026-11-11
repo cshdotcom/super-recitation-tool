@@ -8,10 +8,12 @@
 //   • 搜索：过滤试卷标题 + items[].question 题目内容
 //   • 排序：创建时间 / 标题 / 题数 × 正序/倒序（偏好存 localStorage）
 //   • 日期筛选：全部 / 近7天 / 近30天 / 近90天
-//   • 批量管理：复选框模式 — 全选 / 批量删除（确认）/ 批量导出（合并 Markdown）
+//   • 批量管理：复选框模式 — 全选 / 批量删除（确认）/ 批量导出（合并 MD / 合并
+//     HTML / 合并 PDF 打印）
 //   • 试卷详情：内联展开，RichContent 渲染每题（题干+选项+答案，富媒体绝不溢出）
 //     每题可勾选；全选/反选 + AI 智能勾选（/api/chat mode:'pick'）+ 练习所选；
-//     「开始练习」→ onPractice(items, title) 由宿主接入答题流程；导出单份 MD / TXT
+//     「开始练习」→ onPractice(items, title) 由宿主接入答题流程；
+//     导出单份 MD / TXT / HTML / PDF（打印）
 //
 // API（src/app/api/papers/route.ts）：
 //   GET    /api/papers?cardId=<id> → { papers }（省略 cardId = 全部，时间倒序）
@@ -24,12 +26,14 @@ import {
   CalendarRange,
   Check,
   Download,
+  FileCode2,
   FileText,
   FolderOpen,
   Loader2,
   MoreVertical,
   Pencil,
   Play,
+  Printer,
   Search,
   Sparkles,
   Square,
@@ -39,6 +43,12 @@ import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
 import { RichContent } from '@/components/recitation/rich-content'
+import {
+  escapeHtml,
+  mediaRefsToText,
+  printHtmlDocument,
+  renderMarkdown,
+} from '@/lib/export-utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -81,6 +91,8 @@ export interface PaperItem {
   question: string
   answer: string
   options?: string[]
+  /** 解析（可选：AI 出题/举一反三来源可能携带） */
+  explanation?: string
 }
 
 export interface PaperData {
@@ -225,7 +237,10 @@ function safeFilename(s: string): string {
   return (s.trim() || '试卷').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60)
 }
 
-/** 单份试卷 → Markdown（试卷标题 + 题目 + 选项 + 答案） */
+/** 导出格式：md / txt / html / pdf（打印链路，浏览器「另存为 PDF」） */
+type PaperExportFormat = 'md' | 'txt' | 'html' | 'pdf'
+
+/** 单份试卷 → Markdown（试卷标题 + 题目 + 选项 + 答案 + 解析；富媒体保留源码原样） */
 function paperToMarkdown(p: PaperData): string {
   const head: string[] = [
     `# ${p.title}`,
@@ -243,24 +258,161 @@ function paperToMarkdown(p: PaperData): string {
     }
     body.push('')
     body.push(`**答案：** ${it.answer ?? ''}`)
+    if ((it.explanation ?? '').trim()) {
+      body.push('')
+      body.push(`**解析：** ${it.explanation ?? ''}`)
+    }
     body.push('')
   })
   return [...head, ...body].join('\n')
 }
 
-/** 单份试卷 → 纯文本 */
+/** 单份试卷 → 纯文本（音视频引用转为全角占位，不裸露 [[audio:]] 语法） */
 function paperToText(p: PaperData): string {
   const lines: string[] = [`试卷：${p.title}`, `共 ${p.count} 题 · ${formatDate(p.createdAt)}`, '']
   ;(p.items ?? []).forEach((it, i) => {
     lines.push(`第${i + 1}题 [${TYPE_LABEL[it.type] ?? it.type ?? '题目'}]`)
-    lines.push(it.question ?? '')
+    lines.push(mediaRefsToText(it.question ?? ''))
     if (Array.isArray(it.options) && it.options.length > 0) {
-      it.options.forEach((o, j) => lines.push(`${String.fromCharCode(65 + j)}. ${o}`))
+      it.options.forEach((o, j) => lines.push(`${String.fromCharCode(65 + j)}. ${mediaRefsToText(o)}`))
     }
-    lines.push(`答案：${it.answer ?? ''}`)
+    lines.push(`答案：${mediaRefsToText(it.answer ?? '')}`)
+    if ((it.explanation ?? '').trim()) lines.push(`解析：${mediaRefsToText(it.explanation ?? '')}`)
     lines.push('')
   })
   return lines.join('\n')
+}
+
+// ---------- 试卷 HTML / 打印 PDF 导出 ----------
+
+/** 试卷导出文档样式（屏幕阅读 + @media print A4 打印规则） */
+const PAPER_DOC_STYLES = `* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: #f5f5f2; color: #26262a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif; font-size: 16px; line-height: 1.85; -webkit-font-smoothing: antialiased; }
+.wrap { max-width: 760px; margin: 0 auto; padding: 48px 28px 40px; background: #ffffff; min-height: 100vh; }
+.paper + .paper { margin-top: 48px; }
+.paper-title { margin: 0 0 8px; font-size: 1.5em; line-height: 1.4; font-weight: 700; text-align: center; }
+.paper-meta { margin: 0 0 18px; text-align: center; font-size: 13px; color: #9a9aa0; }
+.q { border: 1px solid #e6e6e0; border-radius: 12px; padding: 16px 20px; margin: 14px 0; page-break-inside: avoid; break-inside: avoid; }
+.q > h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; font-size: 1em; font-weight: 700; }
+.q .no { color: #0b7a5b; }
+.q .tp { font-size: 12px; font-weight: 600; color: #0b7a5b; background: #e8f6f0; border-radius: 999px; padding: 1px 10px; white-space: nowrap; }
+.stem p { margin: 0 0 0.7em; }
+.stem img { max-width: 100%; height: auto; border-radius: 8px; }
+.stem ul, .stem ol { margin: 0.4em 0 0.8em; padding-left: 1.6em; }
+.stem blockquote { margin: 0.7em 0; padding: 2px 14px; border-left: 3px solid #d8d8d0; background: #fafaf6; color: #55555c; }
+.stem pre { background: #f6f6f2; border: 1px solid #e6e6e0; border-radius: 10px; padding: 10px 14px; overflow-x: auto; font-size: 0.86em; }
+.stem code { font-family: ui-monospace, Menlo, Consolas, monospace; background: #f2f2ee; border-radius: 5px; padding: 1px 5px; font-size: 0.88em; }
+.stem pre code { background: none; padding: 0; }
+.stem table, .val table { border-collapse: collapse; width: 100%; margin: 0.8em 0; font-size: 0.92em; }
+.stem th, .stem td, .val th, .val td { border: 1px solid #dcdcd4; padding: 6px 10px; text-align: left; vertical-align: top; }
+.stem th, .val th { background: #f2f2ec; font-weight: 600; }
+.opts { margin: 8px 0 2px; }
+.opt { margin: 4px 0; }
+.opt .key { font-weight: 600; color: #0b7a5b; margin-right: 4px; }
+.ans, .exp { margin-top: 10px; border-top: 1px dashed #e6e6e0; padding-top: 8px; }
+.ans .lbl, .exp .lbl { display: inline-block; font-size: 12px; font-weight: 700; color: #ffffff; background: #0e9f6e; border-radius: 999px; padding: 1px 10px; margin-bottom: 6px; }
+.exp .lbl { background: #6b7280; }
+.ans .val, .exp .val { color: #1f2937; }
+.ans .val p, .exp .val p { margin: 0 0 0.5em; }
+.doc-footer { margin-top: 44px; padding-top: 14px; border-top: 1px solid #e6e6e0; text-align: center; color: #a0a0a6; font-size: 12px; }
+@media print {
+  @page { size: A4; margin: 14mm 13mm; }
+  html, body { background: #ffffff; }
+  body { font-size: 12pt; }
+  .wrap { max-width: none; padding: 0; min-height: auto; }
+  .paper.break-before { page-break-before: always; break-before: page; }
+  .doc-footer { margin-top: 24px; }
+}`
+
+/** 单份试卷正文（标题 + meta + 题目：题号题型 + 题干 + 选项 + 答案 + 解析）。 */
+function paperSectionHtml(
+  p: PaperData,
+  opts: { headingTag?: 'h1' | 'h2'; breakBefore?: boolean } = {},
+): string {
+  const items = p.items ?? []
+  const h = opts.headingTag ?? 'h1'
+  const meta = [
+    sourceLabel(p.source),
+    `共 ${p.count || items.length} 题`,
+    formatDate(p.createdAt),
+    p.cardTitle ? `《${escapeHtml(p.cardTitle)}》` : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+  const qs = items
+    .map((it, i) => {
+      const optsHtml =
+        Array.isArray(it.options) && it.options.length > 0
+          ? `<div class="opts">${it.options
+              .map(
+                (o, j) =>
+                  `<p class="opt"><span class="key">${String.fromCharCode(65 + j)}.</span> ${escapeHtml(o)}</p>`,
+              )
+              .join('')}</div>`
+          : ''
+      const answer = (it.answer ?? '').trim()
+      const explanation = (it.explanation ?? '').trim()
+      return `<section class="q">
+  <h3><span class="no">第 ${i + 1} 题</span><span class="tp">${escapeHtml(TYPE_LABEL[it.type] ?? it.type ?? '题目')}</span></h3>
+  <div class="stem">${renderMarkdown(it.question ?? '')}</div>${optsHtml ? `\n  ${optsHtml}` : ''}${answer ? `\n  <div class="ans"><span class="lbl">答案</span><div class="val">${renderMarkdown(answer)}</div></div>` : ''}${explanation ? `\n  <div class="exp"><span class="lbl">解析</span><div class="val">${renderMarkdown(explanation)}</div></div>` : ''}
+</section>`
+    })
+    .join('\n')
+  return `<section class="paper${opts.breakBefore ? ' break-before' : ''}">
+  <${h} class="paper-title">${escapeHtml(p.title)}</${h}>
+  <p class="paper-meta">${meta}</p>
+${qs ? `  ${qs}\n` : '  <p class="paper-meta">（这份试卷没有题目）</p>\n'}</section>`
+}
+
+/** 完整独立 HTML 文档（内联 CSS；autoPrint 时加载完自动调起打印）。 */
+function buildPaperHtmlDoc(
+  sections: string,
+  opts: { docTitle: string; autoPrint?: boolean },
+): string {
+  const autoPrintScript = opts.autoPrint
+    ? `\n  <script>
+    window.addEventListener('load', function () {
+      setTimeout(function () { try { window.focus(); window.print(); } catch (e) {} }, 200);
+    });
+  </script>`
+    : ''
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>${escapeHtml(opts.docTitle)}</title>
+<style>${PAPER_DOC_STYLES}</style>
+</head>
+<body>
+  <main class="wrap">
+${sections}
+  <footer class="doc-footer">导出自「背书吧」试卷夹 · ${new Date().toLocaleString('zh-CN', { hour12: false })}</footer>
+  </main>${autoPrintScript}
+</body>
+</html>`
+}
+
+/** 单份试卷 → 独立 HTML 文档。 */
+function buildPaperHtml(p: PaperData, opts: { autoPrint?: boolean } = {}): string {
+  return buildPaperHtmlDoc(paperSectionHtml(p), { docTitle: p.title, autoPrint: opts.autoPrint })
+}
+
+/** 多份试卷 → 合并 HTML 文档（每份试卷打印时另起一页）。 */
+function buildMergedPaperHtml(list: PaperData[], opts: { autoPrint?: boolean } = {}): string {
+  const sections = list
+    .map((p, i) => paperSectionHtml(p, { headingTag: 'h2', breakBefore: i > 0 }))
+    .join('\n')
+  return buildPaperHtmlDoc(sections, {
+    docTitle: `试卷合并导出（${list.length} 份）`,
+    autoPrint: opts.autoPrint,
+  })
+}
+
+/** 打印试卷（隐藏 iframe + A4 打印样式；打印窗口选「另存为 PDF」即得 PDF）。 */
+function printPaper(p: PaperData): void {
+  printHtmlDocument(buildPaperHtml(p, { autoPrint: true }))
 }
 
 // ---------- 主组件 ----------
@@ -507,28 +659,54 @@ export function PapersView({
     }
   }
 
-  const exportOne = (p: PaperData, fmt: 'md' | 'txt') => {
+  const exportOne = (p: PaperData, fmt: PaperExportFormat) => {
     const name = safeFilename(p.title)
-    if (fmt === 'md') {
-      downloadText(`${name}.md`, paperToMarkdown(p), 'text/markdown;charset=utf-8')
-    } else {
-      downloadText(`${name}.txt`, paperToText(p), 'text/plain;charset=utf-8')
+    switch (fmt) {
+      case 'md':
+        downloadText(`${name}.md`, paperToMarkdown(p), 'text/markdown;charset=utf-8')
+        toast.success('已导出 Markdown 文件')
+        break
+      case 'txt':
+        downloadText(`${name}.txt`, paperToText(p), 'text/plain;charset=utf-8')
+        toast.success('已导出 TXT 文件')
+        break
+      case 'html':
+        downloadText(`${name}.html`, buildPaperHtml(p), 'text/html;charset=utf-8')
+        toast.success('已导出 HTML 文件')
+        break
+      case 'pdf':
+        toast.info('已打开打印窗口，选择「另存为 PDF」即可导出')
+        printPaper(p)
+        break
     }
-    toast.success(`已导出 ${fmt.toUpperCase()} 文件`)
   }
 
-  const exportBatch = () => {
+  /** 批量导出：md = 合并 Markdown；html = 合并独立 HTML；pdf = 合并打印（每卷另起一页） */
+  const exportBatch = (fmt: 'md' | 'html' | 'pdf') => {
     if (selectedPapers.length === 0) {
       toast('未选中任何试卷')
       return
     }
-    const md = selectedPapers.map((p) => paperToMarkdown(p)).join('\n\n---\n\n')
-    downloadText(
-      `试卷夹_合并导出_${new Date().toISOString().slice(0, 10)}.md`,
-      md,
-      'text/markdown;charset=utf-8',
-    )
-    toast.success(`已合并导出 ${selectedPapers.length} 份试卷`)
+    const stamp = new Date().toISOString().slice(0, 10)
+    if (fmt === 'md') {
+      const md = selectedPapers.map((p) => paperToMarkdown(p)).join('\n\n---\n\n')
+      downloadText(
+        `试卷夹_合并导出_${stamp}.md`,
+        md,
+        'text/markdown;charset=utf-8',
+      )
+      toast.success(`已合并导出 ${selectedPapers.length} 份试卷（MD）`)
+    } else if (fmt === 'html') {
+      downloadText(
+        `试卷夹_合并导出_${stamp}.html`,
+        buildMergedPaperHtml(selectedPapers),
+        'text/html;charset=utf-8',
+      )
+      toast.success(`已合并导出 ${selectedPapers.length} 份试卷（HTML）`)
+    } else {
+      toast.info('已打开打印窗口，选择「另存为 PDF」即可导出')
+      printHtmlDocument(buildMergedPaperHtml(selectedPapers, { autoPrint: true }))
+    }
   }
 
   // ---- 书本切换列表：当前书 + 全部书 + 其他书 ----
@@ -768,14 +946,29 @@ export function PapersView({
               </button>
             </div>
             <div className="flex gap-2">
-              <Button
-                variant="outline"
-                disabled={selected.size === 0 || busy}
-                onClick={exportBatch}
-                className="h-11 flex-1 rounded-full text-sm"
-              >
-                <Download className="size-4" strokeWidth={1.75} /> 导出 MD
-              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    disabled={selected.size === 0 || busy}
+                    className="h-11 flex-1 rounded-full text-sm"
+                  >
+                    <Download className="size-4" strokeWidth={1.75} /> 批量导出
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-52">
+                  <DropdownMenuItem onClick={() => exportBatch('md')}>
+                    <FileText className="size-4" strokeWidth={1.75} /> 合并导出 MD
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => exportBatch('html')}>
+                    <FileCode2 className="size-4" strokeWidth={1.75} /> 合并导出 HTML
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onClick={() => exportBatch('pdf')}>
+                    <Printer className="size-4" strokeWidth={1.75} /> 合并导出 PDF（打印）
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <AlertDialog open={batchDeleteOpen} onOpenChange={setBatchDeleteOpen}>
                 <Button
                   variant="outline"
@@ -903,7 +1096,7 @@ function PaperCard({
   onToggleExpand: () => void
   /** 开始练习：不传 items = 全部题目；传入 = 只练勾选的题 */
   onPractice: (items?: PaperItem[]) => void
-  onExport: (fmt: 'md' | 'txt') => void
+  onExport: (fmt: PaperExportFormat) => void
   onRename: () => void
   onDelete: () => void
 }) {
@@ -1040,6 +1233,12 @@ function PaperCard({
               <DropdownMenuItem onClick={() => onExport('txt')}>
                 <FileText className="size-4" strokeWidth={1.75} /> 导出 TXT
               </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => onExport('html')}>
+                <FileCode2 className="size-4" strokeWidth={1.75} /> 导出 HTML
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => onExport('pdf')}>
+                <Printer className="size-4" strokeWidth={1.75} /> 导出 PDF（打印）
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={onDelete} className="text-destructive">
                 <Trash2 className="size-4" strokeWidth={1.75} /> 删除
               </DropdownMenuItem>
@@ -1152,20 +1351,37 @@ function PaperCard({
                 <Play className="size-4" strokeWidth={2} /> 练习所选（{sel.size}）
               </Button>
             )}
-            <Button
-              variant="outline"
-              onClick={() => onExport('md')}
-              className="h-11 rounded-full text-sm"
-            >
-              <Download className="size-4" strokeWidth={1.75} /> MD
-            </Button>
-            <Button
-              variant="outline"
-              onClick={() => onExport('txt')}
-              className="h-11 rounded-full text-sm"
-            >
-              <FileText className="size-4" strokeWidth={1.75} /> TXT
-            </Button>
+            {/* 导出格式按钮排：MD / TXT / HTML / PDF（打印） */}
+            <div className="flex w-full flex-wrap gap-2">
+              <Button
+                variant="outline"
+                onClick={() => onExport('md')}
+                className="h-11 min-w-0 flex-1 rounded-full px-2 text-xs"
+              >
+                <Download className="size-4 shrink-0" strokeWidth={1.75} /> MD
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => onExport('txt')}
+                className="h-11 min-w-0 flex-1 rounded-full px-2 text-xs"
+              >
+                <FileText className="size-4 shrink-0" strokeWidth={1.75} /> TXT
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => onExport('html')}
+                className="h-11 min-w-0 flex-1 rounded-full px-2 text-xs"
+              >
+                <FileCode2 className="size-4 shrink-0" strokeWidth={1.75} /> HTML
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => onExport('pdf')}
+                className="h-11 min-w-0 flex-1 rounded-full px-2 text-xs"
+              >
+                <Printer className="size-4 shrink-0" strokeWidth={1.75} /> PDF
+              </Button>
+            </div>
           </div>
         </div>
       )}

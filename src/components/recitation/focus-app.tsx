@@ -353,9 +353,12 @@ export function FocusApp({ onBack }: FocusAppProps) {
   }, [fetchList])
 
   // 浮时钟详情「全屏计时」→ 页面切到本视图后打开全屏遮罩；
-  // 若事件先于本组件挂载派发（用户在其他视图点击），用 consumeOpenFocusRequest 补收
+  // 若事件先于本组件挂载派发（用户在其他视图点击），用 consumeOpenFocusRequest 补收。
+  // ⚠️ 挂载着的监听器也必须 consume 掉时间戳：否则「pill 点击打开遮罩→X 最小化→
+  // 5 秒内离开再回到专注视图」时，挂载补收会吃到陈旧请求把遮罩自动弹回（X「退不出去」）。
   React.useEffect(() => {
     const onOpenFocus = () => {
+      consumeOpenFocusRequest()
       if (getFocusState().running) setOverlay(true)
     }
     window.addEventListener('sb-open-focus', onOpenFocus)
@@ -1075,8 +1078,8 @@ export function FocusApp({ onBack }: FocusAppProps) {
               结束并保存
             </button>
           </div>
-          <p className="pointer-events-none absolute inset-x-0 bottom-3 z-20 text-center text-xs text-white/40">
-            关闭后计时仍在后台继续，右下角浮时钟可返回
+          <p className="pointer-events-none absolute inset-x-0 bottom-3 z-20 text-center text-xs text-white/70 drop-shadow">
+            点左上角 ✕ 收起（计时后台继续），右下角浮时钟可随时返回
           </p>
         </div>
       )}

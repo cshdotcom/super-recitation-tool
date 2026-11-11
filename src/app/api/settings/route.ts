@@ -149,6 +149,10 @@ export async function PATCH(req: NextRequest) {
     if (typeof body?.aiAutoCloze === 'boolean') {
       data.aiAutoCloze = body.aiAutoCloze
     }
+    // 导入时 AI 智能排版
+    if (typeof body?.aiAutoFormat === 'boolean') {
+      data.aiAutoFormat = body.aiAutoFormat
+    }
     // AI 出题后自动存入试卷夹
     if (typeof body?.quizAutoPaper === 'boolean') {
       data.quizAutoPaper = body.quizAutoPaper

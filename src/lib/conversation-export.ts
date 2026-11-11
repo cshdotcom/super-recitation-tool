@@ -684,6 +684,45 @@ async function exportAsImage(html: string, filename: string): Promise<void> {
   }
 }
 
+// ---------- mermaid 预渲染（HTML / PDF / 图片 导出增强） ----------
+
+/**
+ * 把导出 HTML 中的 `<pre class="mermaid">源码</pre>` 用 mermaid.render 渲染成
+ * 内联 svg（居中白底容器包裹；渲染失败的块保留源码原文，绝不丢内容）。
+ * 导出 HTML/PDF/图片 前调用，保证收到的文档无需外部脚本即可看到图。
+ */
+async function renderMermaidBlocksInHtml(html: string): Promise<string> {
+  if (!html.includes('class="mermaid"')) return html
+  const mermaid = (await import('mermaid')).default
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: 'neutral',
+    securityLevel: 'strict',
+    flowchart: { htmlLabels: false },
+  })
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  const pres = Array.from(doc.querySelectorAll('pre.mermaid'))
+  let seq = 0
+  for (const pre of pres) {
+    const code = (pre.textContent ?? '').trim()
+    if (!code) continue
+    try {
+      seq += 1
+      const { svg } = await mermaid.render(`conv-export-mermaid-${seq}`, code)
+      const wrap = doc.createElement('div')
+      wrap.setAttribute(
+        'style',
+        'text-align:center;background:#f6f8fa;border:1px solid #e5e7eb;border-radius:10px;padding:12px;overflow-x:auto',
+      )
+      wrap.innerHTML = svg
+      pre.replaceWith(wrap)
+    } catch {
+      // 渲染失败：保留源码块（导出不中断）
+    }
+  }
+  return `<!DOCTYPE html>\n${doc.documentElement.outerHTML}`
+}
+
 // ---------- 主入口 ----------
 
 /**
@@ -711,14 +750,12 @@ export async function exportMessages(
         )
         toast.success('已导出 Markdown')
         break
-      case 'html':
-        downloadTextFile(
-          `${name}.html`,
-          messagesToHtmlDoc(input, opts, 'screen'),
-          'text/html',
-        )
+      case 'html': {
+        const html = await renderMermaidBlocksInHtml(messagesToHtmlDoc(input, opts, 'screen'))
+        downloadTextFile(`${name}.html`, html, 'text/html')
         toast.success('已导出 HTML')
         break
+      }
       case 'txt':
         downloadTextFile(`${name}.txt`, messagesToText(input), 'text/plain')
         toast.success('已导出 TXT')
@@ -729,13 +766,16 @@ export async function exportMessages(
         break
       case 'pdf': {
         const tid = toast.loading('正在准备打印…')
-        await exportAsPdf(messagesToHtmlDoc(input, opts, 'print'))
+        await exportAsPdf(await renderMermaidBlocksInHtml(messagesToHtmlDoc(input, opts, 'print')))
         toast.dismiss(tid)
         break
       }
       case 'image': {
         const tid = toast.loading('正在生成图片…')
-        await exportAsImage(messagesToHtmlDoc(input, opts, 'image'), `${name}.png`)
+        await exportAsImage(
+          await renderMermaidBlocksInHtml(messagesToHtmlDoc(input, opts, 'image')),
+          `${name}.png`,
+        )
         toast.success('已导出图片', { id: tid })
         break
       }

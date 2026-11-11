@@ -4,7 +4,8 @@
 //   table   → 表格网格编辑器（增删行列、单元格编辑）
 //   formula → 公式编辑器（KaTeX 实时预览 + 常用符号面板 + LaTeX 输入）
 //   mermaid mindmap → 思维导图树编辑器（加/改名/删/移动节点）
-//   mermaid graph/flowchart → 流程图结构化编辑器（节点 + 连线，Select 选端点）
+//   mermaid graph/flowchart → 画布式流程图编辑器（SVG 拖拽 / 锚点连线 / 缩放平移 /
+//     subgraph 分组 + 列表模式，两模式共享同一 FlowDoc 与撤销栈）
 //   svg → SVG 可视化编辑器（形状面板 / 画布拖拽 / 属性栏，复杂元素源码保留）
 //   其他 code → 实时预览 + 源码编辑
 // 容错（apply 前校验 + 部分加载 + AI 修复）：
@@ -23,18 +24,28 @@ import 'katex/contrib/mhchem'
 import {
   AlertTriangle,
   ArrowDown,
+  ArrowLeftRight,
   ArrowUp,
   Check,
   ChevronDown,
   ChevronRight,
   Code2,
   Eye,
+  Hand,
   Loader2,
+  Magnet,
+  Maximize2,
+  MousePointer2,
+  MoveRight,
+  Pencil,
   Plus,
+  Redo2,
   Sparkles,
   Trash2,
   Undo2,
   Wand2,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -59,19 +70,14 @@ import {
 } from '@/components/ui/select'
 import {
   MEDIA_KIND_LABEL,
-  buildFlow,
   isMindmap,
-  parseFlow,
   parseMindmap,
   parseTable,
   serializeMindmap,
   serializeTable,
-  type FlowEdge,
-  type FlowGraph,
-  type FlowNode,
-  type FlowShape,
   type MediaKind,
   type MediaRef,
+  type MediaRefKind,
   type MindNode,
   type TableGrid,
 } from '@/components/recitation/media-refs'
@@ -447,120 +453,1893 @@ function MindmapEditor({
   )
 }
 
-// ---------- 流程图结构化编辑器（graph / flowchart） ----------
+// ---------- 流程图画布编辑器（graph / flowchart） ----------
+//
+// 【布局注释协议】节点中心坐标以 JSON 存在声明行后的注释里（mermaid 渲染端忽略 %% 注释行）：
+//   flowchart TD
+//   %%layout:{"a":[80,40],"b":[280,120]}
+// 缺少该行时按连线关系自动分层生成初始坐标；任何画布/列表操作都会重写该行实现位置持久化。
+//
+// 数据流：画布/列表操作 → FlowDoc（不可变更新）→ serializeFlowDoc 重新生成源码 →
+//   宿主 onChange 链写回 src（结构变化立即、拖动位置防抖 600ms）→ 既有校验容错链照常工作。
+// 容错解析：parseFlowDoc 逐行扫描，坏行/未支持指令原样保留在 doc.extras（不丢内容），
+//   行号记入 problems，画布顶部黄条提示「解析出多少显示多少，坏行忽略」。
 
-const FLOW_SHAPES: Array<{ value: FlowShape; label: string }> = [
-  { value: 'rect', label: '方块' },
-  { value: 'round', label: '圆角' },
-  { value: 'diamond', label: '菱形' },
-  { value: 'circle', label: '圆形' },
+type FlowDir = 'TD' | 'TB' | 'LR' | 'RL' | 'BT'
+type FlowEdgeStyle = '-->' | '---' | '-.->' | '==>'
+/** 节点形状（mermaid 语法：bare 默认 / [..] / (..) / ((..)) / {..} / {{..}} / [(..)] / [/../]） */
+type FlowNodeShape =
+  | 'default'
+  | 'rect'
+  | 'round'
+  | 'circle'
+  | 'diamond'
+  | 'hexagon'
+  | 'cylinder'
+  | 'parallelogram'
+
+interface FlowDocNode {
+  id: string
+  label: string
+  shape: FlowNodeShape
+  /** 所属 subgraph 分组 id */
+  group?: string
+  /** 填充色（生成 `style <id> fill:#hex` 行） */
+  fill?: string
+}
+
+interface FlowDocEdge {
+  from: string
+  to: string
+  label?: string
+  style?: FlowEdgeStyle
+}
+
+interface FlowGroup {
+  id: string
+  title: string
+  /** 嵌套父分组 id（subgraph 嵌套） */
+  parent?: string
+}
+
+interface FlowDoc {
+  dir: FlowDir
+  nodes: FlowDocNode[]
+  edges: FlowDocEdge[]
+  groups: FlowGroup[]
+  /** 节点中心坐标（%%layout 协议行） */
+  layout: Record<string, [number, number]>
+  /** 暂不支持可视化的指令行（classDef / class / linkStyle / click…），重建源码时原样带回 */
+  extras: string[]
+}
+
+/** 可选形状（工具条 7 种图标 + 列表下拉共用；bare 默认形状仅由解析产生，改名时自动升级为方形） */
+const FLOW_SHAPES: Array<{ value: FlowNodeShape; label: string; syntax: string }> = [
+  { value: 'rect', label: '方形', syntax: '[文字]' },
+  { value: 'round', label: '圆角', syntax: '(文字)' },
+  { value: 'diamond', label: '菱形', syntax: '{文字}' },
+  { value: 'hexagon', label: '六边形', syntax: '{{文字}}' },
+  { value: 'cylinder', label: '圆柱', syntax: '[(文字)]' },
+  { value: 'parallelogram', label: '平行四边形', syntax: '[/文字/]' },
+  { value: 'circle', label: '圆形', syntax: '((文字))' },
 ]
 
-function FlowEditor({
-  flow,
-  onChange,
-}: {
-  flow: FlowGraph
-  onChange: (f: FlowGraph) => void
-}) {
-  const [section, setSection] = React.useState<'nodes' | 'edges'>('nodes')
+const FLOW_EDGE_STYLES: Array<{ value: FlowEdgeStyle; label: string }> = [
+  { value: '-->', label: '实线箭头' },
+  { value: '---', label: '无箭头' },
+  { value: '-.->', label: '虚线箭头' },
+  { value: '==>', label: '粗线箭头' },
+]
 
+/** 填充色板（选中节点 → 生成 style 行；至少 6 选） */
+const FLOW_FILLS = ['#dbeafe', '#dcfce7', '#fef3c7', '#fce7f3', '#ede9fe', '#fee2e2'] as const
+
+const FLOW_ID_CHAR = /[\w\u4e00-\u9fff]/
+
+/** 节点 token（A / A[文字] / A[(文字)] …）→ { id, label, shape }；不认识返回 null。 */
+function parseFlowToken(tok: string): { id: string; label: string; shape: FlowNodeShape } | null {
+  let i = 0
+  while (i < tok.length && FLOW_ID_CHAR.test(tok[i])) i++
+  const id = tok.slice(0, i)
+  if (!id) return null
+  const rest = tok.slice(i).trim().replace(/^:::[\w-]+/, '').trim()
+  const unquote = (s: string) =>
+    s.length >= 2 && s.startsWith('"') && s.endsWith('"') ? s.slice(1, -1) : s
+  const inner = (s: string) => unquote(s).replace(/\s+/g, ' ').trim() || id
+  let m: RegExpMatchArray | null
+  if ((m = rest.match(/^\(\(([\s\S]*)\)\)$/))) return { id, label: inner(m[1]), shape: 'circle' }
+  if ((m = rest.match(/^\[\(([\s\S]*)\)\]$/))) return { id, label: inner(m[1]), shape: 'cylinder' }
+  if ((m = rest.match(/^\[\/([\s\S]*)\/\]$/))) return { id, label: inner(m[1]), shape: 'parallelogram' }
+  if ((m = rest.match(/^\{\{([\s\S]*)\}\}$/))) return { id, label: inner(m[1]), shape: 'hexagon' }
+  if ((m = rest.match(/^\[([\s\S]*)\]$/))) return { id, label: inner(m[1]), shape: 'rect' }
+  if ((m = rest.match(/^\(([\s\S]*)\)$/))) return { id, label: inner(m[1]), shape: 'round' }
+  if ((m = rest.match(/^\{([\s\S]*)\}$/))) return { id, label: inner(m[1]), shape: 'diamond' }
+  if (rest === '') return { id, label: id, shape: 'default' }
+  return null
+}
+
+/** 箭头片段归类为 4 种受支持样式；无法归类返回 null。 */
+function flowArrowStyle(seg: string): FlowEdgeStyle | null {
+  if (!seg || !/^[-=.]/.test(seg)) return null
+  if (/^=/.test(seg)) return '==>'
+  if (/\./.test(seg)) return '-.->'
+  if (/>$/.test(seg.trim())) return '-->'
+  return '---'
+}
+
+interface FlowScanTok {
+  node?: string
+  edge?: { label?: string; style: FlowEdgeStyle }
+}
+
+/**
+ * 扫描一行流程语句 → 节点/连线交替 token。
+ * 支持 8 种形状括号、链式 A-->B-->C、`-- 文字 -->`、`-->|文字|`、`A:::class`。
+ */
+function scanFlowTokens(line: string): FlowScanTok[] | null {
+  const toks: FlowScanTok[] = []
+  let i = 0
+  const n = line.length
+  let expectNode = true
+  while (i < n) {
+    const ch = line[i]
+    if (ch === ' ' || ch === '\t') {
+      i++
+      continue
+    }
+    if (expectNode) {
+      let j = i
+      while (j < n && FLOW_ID_CHAR.test(line[j])) j++
+      if (j === i) return null
+      const open = line[j]
+      if (open === '[' || open === '(' || open === '{') {
+        const close = open === '[' ? ']' : open === '(' ? ')' : '}'
+        let depth = 0
+        let end = -1
+        for (let k = j; k < n; k++) {
+          if (line[k] === open) depth++
+          else if (line[k] === close) {
+            depth--
+            if (depth === 0) {
+              end = k
+              break
+            }
+          }
+        }
+        if (end === -1) return null
+        j = end + 1
+      }
+      // `A:::class` 修饰（class 定义保留在 extras，引用处忽略）
+      if (line[j] === ':' && line.slice(j).startsWith(':::')) {
+        const cm = line.slice(j).match(/^:::[\w-]+/)
+        if (cm) j += cm[0].length
+      }
+      toks.push({ node: line.slice(i, j) })
+      i = j
+      expectNode = false
+      continue
+    }
+    // ---- 连线段：[-=.] 开头的箭头序列 ----
+    let j = i
+    while (j < n && (line[j] === '-' || line[j] === '=' || line[j] === '.')) j++
+    let seg = line.slice(i, j)
+    if (!seg) return null
+    if (j < n && line[j] === '>') {
+      seg += '>'
+      j++
+    }
+    let label: string | undefined
+    // `-- 文字 -->` / `== 文字 ==>` 内联文字形式
+    const opener = seg.replace(/>$/, '')
+    if (!seg.endsWith('>') && /^(-{2,}|={2,}|-\.+)$/.test(opener)) {
+      const rest = line.slice(j)
+      const m = rest.match(/^([^-=|>.]*?)\s*(-{2,}>|-\.+->|-\.->|={2,}>|-->|==>|\.->|-{3,}|-{2,}|-\.-|-\.|={2,}|\.-)/)
+      if (m && m[2]) {
+        label = m[1].trim() || undefined
+        j += m[0].length
+        seg = line.slice(i, j)
+      }
+    }
+    // `-->|文字|` 形式
+    if (j < n && line[j] === '|') {
+      const close = line.indexOf('|', j + 1)
+      if (close === -1) return null
+      label = line.slice(j + 1, close).trim() || label
+      j = close + 1
+    }
+    const style = flowArrowStyle(seg)
+    if (!style) return null
+    toks.push({ edge: { label, style } })
+    i = j
+    expectNode = true
+  }
+  return expectNode ? null : toks
+}
+
+/**
+ * mermaid graph/flowchart 源码 → FlowDoc（容错解析）。
+ * 返回 null：首个有效行不是 graph/flowchart 声明（非流程图）。
+ * 坏行 / 未支持指令不中断解析：保留进 extras 重建时带回，行号进 problems（黄条提示）。
+ */
+function parseFlowDoc(raw: string): { doc: FlowDoc; problems: number[] } | null {
+  if (!raw) return null
+  const lines = raw.split(/\r?\n/)
+  let declIdx = -1
+  let dir: FlowDir = 'TD'
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim()
+    if (!t || t.startsWith('%%')) continue
+    const m = t.match(/^(?:graph|flowchart)(?:[ \t]+(TD|TB|LR|RL|BT))?[ \t]*$/i)
+    if (!m) return null
+    declIdx = i
+    dir = (m[1] ? m[1].toUpperCase() : 'TD') as FlowDir
+    break
+  }
+  if (declIdx === -1) return null
+
+  // %%layout 协议行（可能不存在 → 走自动布局）
+  const layout: Record<string, [number, number]> = {}
+  for (const l of lines) {
+    const m = l.trim().match(/^%%layout:\s*(\{[\s\S]*\})\s*$/)
+    if (!m) continue
+    try {
+      const obj = JSON.parse(m[1]) as Record<string, unknown>
+      for (const [k, v] of Object.entries(obj)) {
+        if (
+          Array.isArray(v) &&
+          v.length >= 2 &&
+          typeof v[0] === 'number' &&
+          typeof v[1] === 'number'
+        ) {
+          layout[k] = [v[0], v[1]]
+        }
+      }
+    } catch {
+      // 坏 JSON 忽略 → 自动布局
+    }
+    break
+  }
+
+  const nodes: FlowDocNode[] = []
+  const nodeIdx = new Map<string, number>()
+  const edges: FlowDocEdge[] = []
+  const groups: FlowGroup[] = []
+  const groupById = new Map<string, FlowGroup>()
+  const stack: string[] = []
+  const extras: string[] = []
+  const fills: Record<string, string> = {}
+  const problems: number[] = []
+
+  const register = (tok: string): FlowDocNode | null => {
+    const p = parseFlowToken(tok)
+    if (!p) return null
+    const gi = nodeIdx.get(p.id)
+    if (gi !== undefined) {
+      const ex = nodes[gi]
+      // 首见优先；后见带形状/标签时补全
+      if (p.shape !== 'default' || (p.label !== p.id && ex.label === ex.id)) {
+        nodes[gi] = {
+          ...ex,
+          label: p.label === p.id && ex.label !== ex.id ? ex.label : p.label,
+          shape: p.shape === 'default' ? ex.shape : p.shape,
+        }
+        return nodes[gi]
+      }
+      return ex
+    }
+    const node: FlowDocNode = { id: p.id, label: p.label, shape: p.shape, group: stack[stack.length - 1] }
+    nodes.push(node)
+    nodeIdx.set(p.id, nodes.length - 1)
+    return node
+  }
+
+  for (let i = declIdx + 1; i < lines.length; i++) {
+    const t = lines[i].trim()
+    if (!t || t.startsWith('%%')) continue
+    // subgraph 分组（subgraph id[标题] / subgraph 标题）
+    const sm = t.match(/^subgraph[ \t]+(.+)$/i)
+    if (sm) {
+      const tok = sm[1].trim()
+      const bm = tok.match(/^([\w\u4e00-\u9fff]+)[ \t]*[\[\(]([^\]\)]*)[\]\)]$/)
+      const gid = bm ? bm[1] : tok.replace(/[^\w\u4e00-\u9fff]/g, '_')
+      const title = bm ? bm[2].trim() || gid : tok
+      let g = groupById.get(gid)
+      if (!g) {
+        g = { id: gid, title, parent: stack[stack.length - 1] }
+        groups.push(g)
+        groupById.set(gid, g)
+      }
+      stack.push(gid)
+      continue
+    }
+    if (/^end\b/i.test(t)) {
+      if (stack.length) stack.pop()
+      else problems.push(i + 1)
+      continue
+    }
+    // style 行：提取 fill（节点填色），其余样式属性暂不可视化
+    const ym = t.match(/^style[ \t]+([\w\u4e00-\u9fff]+)[ \t]+(.+)$/i)
+    if (ym) {
+      const fm = ym[2].match(/(?:^|[,;]\s*)fill:\s*(#[0-9a-fA-F]{3,8})/)
+      if (fm && nodeIdx.has(ym[1])) fills[ym[1]] = fm[1]
+      else extras.push(t)
+      continue
+    }
+    // 未支持指令：原样保留（不丢内容）；direction 仅影响渲染方向，静默丢弃
+    if (/^(classDef|class|linkStyle|click|init|frontmatter)\b/i.test(t)) {
+      extras.push(t)
+      continue
+    }
+    if (/^direction\b/i.test(t)) continue
+    const toks = scanFlowTokens(t)
+    if (!toks) {
+      extras.push(t)
+      problems.push(i + 1)
+      continue
+    }
+    const nodeToks = toks.filter((x) => x.node != null).map((x) => x.node as string)
+    const edgeToks = toks.filter((x) => x.edge != null).map((x) => x.edge as NonNullable<FlowScanTok['edge']>)
+    if (nodeToks.length === 0 || edgeToks.length !== nodeToks.length - 1) {
+      extras.push(t)
+      problems.push(i + 1)
+      continue
+    }
+    if (edgeToks.length === 0) {
+      register(nodeToks[0])
+      continue
+    }
+    for (let k = 0; k < edgeToks.length; k++) {
+      const a = register(nodeToks[k])
+      const b = register(nodeToks[k + 1])
+      if (!a || !b) {
+        extras.push(t)
+        problems.push(i + 1)
+        break
+      }
+      edges.push({ from: a.id, to: b.id, label: edgeToks[k].label, style: edgeToks[k].style })
+    }
+  }
+
+  // 悬空分组引用清理 + 填色应用
+  const gidSet = new Set(groups.map((g) => g.id))
+  const finalNodes = nodes.map((n) => ({
+    ...n,
+    group: n.group && gidSet.has(n.group) ? n.group : undefined,
+    fill: fills[n.id],
+  }))
+  return { doc: { dir, nodes: finalNodes, edges, groups, layout, extras }, problems }
+}
+
+/** FlowDoc → 合法 mermaid flowchart 源码（含 %%layout 协议行；标签特殊字符转全角保证语法合法）。 */
+function serializeFlowDoc(doc: FlowDoc): string {
+  const FW: Record<string, string> = {
+    '|': '｜',
+    '[': '［',
+    ']': '］',
+    '{': '｛',
+    '}': '｝',
+    '(': '（',
+    ')': '）',
+    '/': '／',
+    '<': '＜',
+    '>': '＞',
+    '"': '＂',
+  }
+  const esc = (s: string) =>
+    (s || '')
+      .replace(/[|[\]{}()/<>"]/g, (c) => FW[c] ?? c)
+      .replace(/\s+/g, ' ')
+      .trim()
+  const wrap = (n: FlowDocNode) => {
+    const label = esc(n.label) || n.id
+    switch (n.shape) {
+      case 'round':
+        return `${n.id}(${label})`
+      case 'circle':
+        return `${n.id}((${label}))`
+      case 'diamond':
+        return `${n.id}{${label}}`
+      case 'hexagon':
+        return `${n.id}{{${label}}}`
+      case 'cylinder':
+        return `${n.id}[(${label})]`
+      case 'parallelogram':
+        return `${n.id}[/${label}/]`
+      case 'default':
+        return n.id
+      default:
+        return `${n.id}[${label}]`
+    }
+  }
+  const gidSet = new Set(doc.groups.map((g) => g.id))
+  const validGroup = (id?: string) => (id && gidSet.has(id) ? id : undefined)
+  const lines: string[] = [`flowchart ${doc.dir}`]
+
+  // 位置协议行（仅保留存在节点的坐标；键排序保证稳定）
+  const withPos = doc.nodes.filter((n) => doc.layout[n.id])
+  if (withPos.length) {
+    const obj: Record<string, [number, number]> = {}
+    for (const n of [...withPos].sort((a, b) => (a.id < b.id ? -1 : 1))) {
+      obj[n.id] = [Math.round(doc.layout[n.id][0]), Math.round(doc.layout[n.id][1])]
+    }
+    lines.push(`%%layout:${JSON.stringify(obj)}`)
+  }
+
+  // subgraph 块（递归嵌套；空组不输出；组内节点保持首次出现顺序）
+  const emitGroup = (g: FlowGroup, depth: number) => {
+    const kids = doc.nodes.filter((n) => validGroup(n.group) === g.id)
+    const children = doc.groups.filter((c) => validGroup(c.parent) === g.id)
+    if (kids.length === 0 && children.length === 0) return
+    const pad = '  '.repeat(depth)
+    lines.push(`${pad}subgraph ${g.id}[${esc(g.title) || g.id}]`)
+    for (const n of kids) lines.push(`${pad}  ${wrap(n)}`)
+    for (const c of children) emitGroup(c, depth + 1)
+    lines.push(`${pad}end`)
+  }
+  for (const g of doc.groups) if (!validGroup(g.parent)) emitGroup(g, 0)
+
+  // 未分组节点
+  for (const n of doc.nodes) if (!validGroup(n.group)) lines.push(`  ${wrap(n)}`)
+
+  // 连线（`a -->|标签| b`）
+  for (const e of doc.edges) {
+    const style = e.style ?? '-->'
+    lines.push(e.label ? `  ${e.from} ${style}|${esc(e.label)}| ${e.to}` : `  ${e.from} ${style} ${e.to}`)
+  }
+  // 填充色 style 行
+  for (const n of doc.nodes) if (n.fill) lines.push(`  style ${n.id} fill:${n.fill}`)
+  // 保留的额外指令
+  for (const x of doc.extras) lines.push(x)
+  return lines.join('\n')
+}
+
+/** 自动布局：按连线最长路分层（层间距 100、同层间距 80；TD 纵向分层 / LR 横向分层）。 */
+function autoLayout(doc: FlowDoc): Record<string, [number, number]> {
+  const layout: Record<string, [number, number]> = {}
+  if (doc.nodes.length === 0) return layout
+  const boxes = new Map(doc.nodes.map((n) => [n.id, flowNodeBox(n, doc.layout[n.id])]))
+  const layer = new Map<string, number>(doc.nodes.map((n) => [n.id, 0]))
+  for (let it = 0; it < Math.min(doc.nodes.length + 1, 40); it++) {
+    let changed = false
+    for (const e of doc.edges) {
+      if (!layer.has(e.from) || !layer.has(e.to)) continue
+      const want = (layer.get(e.from) ?? 0) + 1
+      if (want > (layer.get(e.to) ?? 0)) {
+        layer.set(e.to, want)
+        changed = true
+      }
+    }
+    if (!changed) break
+  }
+  const byLayer = new Map<number, FlowDocNode[]>()
+  for (const n of doc.nodes) {
+    const l = layer.get(n.id) ?? 0
+    if (!byLayer.has(l)) byLayer.set(l, [])
+    byLayer.get(l)!.push(n)
+  }
+  const horizontal = doc.dir === 'LR' || doc.dir === 'RL'
+  const GAP_SAME = 80
+  const GAP_LAYER = 100
+  const PAD = 40
+  let main = PAD
+  for (const l of [...byLayer.keys()].sort((a, b) => a - b)) {
+    const ns = byLayer.get(l)!
+    let cross = PAD
+    let mainSize = 0
+    for (const n of ns) {
+      const b = boxes.get(n.id)!
+      const spread = horizontal ? b.h : b.w
+      const along = horizontal ? b.w : b.h
+      const p = cross + spread / 2
+      layout[n.id] = horizontal ? [main + along / 2, p] : [p, main + along / 2]
+      cross += spread + GAP_SAME
+      mainSize = Math.max(mainSize, along)
+    }
+    main += mainSize + GAP_LAYER
+  }
+  return layout
+}
+
+/** 解析结果补坐标：协议行整行缺失 → 全量自动布局；个别节点缺坐标 → 仅补缺失项。 */
+function withAutoLayout(doc: FlowDoc): FlowDoc {
+  if (doc.nodes.length === 0) return doc
+  const missing = doc.nodes.filter((n) => !doc.layout[n.id])
+  if (missing.length === 0) return doc
+  const auto = autoLayout(doc)
+  if (missing.length === doc.nodes.length) return { ...doc, layout: auto }
+  const layout = { ...doc.layout }
+  for (const n of missing) layout[n.id] = auto[n.id] ?? [80, 80]
+  return { ...doc, layout }
+}
+
+interface FlowBox {
+  x: number
+  y: number
+  w: number
+  h: number
+  cx: number
+  cy: number
+  lines: string[]
+}
+
+/** 估算节点尺寸（CJK 约 13px / 其他约 7.2px；超宽自动折两行）。 */
+function flowNodeBox(n: FlowDocNode, pos?: [number, number]): FlowBox {
+  const label = (n.label || '').trim() || n.id
+  const textW = (s: string) => {
+    let w = 0
+    for (const ch of s) w += ch.charCodeAt(0) > 0x2e7f ? 13 : 7.2
+    return w
+  }
+  let lines = [label]
+  if (textW(label) > 190 && label.length > 1) {
+    let best = Math.ceil(label.length / 2)
+    let bestDiff = Infinity
+    for (let i = 1; i < label.length; i++) {
+      const d = Math.abs(textW(label.slice(0, i)) - textW(label.slice(i)))
+      if (d < bestDiff) {
+        bestDiff = d
+        best = i
+      }
+    }
+    lines = [label.slice(0, best), label.slice(best)]
+  }
+  const w = Math.min(250, Math.max(76, ...lines.map((l) => textW(l) + 28)))
+  const h = lines.length > 1 ? 56 : 40
+  const cx = pos?.[0] ?? 0
+  const cy = pos?.[1] ?? 0
+  return { x: cx - w / 2, y: cy - h / 2, w, h, cx, cy, lines }
+}
+
+/** 连线端点：按两节点相对方位自动选左右 / 上下锚点。 */
+function flowEdgeAnchors(a: FlowBox, b: FlowBox): { x1: number; y1: number; x2: number; y2: number } {
+  const dx = b.cx - a.cx
+  const dy = b.cy - a.cy
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0
+      ? { x1: a.x + a.w, y1: a.cy, x2: b.x, y2: b.cy }
+      : { x1: a.x, y1: a.cy, x2: b.x + b.w, y2: b.cy }
+  }
+  return dy >= 0
+    ? { x1: a.cx, y1: a.y + a.h, x2: b.cx, y2: b.y }
+    : { x1: a.cx, y1: a.y, x2: b.cx, y2: b.y + b.h }
+}
+
+/** 箭头三角形（手绘 polygon，避免 marker 的取色/缩放兼容问题）。 */
+function flowArrowHead(x1: number, y1: number, x2: number, y2: number, size = 9) {
+  const a = Math.atan2(y2 - y1, x2 - x1)
+  const c = Math.cos(a)
+  const s = Math.sin(a)
+  const bx = x2 - c * size
+  const by = y2 - s * size
+  const nx = -s * size * 0.45
+  const ny = c * size * 0.45
+  return {
+    head: `M ${x2} ${y2} L ${bx + nx} ${by + ny} L ${bx - nx} ${by - ny} Z`,
+    lineEnd: [x2 - c * size * 0.72, y2 - s * size * 0.72] as [number, number],
+  }
+}
+
+interface GroupBox {
+  x: number
+  y: number
+  w: number
+  h: number
+  depth: number
+}
+
+/** 分组容器包围盒（递归含子组与成员节点；顶部留 36px 标题区、四周留白）。 */
+function flowGroupBoxes(doc: FlowDoc, boxes: Map<string, FlowBox>): Map<string, GroupBox> {
+  const memo = new Map<string, GroupBox | null>()
+  const childrenOf = (gid: string) => doc.groups.filter((g) => g.parent === gid)
+  const rec = (gid: string): GroupBox | null => {
+    if (memo.has(gid)) return memo.get(gid) ?? null
+    memo.set(gid, null) // 防环
+    let x1 = Infinity
+    let y1 = Infinity
+    let x2 = -Infinity
+    let y2 = -Infinity
+    for (const n of doc.nodes) {
+      if (n.group !== gid) continue
+      const b = boxes.get(n.id)
+      if (!b) continue
+      x1 = Math.min(x1, b.x)
+      y1 = Math.min(y1, b.y)
+      x2 = Math.max(x2, b.x + b.w)
+      y2 = Math.max(y2, b.y + b.h)
+    }
+    for (const c of childrenOf(gid)) {
+      const b = rec(c.id)
+      if (!b) continue
+      x1 = Math.min(x1, b.x)
+      y1 = Math.min(y1, b.y)
+      x2 = Math.max(x2, b.x + b.w)
+      y2 = Math.max(y2, b.y + b.h)
+    }
+    const out: GroupBox | null =
+      x1 === Infinity ? null : { x: x1 - 22, y: y1 - 36, w: x2 - x1 + 44, h: y2 - y1 + 52, depth: 0 }
+    memo.set(gid, out)
+    return out
+  }
+  const depthOf = (g: FlowGroup): number => {
+    let d = 0
+    let p = g.parent
+    const seen = new Set<string>()
+    while (p && !seen.has(p)) {
+      seen.add(p)
+      d++
+      p = doc.groups.find((x) => x.id === p)?.parent
+    }
+    return d
+  }
+  const result = new Map<string, GroupBox>()
+  for (const g of doc.groups) {
+    const b = rec(g.id)
+    if (b) result.set(g.id, { ...b, depth: depthOf(g) })
+  }
+  return result
+}
+
+/** 点所在的最内层分组（depth 最大者优先；excludeIds 内的组忽略）。 */
+function groupAtPoint(
+  doc: FlowDoc,
+  gboxes: Map<string, GroupBox>,
+  x: number,
+  y: number,
+  excludeIds?: Set<string>,
+): string | undefined {
+  let best: { id: string; depth: number } | null = null
+  for (const g of doc.groups) {
+    if (excludeIds?.has(g.id)) continue
+    const b = gboxes.get(g.id)
+    if (!b) continue
+    if (x < b.x || x > b.x + b.w || y < b.y || y > b.y + b.h) continue
+    if (!best || b.depth > best.depth) best = { id: g.id, depth: b.depth }
+  }
+  return best?.id
+}
+
+/** 命中测试：返回包含点的节点 id（后声明者优先）。 */
+function nodeAtPoint(doc: FlowDoc, boxes: Map<string, FlowBox>, x: number, y: number): string | null {
+  for (let i = doc.nodes.length - 1; i >= 0; i--) {
+    const b = boxes.get(doc.nodes[i].id)
+    if (b && x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) return doc.nodes[i].id
+  }
+  return null
+}
+
+/** 分组自身 + 全部子孙分组 id。 */
+function groupSubtreeIds(doc: FlowDoc, gid: string): Set<string> {
+  const all = new Set<string>([gid])
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const g of doc.groups) {
+      if (g.parent && all.has(g.parent) && !all.has(g.id)) {
+        all.add(g.id)
+        changed = true
+      }
+    }
+  }
+  return all
+}
+
+/** 分组（含子孙分组）内全部节点 id。 */
+function groupMemberIds(doc: FlowDoc, gid: string): string[] {
+  const gids = groupSubtreeIds(doc, gid)
+  return doc.nodes.filter((n) => n.group && gids.has(n.group)).map((n) => n.id)
+}
+
+// ---------- 画布子组件 ----------
+
+/** 画布变更入口（由 FlowGraphEditor 提供，两模式共享撤销栈）。 */
+interface FlowMutate {
+  /** 提交修改（默认入撤销栈 + 立即写回源码）。 */
+  update: (next: FlowDoc, opts?: { history?: boolean; immediate?: boolean }) => void
+  /** 仅把当前状态入栈（手势开始时调用，后续以 history:false 连续更新）。 */
+  snapshot: () => void
+  undo: () => void
+  redo: () => void
+}
+
+type FlowSelection = { type: 'node'; id: string } | { type: 'edge'; index: number }
+
+type FlowDrag =
+  | { kind: 'node'; id: string; startWX: number; startWY: number; orig: [number, number]; moved: boolean }
+  | { kind: 'group'; gid: string; ids: string[]; startWX: number; startWY: number; origs: Record<string, [number, number]>; moved: boolean }
+  | { kind: 'pan'; startCX: number; startCY: number; orig: { x: number; y: number; k: number }; moved: boolean }
+  | { kind: 'link'; from: string; ax: number; ay: number }
+
+/** 节点形状 SVG 图形（按 mermaid 语法对应渲染；mini 用于工具条小图标）。 */
+function FlowShapeFigure({
+  shape,
+  x,
+  y,
+  w,
+  h,
+  fill,
+  selected,
+  mini,
+}: {
+  shape: FlowNodeShape
+  x: number
+  y: number
+  w: number
+  h: number
+  fill?: string
+  selected?: boolean
+  mini?: boolean
+}) {
+  const stroke = selected ? 'var(--primary)' : mini ? 'var(--muted-foreground)' : 'var(--border)'
+  const style: React.CSSProperties = {
+    fill: fill ?? 'var(--muted)',
+    stroke,
+    strokeWidth: selected ? 2.2 : 1.4,
+  }
+  switch (shape) {
+    case 'round':
+      return <rect x={x} y={y} width={w} height={h} rx={Math.min(w, h) / 2} style={style} />
+    case 'default':
+      return <rect x={x} y={y} width={w} height={h} rx={Math.min(10, w / 2, h / 2)} style={style} />
+    case 'circle':
+      return <ellipse cx={x + w / 2} cy={y + h / 2} rx={w / 2} ry={h / 2} style={style} />
+    case 'diamond':
+      return (
+        <polygon
+          points={`${x + w / 2},${y} ${x + w},${y + h / 2} ${x + w / 2},${y + h} ${x},${y + h / 2}`}
+          style={style}
+        />
+      )
+    case 'hexagon': {
+      const c = Math.min(16, w / 4)
+      return (
+        <polygon
+          points={`${x + c},${y} ${x + w - c},${y} ${x + w},${y + h / 2} ${x + w - c},${y + h} ${x + c},${y + h} ${x},${y + h / 2}`}
+          style={style}
+        />
+      )
+    }
+    case 'cylinder': {
+      const ry = Math.min(7, h / 4)
+      const rx = Math.min(16, w / 2)
+      const body = `M ${x} ${y + ry} A ${rx} ${ry} 0 0 1 ${x + w} ${y + ry} L ${x + w} ${y + h - ry} A ${rx} ${ry} 0 0 1 ${x} ${y + h - ry} Z`
+      return (
+        <g>
+          <path d={body} style={style} />
+          <path
+            d={`M ${x} ${y + ry} A ${rx} ${ry} 0 0 0 ${x + w} ${y + ry}`}
+            fill="none"
+            style={{ stroke, strokeWidth: 1.4 }}
+          />
+        </g>
+      )
+    }
+    case 'parallelogram': {
+      const s = Math.min(16, w / 3)
+      return (
+        <polygon points={`${x + s},${y} ${x + w},${y} ${x + w - s},${y + h} ${x},${y + h}`} style={style} />
+      )
+    }
+    case 'rect':
+    default:
+      return <rect x={x} y={y} width={w} height={h} rx={2} style={style} />
+  }
+}
+
+/** 画布模式：SVG 画布 + 工具栏（拖节点 / 锚点连线 / 缩放平移 / 形状填色 / 连线标签）。 */
+function FlowCanvasEditor({ doc, mutate }: { doc: FlowDoc; mutate: FlowMutate }) {
+  // ---- 本地 UI 状态 ----
+  const containerRef = React.useRef<HTMLDivElement>(null)
+  const [tool, setTool] = React.useState<'select' | 'pan'>('select')
+  const [snapGrid, setSnapGrid] = React.useState(true)
+  const [arrowOn, setArrowOn] = React.useState(true)
+  const [placing, setPlacing] = React.useState(false)
+  const [selection, setSelection] = React.useState<FlowSelection | null>(null)
+  const [view, setView] = React.useState({ x: 30, y: 30, k: 1 })
+  const [rubber, setRubber] = React.useState<{ ax: number; ay: number; x: number; y: number } | null>(null)
+  const [editing, setEditing] = React.useState<string | null>(null)
+  const [draft, setDraft] = React.useState('')
+  const [edgeDraft, setEdgeDraft] = React.useState('')
+
+  // ---- 渲染期镜像 ref（手势处理里读最新值；通过 useLayoutEffect 同步写，
+  //      既规避 ref-during-render 规则，又保证下一次浏览器事件触发前 ref 已是最新值） ----
+  const docRef = React.useRef(doc)
+  const viewRef = React.useRef(view)
+  const boxesRef = React.useRef(new Map<string, FlowBox>())
+  const gboxesRef = React.useRef(new Map<string, GroupBox>())
+  const dragRef = React.useRef<FlowDrag | null>(null)
+  const pointersRef = React.useRef(new Map<number, { x: number; y: number }>())
+  const pinchRef = React.useRef<{ d: number; cx: number; cy: number; view: { x: number; y: number; k: number } } | null>(null)
+  const nudgeTsRef = React.useRef(0)
+  const didFitRef = React.useRef(false)
+
+  const boxes = React.useMemo(() => {
+    const m = new Map<string, FlowBox>()
+    for (const n of doc.nodes) m.set(n.id, flowNodeBox(n, doc.layout[n.id]))
+    return m
+  }, [doc])
+  const gboxes = React.useMemo(() => flowGroupBoxes(doc, boxes), [doc, boxes])
+  React.useLayoutEffect(() => {
+    docRef.current = doc
+  })
+  React.useLayoutEffect(() => {
+    viewRef.current = view
+  })
+  React.useLayoutEffect(() => {
+    boxesRef.current = boxes
+  })
+  React.useLayoutEffect(() => {
+    gboxesRef.current = gboxes
+  })
+
+  const selNode = selection?.type === 'node' ? doc.nodes.find((n) => n.id === selection.id) : undefined
+  const selEdge =
+    selection?.type === 'edge' && selection.index < doc.edges.length ? doc.edges[selection.index] : undefined
+
+  // 选中连线变化 → 同步标签草稿
+  React.useEffect(() => {
+    if (selection?.type === 'edge') setEdgeDraft(docRef.current.edges[selection.index]?.label ?? '')
+  }, [selection])
+
+  // ---- 坐标换算 / 缩放平移 ----
+  const toWorld = (clientX: number, clientY: number) => {
+    const rect = containerRef.current?.getBoundingClientRect()
+    const v = viewRef.current
+    if (!rect) return { x: 0, y: 0 }
+    return { x: (clientX - rect.left - v.x) / v.k, y: (clientY - rect.top - v.y) / v.k }
+  }
+
+  const zoomAt = React.useCallback((sx: number, sy: number, factor: number) => {
+    const v = viewRef.current
+    const k = Math.min(2.5, Math.max(0.3, v.k * factor))
+    setView({ k, x: sx - (sx - v.x) * (k / v.k), y: sy - (sy - v.y) * (k / v.k) })
+  }, [])
+
+  const zoomCenter = (factor: number) => {
+    const el = containerRef.current
+    if (!el) return
+    const r = el.getBoundingClientRect()
+    zoomAt(r.width / 2, r.height / 2, factor)
+  }
+
+  /** 适应内容（可传目标 doc，用于自动布局后立即取景）。 */
+  const fitView = React.useCallback((target?: FlowDoc) => {
+    const el = containerRef.current
+    if (!el) return
+    const rect = el.getBoundingClientRect()
+    if (rect.width < 10 || rect.height < 10) return
+    const d = target ?? docRef.current
+    let x1 = Infinity
+    let y1 = Infinity
+    let x2 = -Infinity
+    let y2 = -Infinity
+    for (const n of d.nodes) {
+      const b = flowNodeBox(n, d.layout[n.id])
+      x1 = Math.min(x1, b.x)
+      y1 = Math.min(y1, b.y)
+      x2 = Math.max(x2, b.x + b.w)
+      y2 = Math.max(y2, b.y + b.h)
+    }
+    if (x1 === Infinity || x2 <= x1 || y2 <= y1) {
+      setView({ x: 30, y: 30, k: 1 })
+      return
+    }
+    const pad = 36
+    const k = Math.min(
+      1.25,
+      Math.max(0.3, Math.min((rect.width - pad * 2) / (x2 - x1), (rect.height - pad * 2) / (y2 - y1))),
+    )
+    setView({
+      k,
+      x: (rect.width - (x2 - x1) * k) / 2 - x1 * k,
+      y: (rect.height - (y2 - y1) * k) / 2 - y1 * k,
+    })
+  }, [])
+
+  // 滚轮缩放（非被动监听，拦截页面滚动）
+  React.useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      zoomAt(e.clientX - rect.left, e.clientY - rect.top, Math.exp(-e.deltaY * 0.0012))
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [zoomAt])
+
+  // 首次挂载自动适应内容
+  React.useEffect(() => {
+    if (didFitRef.current || docRef.current.nodes.length === 0) return
+    didFitRef.current = true
+    const raf = requestAnimationFrame(() => fitView())
+    return () => cancelAnimationFrame(raf)
+  }, [fitView, doc])
+
+  // ---- 结构操作 ----
   const genId = () => {
-    let i = flow.nodes.length + 1
+    const d = docRef.current
+    let i = d.nodes.length + 1
     let id = `N${i}`
-    while (flow.nodes.some((n) => n.id === id)) {
+    while (d.nodes.some((n) => n.id === id)) {
       i += 1
       id = `N${i}`
     }
     return id
   }
-  const setNode = (id: string, patch: Partial<FlowNode>) =>
-    onChange({ ...flow, nodes: flow.nodes.map((n) => (n.id === id ? { ...n, ...patch } : n)) })
-  const addNode = () =>
-    onChange({ ...flow, nodes: [...flow.nodes, { id: genId(), label: '新节点', shape: 'rect' }] })
-  const delNode = (id: string) =>
-    onChange({
-      nodes: flow.nodes.filter((n) => n.id !== id),
-      edges: flow.edges.filter((e) => e.from !== id && e.to !== id),
-      dir: flow.dir,
+
+  /** 工具栏「+ 节点」后点击画布：落点放置（默认方形）+ 自动入所在分组 + 就地改名。 */
+  const placeNode = (wx: number, wy: number) => {
+    const d = docRef.current
+    const id = genId()
+    const pos: [number, number] = snapGrid
+      ? [Math.round(wx / 10) * 10, Math.round(wy / 10) * 10]
+      : [wx, wy]
+    const gid = groupAtPoint(d, gboxesRef.current, pos[0], pos[1])
+    mutate.update({
+      ...d,
+      nodes: [...d.nodes, { id, label: '新节点', shape: 'rect', group: gid }],
+      layout: { ...d.layout, [id]: pos },
     })
-  const setEdge = (i: number, patch: Partial<FlowEdge>) =>
-    onChange({ ...flow, edges: flow.edges.map((e, k) => (k === i ? { ...e, ...patch } : e)) })
-  const addEdge = () => {
-    if (flow.nodes.length < 2) {
-      toast.warning('请先添加至少两个节点')
-      return
-    }
-    onChange({
-      ...flow,
-      edges: [...flow.edges, { from: flow.nodes[0].id, to: flow.nodes[1].id, style: '-->' }],
+    setSelection({ type: 'node', id })
+    setDraft('新节点')
+    setEditing(id)
+  }
+
+  const openRename = (id: string) => {
+    setDraft(docRef.current.nodes.find((x) => x.id === id)?.label ?? '')
+    setEditing(id)
+  }
+
+  /** 双击改名提交（bare 默认形状无法携带文字 → 自动升级为方形）。 */
+  const commitRename = () => {
+    const id = editing
+    if (!id) return
+    setEditing(null)
+    const d = docRef.current
+    const node = d.nodes.find((n) => n.id === id)
+    if (!node) return
+    const label = draft.trim()
+    if (node.label === label) return
+    mutate.update({
+      ...d,
+      nodes: d.nodes.map((n) =>
+        n.id === id ? { ...n, label, shape: n.shape === 'default' ? 'rect' : n.shape } : n,
+      ),
     })
   }
 
-  const delBtn =
-    'shrink-0 rounded p-1 text-muted-foreground/70 hover:bg-destructive/10 hover:text-destructive'
+  const deleteSelection = () => {
+    if (!selection) return
+    const d = docRef.current
+    if (selection.type === 'node') {
+      mutate.update({
+        ...d,
+        nodes: d.nodes.filter((n) => n.id !== selection.id),
+        edges: d.edges.filter((e) => e.from !== selection.id && e.to !== selection.id),
+      })
+    } else {
+      mutate.update({ ...d, edges: d.edges.filter((_, i) => i !== selection.index) })
+    }
+    setSelection(null)
+  }
+
+  const setNodeShape = (shape: FlowNodeShape) => {
+    if (selection?.type !== 'node') return
+    const d = docRef.current
+    mutate.update({ ...d, nodes: d.nodes.map((n) => (n.id === selection.id ? { ...n, shape } : n)) })
+  }
+
+  const setNodeFill = (fill?: string) => {
+    if (selection?.type !== 'node') return
+    const d = docRef.current
+    mutate.update({ ...d, nodes: d.nodes.map((n) => (n.id === selection.id ? { ...n, fill } : n)) })
+  }
+
+  const commitEdgeLabel = () => {
+    if (selection?.type !== 'edge') return
+    const d = docRef.current
+    const e = d.edges[selection.index]
+    if (!e) return
+    const label = edgeDraft.trim()
+    if ((e.label ?? '') === label) return
+    mutate.update({
+      ...d,
+      edges: d.edges.map((x, i) => (i === selection.index ? { ...x, label: label || undefined } : x)),
+    })
+  }
+
+  const setEdgeStyle = (style: FlowEdgeStyle) => {
+    if (selection?.type !== 'edge') return
+    const d = docRef.current
+    mutate.update({
+      ...d,
+      edges: d.edges.map((x, i) => (i === selection.index ? { ...x, style } : x)),
+    })
+  }
+
+  const swapEdge = () => {
+    if (selection?.type !== 'edge') return
+    const d = docRef.current
+    mutate.update({
+      ...d,
+      edges: d.edges.map((e, i) => (i === selection.index ? { ...e, from: e.to, to: e.from } : e)),
+    })
+  }
+
+  const applyAutoLayout = () => {
+    const d = docRef.current
+    if (d.nodes.length === 0) return
+    const next = { ...d, layout: autoLayout(d) }
+    mutate.update(next)
+    requestAnimationFrame(() => fitView(next))
+  }
+
+  // ---- 指针交互（单指拖动 / 锚点连线 / 双指缩放 / 抓手平移） ----
+  const startPan = (e: React.PointerEvent<HTMLDivElement>) => {
+    dragRef.current = {
+      kind: 'pan',
+      startCX: e.clientX,
+      startCY: e.clientY,
+      orig: { ...viewRef.current },
+      moved: false,
+    }
+  }
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+    const el = containerRef.current
+    if (!el) return
+    // 浮层（工具条 / 输入框）上的指针事件交给浮层自己
+    if ((e.target as Element).closest?.('[data-overlay]')) return
+    el.setPointerCapture(e.pointerId)
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+    if (pointersRef.current.size === 2) {
+      // 进入双指缩放：中止当前手势
+      dragRef.current = null
+      setRubber(null)
+      const ps = [...pointersRef.current.values()]
+      pinchRef.current = {
+        d: Math.max(1, Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y)),
+        cx: (ps[0].x + ps[1].x) / 2,
+        cy: (ps[0].y + ps[1].y) / 2,
+        view: { ...viewRef.current },
+      }
+      return
+    }
+    if (pointersRef.current.size > 2) return
+
+    const target = e.target as Element
+    const anchorEl = target.closest('[data-link-anchor]')
+    const nodeEl = target.closest('[data-node-id]')
+    const edgeEl = target.closest('[data-edge-index]')
+    const groupEl = target.closest('[data-group-drag]')
+    const w = toWorld(e.clientX, e.clientY)
+
+    if (tool === 'pan' && !anchorEl && !nodeEl && !groupEl) {
+      startPan(e)
+      return
+    }
+    // 从锚点拖出橡皮筋连线
+    if (anchorEl && nodeEl) {
+      const id = nodeEl.getAttribute('data-node-id') as string
+      const b = boxesRef.current.get(id)
+      if (b) {
+        const side = anchorEl.getAttribute('data-link-anchor')
+        const pt =
+          side === 't'
+            ? { x: b.cx, y: b.y }
+            : side === 'b'
+              ? { x: b.cx, y: b.y + b.h }
+              : side === 'l'
+                ? { x: b.x, y: b.cy }
+                : { x: b.x + b.w, y: b.cy }
+        dragRef.current = { kind: 'link', from: id, ax: pt.x, ay: pt.y }
+        setRubber({ ax: pt.x, ay: pt.y, x: w.x, y: w.y })
+      }
+      return
+    }
+    // 节点：选中 + 开始拖动
+    if (nodeEl) {
+      const id = nodeEl.getAttribute('data-node-id') as string
+      setPlacing(false)
+      setSelection({ type: 'node', id })
+      const pos = docRef.current.layout[id]
+      if (pos) {
+        mutate.snapshot()
+        dragRef.current = { kind: 'node', id, startWX: w.x, startWY: w.y, orig: pos, moved: false }
+      }
+      return
+    }
+    // 连线：选中
+    if (edgeEl) {
+      setPlacing(false)
+      setSelection({ type: 'edge', index: Number(edgeEl.getAttribute('data-edge-index')) })
+      return
+    }
+    // 分组标题条 / 边框：整组拖动（组内节点跟随）
+    if (groupEl) {
+      setPlacing(false)
+      const gid = groupEl.getAttribute('data-group-drag') as string
+      const d = docRef.current
+      const ids = groupMemberIds(d, gid)
+      if (ids.length) {
+        mutate.snapshot()
+        const origs: Record<string, [number, number]> = {}
+        for (const nid of ids) origs[nid] = d.layout[nid] ?? [0, 0]
+        dragRef.current = { kind: 'group', gid, ids, startWX: w.x, startWY: w.y, origs, moved: false }
+      }
+      return
+    }
+    // 背景：放置模式 → 建节点；否则拖动平移
+    if (placing) {
+      setPlacing(false)
+      placeNode(w.x, w.y)
+      return
+    }
+    startPan(e)
+  }
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!pointersRef.current.has(e.pointerId)) return
+    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+    // 双指缩放（围绕双指中心）
+    if (pinchRef.current && pointersRef.current.size >= 2) {
+      const ps = [...pointersRef.current.values()]
+      const d = Math.max(1, Math.hypot(ps[0].x - ps[1].x, ps[0].y - ps[1].y))
+      const cx = (ps[0].x + ps[1].x) / 2
+      const cy = (ps[0].y + ps[1].y) / 2
+      const p = pinchRef.current
+      const k = Math.min(2.5, Math.max(0.3, p.view.k * (d / p.d)))
+      setView({
+        k,
+        x: cx - (p.cx - p.view.x) * (k / p.view.k),
+        y: cy - (p.cy - p.view.y) * (k / p.view.k),
+      })
+      return
+    }
+    const drag = dragRef.current
+    if (!drag) return
+    const w = toWorld(e.clientX, e.clientY)
+    const d = docRef.current
+    const snap = (v: number) => (snapGrid ? Math.round(v / 10) * 10 : v)
+    if (drag.kind === 'pan') {
+      const dx = e.clientX - drag.startCX
+      const dy = e.clientY - drag.startCY
+      if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true
+      setView({ ...drag.orig, x: drag.orig.x + dx, y: drag.orig.y + dy })
+      return
+    }
+    if (drag.kind === 'node') {
+      const dx = w.x - drag.startWX
+      const dy = w.y - drag.startWY
+      if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true
+      if (!drag.moved) return
+      mutate.update(
+        { ...d, layout: { ...d.layout, [drag.id]: [snap(drag.orig[0] + dx), snap(drag.orig[1] + dy)] } },
+        { history: false, immediate: false },
+      )
+      return
+    }
+    if (drag.kind === 'group') {
+      const dx = w.x - drag.startWX
+      const dy = w.y - drag.startWY
+      if (Math.abs(dx) + Math.abs(dy) > 2) drag.moved = true
+      if (!drag.moved) return
+      const layout = { ...d.layout }
+      for (const nid of drag.ids) {
+        const o = drag.origs[nid]
+        layout[nid] = [snap(o[0] + dx), snap(o[1] + dy)]
+      }
+      mutate.update({ ...d, layout }, { history: false, immediate: false })
+      return
+    }
+    // link 橡皮筋
+    setRubber({ ax: drag.ax, ay: drag.ay, x: w.x, y: w.y })
+  }
+
+  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = containerRef.current
+    if (el?.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId)
+    pointersRef.current.delete(e.pointerId)
+    if (pinchRef.current) {
+      if (pointersRef.current.size < 2) pinchRef.current = null
+      dragRef.current = null
+      return
+    }
+    const drag = dragRef.current
+    dragRef.current = null
+    if (!drag) return
+    const d = docRef.current
+    if (drag.kind === 'pan') {
+      if (!drag.moved) setSelection(null) // 空白点按 → 取消选择
+      return
+    }
+    if (drag.kind === 'node' && drag.moved) {
+      let next = d
+      const pos = d.layout[drag.id]
+      if (pos) {
+        // 拖出 / 拖入分组边界 → 换组（重写源码时移动到对应 subgraph 块）
+        const gid = groupAtPoint(d, gboxesRef.current, pos[0], pos[1])
+        const cur = d.nodes.find((n) => n.id === drag.id)?.group
+        if ((gid ?? undefined) !== cur) {
+          next = { ...next, nodes: next.nodes.map((n) => (n.id === drag.id ? { ...n, group: gid } : n)) }
+        }
+      }
+      mutate.update(next, { history: false, immediate: true }) // 松手即持久（立即写回 %%layout）
+      return
+    }
+    if (drag.kind === 'group' && drag.moved) {
+      let next = d
+      // 组中心进入其他组 → 嵌套为其子组；拖离父组 → 解除嵌套
+      const cx = drag.ids.reduce((a, id) => a + (d.layout[id]?.[0] ?? 0), 0) / Math.max(drag.ids.length, 1)
+      const cy = drag.ids.reduce((a, id) => a + (d.layout[id]?.[1] ?? 0), 0) / Math.max(drag.ids.length, 1)
+      const gid = groupAtPoint(d, gboxesRef.current, cx, cy, groupSubtreeIds(d, drag.gid))
+      const cur = d.groups.find((g) => g.id === drag.gid)?.parent
+      if ((gid ?? undefined) !== cur) {
+        next = { ...next, groups: next.groups.map((g) => (g.id === drag.gid ? { ...g, parent: gid } : g)) }
+      }
+      mutate.update(next, { history: false, immediate: true })
+      return
+    }
+    if (drag.kind === 'link') {
+      setRubber(null)
+      const w = toWorld(e.clientX, e.clientY)
+      const hit = nodeAtPoint(d, boxesRef.current, w.x, w.y)
+      if (hit && hit !== drag.from) {
+        const style: FlowEdgeStyle = arrowOn ? '-->' : '---'
+        if (d.edges.some((x) => x.from === drag.from && x.to === hit && (x.style ?? '-->') === style)) {
+          toast('这条连线已存在')
+        } else {
+          mutate.update({ ...d, edges: [...d.edges, { from: drag.from, to: hit, style }] })
+        }
+      }
+      return
+    }
+  }
+
+  const onPointerCancel = (e: React.PointerEvent<HTMLDivElement>) => {
+    const el = containerRef.current
+    if (el?.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId)
+    pointersRef.current.delete(e.pointerId)
+    if (pointersRef.current.size < 2) pinchRef.current = null
+    dragRef.current = null
+    setRubber(null)
+  }
+
+  // ---- 键盘：Delete 删除 / 方向键微移（±10px，Shift=1px） ----
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const t = e.target as HTMLElement | null
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+    if (e.key === 'Escape') {
+      setPlacing(false)
+      setEditing(null)
+      setSelection(null)
+      return
+    }
+    if (!selection) return
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      e.preventDefault()
+      deleteSelection()
+      return
+    }
+    if (selection.type === 'node') {
+      const step = e.shiftKey ? 1 : 10
+      const delta: Record<string, [number, number]> = {
+        ArrowLeft: [-step, 0],
+        ArrowRight: [step, 0],
+        ArrowUp: [0, -step],
+        ArrowDown: [0, step],
+      }
+      const dd = delta[e.key]
+      if (!dd) return
+      e.preventDefault()
+      const d = docRef.current
+      const cur = d.layout[selection.id] ?? [0, 0]
+      // 连续微移 700ms 内只入一次撤销栈
+      const now = Date.now()
+      if (now - nudgeTsRef.current > 700) mutate.snapshot()
+      nudgeTsRef.current = now
+      mutate.update(
+        { ...d, layout: { ...d.layout, [selection.id]: [cur[0] + dd[0], cur[1] + dd[1]] } },
+        { history: false, immediate: true },
+      )
+    }
+  }
+
+  const tbBtn =
+    'h-7 rounded-full px-2.5 text-xs font-normal outline-none transition-colors hover:bg-accent hover:text-accent-foreground'
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      {/* 工具栏 */}
+      <div className="flex flex-wrap items-center gap-1" role="toolbar" aria-label="画布工具栏">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-pressed={placing}
+          className={cn(tbBtn, placing && 'border-primary text-primary')}
+          onClick={() => {
+            setPlacing((p) => !p)
+            setSelection(null)
+          }}
+        >
+          <Plus className="size-3.5" /> 节点
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-label={tool === 'select' ? '当前为选择工具' : '切换为选择工具'}
+          aria-pressed={tool === 'select'}
+          className={cn(tbBtn, tool === 'select' && 'border-primary text-primary')}
+          onClick={() => setTool('select')}
+        >
+          <MousePointer2 className="size-3.5" />
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-label="抓手平移工具"
+          aria-pressed={tool === 'pan'}
+          className={cn(tbBtn, tool === 'pan' && 'border-primary text-primary')}
+          onClick={() => setTool('pan')}
+        >
+          <Hand className="size-3.5" />
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-label="新连线箭头开关（关则为无箭头连线）"
+          aria-pressed={arrowOn}
+          className={cn(tbBtn, arrowOn && 'border-primary text-primary')}
+          onClick={() => setArrowOn((v) => !v)}
+        >
+          <MoveRight className="size-3.5" /> 箭头
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          aria-label="网格吸附开关（10px）"
+          aria-pressed={snapGrid}
+          className={cn(tbBtn, snapGrid && 'border-primary text-primary')}
+          onClick={() => setSnapGrid((v) => !v)}
+        >
+          <Magnet className="size-3.5" /> 吸附
+        </Button>
+        <Button type="button" variant="outline" size="sm" className={tbBtn} onClick={applyAutoLayout}>
+          <Wand2 className="size-3.5" /> 自动布局
+        </Button>
+        <Button type="button" variant="outline" size="sm" className={tbBtn} onClick={() => fitView()}>
+          <Maximize2 className="size-3.5" /> 适应
+        </Button>
+        <div className="ml-auto flex items-center gap-0.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            aria-label="缩小"
+            className="h-7 w-7 rounded-full p-0"
+            onClick={() => zoomCenter(1 / 1.25)}
+          >
+            <ZoomOut className="size-3.5" />
+          </Button>
+          <span
+            className="min-w-10 text-center text-[11px] tabular-nums text-muted-foreground"
+            aria-label={`缩放 ${Math.round(view.k * 100)}%`}
+          >
+            {Math.round(view.k * 100)}%
+          </span>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            aria-label="放大"
+            className="h-7 w-7 rounded-full p-0"
+            onClick={() => zoomCenter(1.25)}
+          >
+            <ZoomIn className="size-3.5" />
+          </Button>
+        </div>
+      </div>
+
+      {/* 画布 */}
+      <div
+        ref={containerRef}
+        role="application"
+        aria-label="流程图画布：拖动节点、从节点边缘圆点拖出连线、双击改文字、滚轮或双指缩放"
+        tabIndex={0}
+        onKeyDown={onKeyDown}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerCancel}
+        onContextMenu={(e) => e.preventDefault()}
+        className={cn(
+          'relative h-[46dvh] min-h-56 touch-none select-none overflow-hidden rounded-xl border border-border bg-background outline-none focus-visible:ring-2 focus-visible:ring-ring/60',
+          tool === 'pan' ? 'cursor-grab' : placing ? 'cursor-crosshair' : 'cursor-default',
+        )}
+        style={{
+          backgroundImage: 'radial-gradient(var(--border) 1px, transparent 1px)',
+          backgroundSize: `${20 * view.k}px ${20 * view.k}px`,
+          backgroundPosition: `${view.x}px ${view.y}px`,
+        }}
+      >
+        <svg className="absolute inset-0 h-full w-full" aria-hidden>
+          <g transform={`translate(${view.x} ${view.y}) scale(${view.k})`}>
+            {/* 分组容器（外层先画：虚线圆角大框 + 标题，标题条/边框可整体拖动） */}
+            {[...gboxes.entries()]
+              .sort((a, b) => a[1].depth - b[1].depth)
+              .map(([gid, b]) => {
+                const g = doc.groups.find((x) => x.id === gid)
+                if (!g) return null
+                return (
+                  <g key={gid}>
+                    <rect
+                      x={b.x}
+                      y={b.y}
+                      width={b.w}
+                      height={b.h}
+                      rx={12}
+                      className="fill-muted/20 stroke-muted-foreground/50"
+                      style={{ strokeDasharray: '7 5', strokeWidth: 1.2 }}
+                    />
+                    <text x={b.x + 10} y={b.y + 18} fontSize={12} className="fill-muted-foreground">
+                      {g.title}
+                    </text>
+                    <rect
+                      x={b.x}
+                      y={b.y}
+                      width={b.w}
+                      height={24}
+                      fill="transparent"
+                      data-group-drag={gid}
+                      className="cursor-grab"
+                    />
+                    <rect
+                      x={b.x}
+                      y={b.y}
+                      width={b.w}
+                      height={b.h}
+                      rx={12}
+                      fill="none"
+                      stroke="transparent"
+                      strokeWidth={12}
+                      pointerEvents="stroke"
+                      data-group-drag={gid}
+                      className="cursor-grab"
+                    />
+                  </g>
+                )
+              })}
+
+            {/* 连线（带箭头 + 标签） */}
+            {doc.edges.map((e, i) => {
+              const a = boxes.get(e.from)
+              const b = boxes.get(e.to)
+              if (!a || !b) return null
+              const sel = selection?.type === 'edge' && selection.index === i
+              const style = e.style ?? '-->'
+              const hasArrow = style !== '---'
+              const thick = style === '==>' ? 3 : 1.8
+              let dstr: string
+              let head: string | null = null
+              let labelX: number
+              let labelY: number
+              if (e.from === e.to) {
+                // 自环
+                const lx = a.x
+                const ly = a.cy
+                const tx = a.cx
+                const ty = a.y
+                const c1x = lx - 48
+                const c1y = ly + 30
+                const c2x = lx - 48
+                const c2y = ty - 44
+                dstr = `M ${lx} ${ly} C ${c1x} ${c1y}, ${c2x} ${c2y}, ${tx} ${ty}`
+                if (hasArrow) head = flowArrowHead(c2x, c2y, tx, ty, 8 + thick).head
+                labelX = lx - 50
+                labelY = ly - 18
+              } else {
+                const p = flowEdgeAnchors(a, b)
+                const size = 8 + thick * 1.4
+                const arr = hasArrow ? flowArrowHead(p.x1, p.y1, p.x2, p.y2, size) : null
+                const end = arr ? arr.lineEnd : [p.x2, p.y2]
+                dstr = `M ${p.x1} ${p.y1} L ${end[0]} ${end[1]}`
+                head = arr?.head ?? null
+                labelX = (p.x1 + p.x2) / 2
+                labelY = (p.y1 + p.y2) / 2 - 7
+              }
+              return (
+                <g key={i}>
+                  <path
+                    d={dstr}
+                    fill="none"
+                    stroke="transparent"
+                    strokeWidth={16}
+                    pointerEvents="stroke"
+                    data-edge-index={i}
+                    className="cursor-pointer"
+                  />
+                  <path
+                    d={dstr}
+                    fill="none"
+                    className={sel ? 'stroke-primary' : 'stroke-muted-foreground'}
+                    style={{
+                      strokeWidth: sel ? thick + 1.2 : thick,
+                      strokeDasharray: style === '-.->' ? '7 5' : undefined,
+                      strokeLinecap: 'round',
+                    }}
+                    pointerEvents="none"
+                  />
+                  {head && (
+                    <path
+                      d={head}
+                      className={sel ? 'fill-primary' : 'fill-muted-foreground'}
+                      pointerEvents="none"
+                    />
+                  )}
+                  {e.label && (
+                    <text
+                      x={labelX}
+                      y={labelY}
+                      textAnchor="middle"
+                      fontSize={11}
+                      className="fill-foreground"
+                      style={{ paintOrder: 'stroke', stroke: 'var(--background)', strokeWidth: 3.5 }}
+                      pointerEvents="none"
+                    >
+                      {e.label}
+                    </text>
+                  )}
+                </g>
+              )
+            })}
+
+            {/* 节点 */}
+            {doc.nodes.map((n) => {
+              const b = boxes.get(n.id)
+              if (!b) return null
+              const sel = selection?.type === 'node' && selection.id === n.id
+              return (
+                <g
+                  key={n.id}
+                  data-node-id={n.id}
+                  className="cursor-grab"
+                  onDoubleClick={() => openRename(n.id)}
+                >
+                  <FlowShapeFigure
+                    shape={n.shape}
+                    x={b.x}
+                    y={b.y}
+                    w={b.w}
+                    h={b.h}
+                    fill={n.fill}
+                    selected={sel}
+                  />
+                  {sel && (
+                    <rect
+                      x={b.x - 6}
+                      y={b.y - 6}
+                      width={b.w + 12}
+                      height={b.h + 12}
+                      rx={8}
+                      fill="none"
+                      stroke="var(--primary)"
+                      style={{ strokeWidth: 1.2, strokeDasharray: '5 4' }}
+                      pointerEvents="none"
+                    />
+                  )}
+                  {b.lines.map((l, li) => (
+                    <text
+                      key={li}
+                      x={b.cx}
+                      y={b.cy + 4.5 + (li - (b.lines.length - 1) / 2) * 15}
+                      textAnchor="middle"
+                      fontSize={13}
+                      style={n.fill ? { fill: '#111827' } : undefined}
+                      className={n.fill ? undefined : 'fill-foreground'}
+                      pointerEvents="none"
+                    >
+                      {l}
+                    </text>
+                  ))}
+                </g>
+              )
+            })}
+
+            {/* 选中节点的连接锚点（上下左右 4 个小圆点） */}
+            {selNode &&
+              (() => {
+                const b = boxes.get(selNode.id)
+                if (!b) return null
+                const pts: Array<[string, number, number]> = [
+                  ['t', b.cx, b.y],
+                  ['r', b.x + b.w, b.cy],
+                  ['b', b.cx, b.y + b.h],
+                  ['l', b.x, b.cy],
+                ]
+                return pts.map(([side, ax, ay]) => (
+                  <circle
+                    key={side}
+                    cx={ax}
+                    cy={ay}
+                    r={5}
+                    data-link-anchor={side}
+                    data-node-id={selNode.id}
+                    className="fill-background stroke-primary cursor-crosshair"
+                    style={{ strokeWidth: 1.6 }}
+                  />
+                ))
+              })()}
+
+            {/* 橡皮筋连线 */}
+            {rubber && (
+              <line
+                x1={rubber.ax}
+                y1={rubber.ay}
+                x2={rubber.x}
+                y2={rubber.y}
+                className="stroke-primary"
+                style={{ strokeWidth: 2, strokeDasharray: '6 4' }}
+                pointerEvents="none"
+              />
+            )}
+          </g>
+        </svg>
+
+        {/* 空画布提示 */}
+        {doc.nodes.length === 0 && !placing && (
+          <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <p className="rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
+              画布为空，点工具栏「节点」添加
+            </p>
+          </div>
+        )}
+
+        {/* 放置模式提示 */}
+        {placing && (
+          <div className="pointer-events-none absolute left-1/2 top-2 z-10 -translate-x-1/2 rounded-full bg-primary px-3 py-1 text-[11px] text-primary-foreground shadow">
+            点击画布放置节点，Esc 取消
+          </div>
+        )}
+
+        {/* 选中节点：浮动工具条（形状 7 种 + 填充色 6 选 + 改名 + 删除） */}
+        {selNode && (
+          <div
+            data-overlay
+            className="absolute left-1/2 top-2 z-10 flex max-w-[calc(100%-12px)] -translate-x-1/2 flex-wrap items-center justify-center gap-0.5 rounded-xl border border-border bg-background/95 p-1 shadow-lg"
+          >
+            {FLOW_SHAPES.map((s) => (
+              <button
+                key={s.value}
+                type="button"
+                title={`${s.label} ${s.syntax}`}
+                aria-label={`形状：${s.label}`}
+                aria-pressed={selNode.shape === s.value}
+                onClick={() => setNodeShape(s.value)}
+                className={cn('rounded-lg p-1', selNode.shape === s.value ? 'bg-primary/10' : 'hover:bg-muted')}
+              >
+                <svg width={22} height={14} viewBox="0 0 22 14" aria-hidden>
+                  <FlowShapeFigure
+                    shape={s.value}
+                    x={1.5}
+                    y={1.5}
+                    w={19}
+                    h={11}
+                    mini
+                    selected={selNode.shape === s.value}
+                  />
+                </svg>
+              </button>
+            ))}
+            <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+            <button
+              type="button"
+              title="默认填充"
+              aria-label="清除填充色"
+              onClick={() => setNodeFill(undefined)}
+              className="rounded-full p-0.5 hover:bg-muted"
+            >
+              <span className="block size-4 rounded-full border border-dashed border-border" aria-hidden />
+            </button>
+            {FLOW_FILLS.map((c) => (
+              <button
+                key={c}
+                type="button"
+                title={c}
+                aria-label={`填充色 ${c}`}
+                onClick={() => setNodeFill(c)}
+                className={cn('rounded-full p-0.5 hover:bg-muted', selNode.fill === c && 'ring-2 ring-primary ring-offset-1')}
+              >
+                <span className="block size-4 rounded-full border border-border" style={{ background: c }} aria-hidden />
+              </button>
+            ))}
+            <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+            <button
+              type="button"
+              aria-label="重命名节点"
+              onClick={() => openRename(selNode.id)}
+              className="rounded-lg p-1.5 hover:bg-muted"
+            >
+              <Pencil className="size-3.5" />
+            </button>
+            <button
+              type="button"
+              aria-label="删除节点"
+              onClick={deleteSelection}
+              className="rounded-lg p-1.5 hover:bg-destructive/10 hover:text-destructive"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* 选中连线：标签 / 样式 / 反转 / 删除 */}
+        {selEdge && (
+          <div
+            data-overlay
+            className="absolute bottom-2 left-1/2 z-10 flex -translate-x-1/2 flex-wrap items-center gap-1 rounded-xl border border-border bg-background/95 p-1 shadow-lg"
+          >
+            <Input
+              value={edgeDraft}
+              onChange={(ev) => setEdgeDraft(ev.target.value)}
+              onBlur={commitEdgeLabel}
+              onKeyDown={(ev) => {
+                if (ev.key === 'Enter') commitEdgeLabel()
+              }}
+              placeholder="连线标签"
+              aria-label="连线标签"
+              className="h-7 w-28 rounded-lg text-xs"
+            />
+            <Select value={selEdge.style ?? '-->'} onValueChange={(v) => setEdgeStyle(v as FlowEdgeStyle)}>
+              <SelectTrigger size="sm" aria-label="连线样式" className="h-7 w-[96px] rounded-lg text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {FLOW_EDGE_STYLES.map((s) => (
+                  <SelectItem key={s.value} value={s.value} className="text-xs">
+                    {s.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <button
+              type="button"
+              aria-label="反转连线方向"
+              onClick={swapEdge}
+              className="rounded-lg p-1.5 hover:bg-muted"
+            >
+              <ArrowLeftRight className="size-3.5" />
+            </button>
+            <button
+              type="button"
+              aria-label="删除连线"
+              onClick={deleteSelection}
+              className="rounded-lg p-1.5 hover:bg-destructive/10 hover:text-destructive"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* 就地改名输入框（跟随节点位置） */}
+        {editing &&
+          (() => {
+            const b = boxes.get(editing)
+            if (!b) return null
+            const iw = Math.max(b.w * view.k, 64)
+            return (
+              <div
+                data-overlay
+                className="absolute z-20"
+                style={{ left: b.cx * view.k + view.x - iw / 2, top: b.cy * view.k + view.y - 12, width: iw }}
+              >
+                <input
+                  value={draft}
+                  autoFocus
+                  aria-label="节点名称"
+                  onChange={(ev) => setDraft(ev.target.value)}
+                  onFocus={(ev) => ev.target.select()}
+                  onBlur={commitRename}
+                  onKeyDown={(ev) => {
+                    if (ev.key === 'Enter') commitRename()
+                    if (ev.key === 'Escape') setEditing(null)
+                  }}
+                  className="h-6 w-full rounded-md border-2 border-primary bg-background px-1 text-center text-xs outline-none"
+                />
+              </div>
+            )
+          })()}
+      </div>
+    </div>
+  )
+}
+
+// ---------- 列表模式（表单编辑，与画布共享同一 FlowDoc 与撤销栈） ----------
+
+function FlowListEditor({ doc, mutate }: { doc: FlowDoc; mutate: FlowMutate }) {
+  const [section, setSection] = React.useState<'nodes' | 'edges'>('nodes')
+
+  const genId = () => {
+    let i = doc.nodes.length + 1
+    let id = `N${i}`
+    while (doc.nodes.some((n) => n.id === id)) {
+      i += 1
+      id = `N${i}`
+    }
+    return id
+  }
+  const setNode = (id: string, patch: Partial<FlowDocNode>) =>
+    mutate.update({ ...doc, nodes: doc.nodes.map((n) => (n.id === id ? { ...n, ...patch } : n)) })
+  const addNode = () => {
+    const id = genId()
+    const k = doc.nodes.length
+    mutate.update({
+      ...doc,
+      nodes: [...doc.nodes, { id, label: '新节点', shape: 'rect' }],
+      layout: { ...doc.layout, [id]: [100 + (k % 5) * 110, 80 + Math.floor(k / 5) * 100] },
+    })
+  }
+  const delNode = (id: string) =>
+    mutate.update({
+      ...doc,
+      nodes: doc.nodes.filter((n) => n.id !== id),
+      edges: doc.edges.filter((e) => e.from !== id && e.to !== id),
+    })
+  const setEdge = (i: number, patch: Partial<FlowDocEdge>) =>
+    mutate.update({ ...doc, edges: doc.edges.map((e, k) => (k === i ? { ...e, ...patch } : e)) })
+  const addEdge = () => {
+    if (doc.nodes.length < 2) {
+      toast.warning('请先添加至少两个节点')
+      return
+    }
+    mutate.update({
+      ...doc,
+      edges: [...doc.edges, { from: doc.nodes[0].id, to: doc.nodes[1].id, style: '-->' }],
+    })
+  }
+
+  const delBtn = 'shrink-0 rounded p-1 text-muted-foreground/70 hover:bg-destructive/10 hover:text-destructive'
+  const groupTitleOf = (gid?: string) => doc.groups.find((g) => g.id === gid)?.title
 
   return (
     <div className="flex flex-col gap-2">
-      {/* 分区切换 + 方向 */}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="flex rounded-full bg-muted p-1" role="tablist" aria-label="流程图编辑分区">
-          {(
-            [
-              { key: 'nodes' as const, label: `节点 ${flow.nodes.length}` },
-              { key: 'edges' as const, label: `连线 ${flow.edges.length}` },
-            ] as const
-          ).map((t) => (
-            <button
-              key={t.key}
-              type="button"
-              role="tab"
-              aria-selected={section === t.key}
-              onClick={() => setSection(t.key)}
-              className={cn(
-                'rounded-full px-3 py-1 text-xs transition-colors',
-                section === t.key
-                  ? 'bg-background font-medium text-foreground shadow-sm'
-                  : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              {t.label}
-            </button>
-          ))}
-        </div>
-        <div className="ml-auto flex gap-1">
-          <Button
-            variant="outline"
-            size="sm"
-            aria-label="自上而下布局"
+      {/* 分区切换 */}
+      <div className="flex rounded-full bg-muted p-1" role="tablist" aria-label="流程图编辑分区">
+        {(
+          [
+            { key: 'nodes' as const, label: `节点 ${doc.nodes.length}` },
+            { key: 'edges' as const, label: `连线 ${doc.edges.length}` },
+          ] as const
+        ).map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            aria-selected={section === t.key}
+            onClick={() => setSection(t.key)}
             className={cn(
-              'h-7 rounded-full px-2.5 text-xs',
-              (flow.dir === 'TD' || flow.dir === 'TB') && 'border-primary text-primary',
+              'rounded-full px-3 py-1 text-xs transition-colors',
+              section === t.key
+                ? 'bg-background font-medium text-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground',
             )}
-            onClick={() => onChange({ ...flow, dir: 'TD' })}
           >
-            纵向
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            aria-label="自左向右布局"
-            className={cn(
-              'h-7 rounded-full px-2.5 text-xs',
-              flow.dir === 'LR' && 'border-primary text-primary',
-            )}
-            onClick={() => onChange({ ...flow, dir: 'LR' })}
-          >
-            横向
-          </Button>
-        </div>
+            {t.label}
+          </button>
+        ))}
       </div>
 
       <div className="max-h-[46dvh] space-y-1.5 overflow-y-auto rounded-xl border border-border p-2">
         {section === 'nodes' ? (
           <>
-            {flow.nodes.map((n) => (
-              <div key={n.id} className="flex items-center gap-1.5">
+            {doc.nodes.map((n) => (
+              <div key={n.id} className="flex flex-wrap items-center gap-1.5">
                 <span
                   className="shrink-0 rounded-md bg-muted px-1.5 py-1 font-mono text-[10px] text-muted-foreground"
                   aria-label={`节点标识 ${n.id}`}
@@ -573,21 +2352,26 @@ function FlowEditor({
                   onChange={(e) => setNode(n.id, { label: e.target.value })}
                   className="h-8 min-w-0 flex-1 rounded-lg text-sm"
                 />
-                <Select
-                  value={n.shape ?? 'rect'}
-                  onValueChange={(v) => setNode(n.id, { shape: v as FlowShape })}
-                >
+                {n.group && groupTitleOf(n.group) && (
+                  <span
+                    className="shrink-0 rounded-md border border-dashed border-border px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                    title="所属分组（画布中拖出/拖入可换组）"
+                  >
+                    {groupTitleOf(n.group)}
+                  </span>
+                )}
+                <Select value={n.shape} onValueChange={(v) => setNode(n.id, { shape: v as FlowNodeShape })}>
                   <SelectTrigger
                     size="sm"
                     aria-label={`节点 ${n.id} 形状`}
-                    className="h-8 w-[74px] shrink-0 rounded-lg text-xs"
+                    className="h-8 w-[122px] shrink-0 rounded-lg text-xs"
                   >
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     {FLOW_SHAPES.map((s) => (
                       <SelectItem key={s.value} value={s.value} className="text-xs">
-                        {s.label}
+                        {s.label} {s.syntax}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -613,7 +2397,7 @@ function FlowEditor({
           </>
         ) : (
           <>
-            {flow.edges.map((e, i) => (
+            {doc.edges.map((e, i) => (
               <div key={i} className="flex flex-wrap items-center gap-1.5">
                 <Select value={e.from} onValueChange={(v) => setEdge(i, { from: v })}>
                   <SelectTrigger
@@ -624,7 +2408,7 @@ function FlowEditor({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {flow.nodes.map((n) => (
+                    {doc.nodes.map((n) => (
                       <SelectItem key={n.id} value={n.id} className="text-xs">
                         {n.label || n.id}
                       </SelectItem>
@@ -632,7 +2416,7 @@ function FlowEditor({
                   </SelectContent>
                 </Select>
                 <span aria-hidden className="text-xs text-muted-foreground">
-                  →
+                  {e.style === '---' ? '—' : e.style === '==>' ? '⇒' : e.style === '-.->' ? '⇢' : '→'}
                 </span>
                 <Select value={e.to} onValueChange={(v) => setEdge(i, { to: v })}>
                   <SelectTrigger
@@ -643,7 +2427,7 @@ function FlowEditor({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {flow.nodes.map((n) => (
+                    {doc.nodes.map((n) => (
                       <SelectItem key={n.id} value={n.id} className="text-xs">
                         {n.label || n.id}
                       </SelectItem>
@@ -654,15 +2438,29 @@ function FlowEditor({
                   value={e.label ?? ''}
                   placeholder="连线文字（可空）"
                   aria-label={`连线 ${i + 1} 文字`}
-                  onChange={(ev) => setEdge(i, { label: ev.target.value })}
+                  onChange={(ev) => setEdge(i, { label: ev.target.value || undefined })}
                   className="h-8 min-w-24 flex-1 rounded-lg text-xs"
                 />
+                <Select value={e.style ?? '-->'} onValueChange={(v) => setEdge(i, { style: v as FlowEdgeStyle })}>
+                  <SelectTrigger
+                    size="sm"
+                    aria-label={`连线 ${i + 1} 样式`}
+                    className="h-8 w-[108px] shrink-0 rounded-lg text-xs"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {FLOW_EDGE_STYLES.map((s) => (
+                      <SelectItem key={s.value} value={s.value} className="text-xs">
+                        {s.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
                 <button
                   type="button"
                   aria-label={`删除连线 ${i + 1}`}
-                  onClick={() =>
-                    onChange({ ...flow, edges: flow.edges.filter((_, k) => k !== i) })
-                  }
+                  onClick={() => mutate.update({ ...doc, edges: doc.edges.filter((_, k) => k !== i) })}
                   className={delBtn}
                 >
                   <Trash2 className="size-3.5" />
@@ -674,15 +2472,170 @@ function FlowEditor({
               size="sm"
               className="h-8 w-full rounded-full text-xs"
               onClick={addEdge}
-              disabled={flow.nodes.length < 2}
+              disabled={doc.nodes.length < 2}
             >
               <Plus className="size-3.5" /> 添加连线
             </Button>
           </>
         )}
       </div>
+    </div>
+  )
+}
+
+// ---------- 流程图编辑器容器（画布 ⇄ 列表 + 方向 + 撤销重做） ----------
+
+function FlowGraphEditor({
+  doc,
+  warn,
+  onDocChange,
+}: {
+  doc: FlowDoc
+  /** 解析容错黄条提示（null = 无） */
+  warn: string | null
+  /** immediate=false 时位置类修改防抖 600ms 写回源码 */
+  onDocChange: (next: FlowDoc, immediate?: boolean) => void
+}) {
+  const [mode, setMode] = React.useState<'canvas' | 'list'>('canvas')
+  const [hist, setHist] = React.useState<{ undo: FlowDoc[]; redo: FlowDoc[] }>({ undo: [], redo: [] })
+  const docRef = React.useRef(doc)
+  const histRef = React.useRef(hist)
+  // 同步镜像 ref（撤销重做里读最新值；useLayoutEffect 保证下一次事件触发前已写入）
+  React.useLayoutEffect(() => {
+    docRef.current = doc
+  })
+  React.useLayoutEffect(() => {
+    histRef.current = hist
+  })
+  const canUndo = hist.undo.length > 0
+  const canRedo = hist.redo.length > 0
+
+  // 撤销重做（独立于弹窗其它编辑器；栈深 50）
+  const mutate = React.useMemo<FlowMutate>(
+    () => ({
+      snapshot: () => {
+        const h = histRef.current
+        setHist({ undo: [...h.undo, docRef.current].slice(-50), redo: [] })
+      },
+      update: (next, opts) => {
+        if (opts?.history !== false) {
+          const h = histRef.current
+          setHist({ undo: [...h.undo, docRef.current].slice(-50), redo: [] })
+        }
+        onDocChange(next, opts?.immediate ?? true)
+      },
+      undo: () => {
+        const h = histRef.current
+        const prev = h.undo[h.undo.length - 1]
+        if (!prev) return
+        setHist({ undo: h.undo.slice(0, -1), redo: [...h.redo, docRef.current].slice(-50) })
+        onDocChange(prev, true)
+      },
+      redo: () => {
+        const h = histRef.current
+        const next = h.redo[h.redo.length - 1]
+        if (!next) return
+        setHist({ undo: [...h.undo, docRef.current].slice(-50), redo: h.redo.slice(0, -1) })
+        onDocChange(next, true)
+      },
+    }),
+    [onDocChange],
+  )
+
+  return (
+    <div className="flex flex-col gap-2">
+      {/* 模式切换 + 撤销重做 + 方向 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex rounded-full bg-muted p-1" role="tablist" aria-label="流程图编辑模式">
+          {(
+            [
+              { key: 'canvas' as const, label: '画布' },
+              { key: 'list' as const, label: '列表' },
+            ] as const
+          ).map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              role="tab"
+              aria-selected={mode === t.key}
+              onClick={() => setMode(t.key)}
+              className={cn(
+                'rounded-full px-3 py-1 text-xs transition-colors',
+                mode === t.key
+                  ? 'bg-background font-medium text-foreground shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <div className="ml-auto flex items-center gap-1">
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="撤销"
+            disabled={!canUndo}
+            onClick={mutate.undo}
+            className="h-7 w-7 rounded-full p-0"
+          >
+            <Undo2 className="size-3.5" />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="重做"
+            disabled={!canRedo}
+            onClick={mutate.redo}
+            className="h-7 w-7 rounded-full p-0"
+          >
+            <Redo2 className="size-3.5" />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="自上而下布局"
+            className={cn(
+              'h-7 rounded-full px-2.5 text-xs',
+              (doc.dir === 'TD' || doc.dir === 'TB') && 'border-primary text-primary',
+            )}
+            onClick={() => mutate.update({ ...doc, dir: 'TD' })}
+          >
+            纵向
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="自左向右布局"
+            className={cn('h-7 rounded-full px-2.5 text-xs', doc.dir === 'LR' && 'border-primary text-primary')}
+            onClick={() => mutate.update({ ...doc, dir: 'LR' })}
+          >
+            横向
+          </Button>
+        </div>
+      </div>
+
+      {/* 解析容错黄条 */}
+      {warn && (
+        <div
+          role="status"
+          className="flex items-start gap-1.5 rounded-xl border border-amber-300 bg-amber-50 px-2.5 py-1.5 text-[11px] text-amber-900 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-300"
+        >
+          <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+          <p className="min-w-0 flex-1 break-words">{warn}</p>
+        </div>
+      )}
+
+      {mode === 'canvas' ? (
+        <FlowCanvasEditor doc={doc} mutate={mutate} />
+      ) : (
+        <FlowListEditor doc={doc} mutate={mutate} />
+      )}
+
       <p className="text-[11px] text-muted-foreground">
-        节点：改名 / 换形状 / 删除（自动移除相关连线）；连线：选起点终点、可加文字；删除节点前先记住被引用的连线
+        {mode === 'canvas'
+          ? '拖动节点 / 分组标题排版（拖到虚线分组内外自动换组）；点选节点后从边缘圆点拖出连线（工具栏可关箭头）；双击改文字，Delete 删除；滚轮或双指缩放，空白处拖动平移，方向键微移'
+          : '节点：改名 / 换形状 / 删除（自动移除相关连线）；连线：选起点终点、可加标签与样式；两模式共享同一数据与撤销栈'}
       </p>
     </div>
   )
@@ -793,6 +2746,11 @@ function apiKindOf(ref: MediaRef): 'mermaid' | 'svg' | 'table' | 'formula' | 'co
   return 'code'
 }
 
+/** MediaRefKind → 可编辑类型（audio/video 按源码文本处理，同 code） */
+function asMediaKind(k: MediaRefKind): MediaKind {
+  return k === 'audio' || k === 'video' ? 'code' : k
+}
+
 /** 源码 → RichContent 可渲染文本（预览 / AI 修复预览共用） */
 function renderableOf(kind: MediaKind, code: string): string {
   switch (kind) {
@@ -823,7 +2781,8 @@ export function MediaEditDialog({
   const [src, setSrc] = React.useState('')
   const [grid, setGrid] = React.useState<TableGrid | null>(null)
   const [tree, setTree] = React.useState<MindNode | null>(null)
-  const [flow, setFlow] = React.useState<FlowGraph | null>(null)
+  const [flowDoc, setFlowDoc] = React.useState<FlowDoc | null>(null)
+  const [flowWarn, setFlowWarn] = React.useState<string | null>(null)
 
   // 容错 + AI
   const [check, setCheck] = React.useState<CheckState>({ status: 'ok' })
@@ -833,34 +2792,72 @@ export function MediaEditDialog({
   const [aiOpen, setAiOpen] = React.useState(false)
   const checkGenRef = React.useRef(0)
 
+  // 流程图画布：doc ⇄ 源码同步（结构变化立即写回；拖动位置防抖 600ms，松手 flush）
+  const flowDocSyncRef = React.useRef<FlowDoc | null>(null)
+  const flowSrcTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const syncFlowDoc = React.useCallback((next: FlowDoc, immediate = true) => {
+    flowDocSyncRef.current = next
+    setFlowDoc(next)
+    if (flowSrcTimerRef.current) {
+      clearTimeout(flowSrcTimerRef.current)
+      flowSrcTimerRef.current = null
+    }
+    if (immediate) {
+      setSrc(serializeFlowDoc(next))
+    } else {
+      flowSrcTimerRef.current = setTimeout(() => {
+        flowSrcTimerRef.current = null
+        setSrc(serializeFlowDoc(flowDocSyncRef.current ?? next))
+      }, 600)
+    }
+  }, [])
+
+  /** mermaid 源码 → FlowDoc（自动布局补坐标 + 解析容错黄条文案） */
+  const parseFlowFromSrc = React.useCallback((code: string): FlowDoc | null => {
+    const r = parseFlowDoc(code)
+    if (!r) return null
+    setFlowWarn(
+      r.problems.length
+        ? `第 ${r.problems.join('、')} 行无法解析为画布内容（已原样保留在源码中），画布仅显示可解析部分`
+        : null,
+    )
+    return withAutoLayout(r.doc)
+  }, [])
+
   React.useEffect(() => {
     if (!mediaRef) return
+    if (flowSrcTimerRef.current) {
+      clearTimeout(flowSrcTimerRef.current)
+      flowSrcTimerRef.current = null
+    }
     setSrc(mediaRef.src)
     setTab('visual')
     setForceOriginal(false)
     setFix(null)
     setAiOpen(false)
     setCheck({ status: 'ok' })
+    setFlowWarn(null)
     if (mediaRef.kind === 'table') {
       setGrid(parseTable(mediaRef.src))
       setTree(null)
-      setFlow(null)
+      setFlowDoc(null)
     } else if (mediaRef.kind === 'mermaid' && isMindmap(mediaRef.src)) {
-      // mindmap → 树编辑器；graph/flowchart → 流程图编辑器（不再静默落源码）
+      // mindmap → 树编辑器；graph/flowchart → 画布式流程图编辑器
       const t = parseMindmap(mediaRef.src)
       if (t) {
         setTree(t)
-        setFlow(null)
+        setFlowDoc(null)
       } else {
         setTree(null)
-        setFlow(parseFlow(mediaRef.src))
+        setFlowDoc(parseFlowFromSrc(mediaRef.src))
       }
     } else {
       setGrid(null)
       setTree(null)
-      setFlow(null)
+      setFlowDoc(null)
     }
-  }, [mediaRef])
+  }, [mediaRef, parseFlowFromSrc])
 
   // 实时校验（mermaid / svg / formula，防抖 600ms；mermaid 失败尝试部分加载）
   React.useEffect(() => {
@@ -905,7 +2902,7 @@ export function MediaEditDialog({
   // 可视化模式可用性（svg 始终可用：编辑器内部容错解析）
   const visualAvailable =
     (ref.kind === 'table' && !!grid) ||
-    (ref.kind === 'mermaid' && (!!tree || !!flow)) ||
+    (ref.kind === 'mermaid' && (!!tree || !!flowDoc)) ||
     ref.kind === 'formula' ||
     ref.kind === 'svg'
   const activeTab: EditTab = tab === 'visual' && !visualAvailable ? 'source' : tab
@@ -922,10 +2919,10 @@ export function MediaEditDialog({
       const t = parseMindmap(code)
       if (t) {
         setTree(t)
-        setFlow(null)
+        setFlowDoc(null)
       } else {
         setTree(null)
-        setFlow(parseFlow(code))
+        setFlowDoc(parseFlowFromSrc(code))
       }
     }
   }
@@ -939,7 +2936,7 @@ export function MediaEditDialog({
       ref.kind === 'table'
         ? !!parseTable(code)
         : ref.kind === 'mermaid'
-          ? !!(parseMindmap(code) || parseFlow(code))
+          ? !!(parseMindmap(code) || parseFlowDoc(code))
           : ref.kind === 'formula' || ref.kind === 'svg'
     setTab(can ? 'visual' : 'source')
     toast.success('AI 代码已写入，可继续可视化编辑')
@@ -982,13 +2979,26 @@ export function MediaEditDialog({
     toast.success('已应用 AI 修复代码（校验将自动重跑）')
   }
 
+  /**
+   * 切换编辑模式；切回可视化时 mermaid 流程图从当前源码重新容错解析
+   * （解析多少显示多少；不再是流程图则保留画布旧状态 + 黄条提示）。
+   */
+  const switchTab = (t: EditTab) => {
+    if (t === 'visual' && tab !== 'visual' && ref.kind === 'mermaid' && !tree) {
+      const d = parseFlowFromSrc(src)
+      if (d) setFlowDoc(d)
+      else setFlowWarn('源码缺少 graph/flowchart 声明，画布暂保留旧内容；请先在源码中修正')
+    }
+    setTab(t)
+  }
+
   const apply = async () => {
     if (applying) return
     let newSrc = src
     if (activeTab === 'visual') {
       if (ref.kind === 'table' && grid) newSrc = serializeTable(grid)
       else if (ref.kind === 'mermaid' && tree) newSrc = serializeMindmap(tree)
-      else if (ref.kind === 'mermaid' && flow) newSrc = buildFlow(flow.nodes, flow.edges, flow.dir)
+      else if (ref.kind === 'mermaid' && flowDoc) newSrc = serializeFlowDoc(flowDoc)
     }
     if (!newSrc.trim()) {
       toast.warning('内容不能为空')
@@ -1001,7 +3011,7 @@ export function MediaEditDialog({
     if (!skipValidate) {
       setApplying(true)
       try {
-        const verdict = await validateMediaSrc(ref.kind, newSrc)
+        const verdict = await validateMediaSrc(asMediaKind(ref.kind), newSrc)
         if (!verdict.ok) {
           setCheck({ status: 'error', message: verdict.message, line: verdict.line })
           toast.error('存在语法错误：可点击「AI 修复」，或「仍用原文」继续应用')
@@ -1125,7 +3135,7 @@ export function MediaEditDialog({
                       <React.Suspense
                         fallback={<p className="py-2 text-center text-xs text-muted-foreground">渲染中…</p>}
                       >
-                        <RichContentLazy content={renderableOf(ref.kind, fix.code)} />
+                        <RichContentLazy content={renderableOf(asMediaKind(ref.kind), fix.code)} />
                       </React.Suspense>
                     </div>
                     <details className="mt-1.5">
@@ -1175,7 +3185,7 @@ export function MediaEditDialog({
                   role="tab"
                   aria-selected={activeTab === t.key}
                   disabled={t.disabled}
-                  onClick={() => setTab(t.key)}
+                  onClick={() => switchTab(t.key)}
                   className={cn(
                     'flex flex-1 items-center justify-center gap-1.5 rounded-full py-1.5 text-sm transition-colors',
                     activeTab === t.key
@@ -1199,8 +3209,8 @@ export function MediaEditDialog({
                 <FormulaEditor src={src} onChange={setSrc} />
               ) : ref.kind === 'mermaid' && tree ? (
                 <MindmapEditor root={tree} onChange={setTree} />
-              ) : ref.kind === 'mermaid' && flow ? (
-                <FlowEditor flow={flow} onChange={setFlow} />
+              ) : ref.kind === 'mermaid' && flowDoc ? (
+                <FlowGraphEditor doc={flowDoc} warn={flowWarn} onDocChange={syncFlowDoc} />
               ) : ref.kind === 'svg' ? (
                 <SvgVisualEditor code={src} onChange={setSrc} />
               ) : null
@@ -1220,7 +3230,7 @@ export function MediaEditDialog({
                     </p>
                     <React.Suspense fallback={<p className="text-xs text-muted-foreground">渲染中…</p>}>
                       {/* 预览同样带统一富媒体交互（点击/悬浮可放大详情、下载） */}
-                      <RichContentLazy content={renderableOf(ref.kind, previewSrc)} />
+                      <RichContentLazy content={renderableOf(asMediaKind(ref.kind), previewSrc)} />
                     </React.Suspense>
                   </div>
                 )}
@@ -1239,7 +3249,7 @@ export function MediaEditDialog({
             <Button
               className="flex-1 rounded-full bg-zinc-900 font-semibold text-white hover:bg-zinc-800"
               onClick={() => void apply()}
-              disabled={applying || (!src.trim() && !grid && !tree && !flow)}
+              disabled={applying || (!src.trim() && !grid && !tree && !flowDoc)}
             >
               {applying ? (
                 <>
@@ -1257,7 +3267,7 @@ export function MediaEditDialog({
       <AiAssistPopover
         open={aiOpen}
         onOpenChange={setAiOpen}
-        kind={ref.kind}
+        kind={asMediaKind(ref.kind)}
         currentCode={src}
         onApply={applyAiCode}
       />

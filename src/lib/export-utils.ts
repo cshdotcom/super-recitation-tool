@@ -1,8 +1,8 @@
 'use client'
 
 // 通用导出工具库（背书吧）
-// 提供 TXT / Markdown / HTML / 打印导出 PDF / JSON 备份等导出方式，
-// 全部为纯函数（仅下载/打印时使用 DOM API），可被任意客户端组件复用。
+// 提供 TXT / Markdown / HTML / 打印导出 PDF / PNG 图片 / JSON 备份等导出方式，
+// 全部为纯函数（仅下载/打印/渲染图片时使用 DOM API），可被任意客户端组件复用。
 //
 // 中文零乱码策略：
 //   - TXT ：UTF-8 + BOM（\uFEFF 前缀），Windows 记事本直接打开不乱码
@@ -97,9 +97,20 @@ function fmtDate(d?: string | null): string {
 
 /** 纯文本导出时，图片 markdown 语法换成全角占位符（dataURL 太长会污染文本）。 */
 function imageToTextPlaceholder(src: string): string {
-  return src.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m: string, alt: string) =>
-    alt.trim() ? `［图片：${alt.trim()}］` : '［图片］',
+  return mediaRefsToText(
+    src.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m: string, alt: string) =>
+      alt.trim() ? `［图片：${alt.trim()}］` : '［图片］',
+    ),
   )
+}
+
+/** 音视频引用标记 → 全角占位（纯文本导出/朗读友好）：[[audio:uuid|标题]] → ［音频：标题］（无标题时 ［音频］）。 */
+export function mediaRefsToText(s: string): string {
+  return s.replace(/\[\[(audio|video):[a-f0-9-]+(?:\|([^\]]*))?\]\]/g, (_m: string, kind: string, title: string | undefined) => {
+    const name = kind === 'audio' ? '音频' : '视频'
+    const t = (title ?? '').trim()
+    return `［${t ? `${name}：${t}` : name}］`
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +127,8 @@ function escapeHtml(s: string): string {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
 }
+
+export { escapeHtml }
 
 /** 图片地址规范化：站内相对路径（/api/upload/…）补全为绝对地址，下载后的 HTML 里也能加载。 */
 function normalizeImgSrc(src: string): string {
@@ -134,6 +147,15 @@ function renderInline(escaped: string): string {
     codeSpans.push(`<code>${code}</code>`)
     return `\u0000C${codeSpans.length - 1}\u0000`
   })
+  // 1.5 音视频引用 [[audio:<uuid>|标题]] → 行内徽标（HTML 导出可读，不裸露语法）
+  out = out.replace(
+    /\[\[(audio|video):[a-f0-9-]+(?:\|([^\]]*))?\]\]/g,
+    (_m: string, kind: string, title: string | undefined) => {
+      const name = (title ?? '').trim() || (kind === 'audio' ? '音频' : '视频')
+      const icon = kind === 'audio' ? '🔊' : '🎬'
+      return `<span style="display:inline-block;padding:1px 10px 1px 8px;margin:0 2px;border:1px solid #e6e6e0;border-radius:999px;background:#fafaf6;font-size:0.92em;white-space:nowrap">${icon} ${name}</span>`
+    },
+  )
   // 2. 图片 ![alt](src)（必须先于链接，否则 ![..](..) 会被链接规则误吞）
   out = out.replace(
     /!\[([^\]]*)\]\(\s*([^)\s]+)\s*(?:&quot;[^&]*&quot;)?\s*\)/g,
@@ -162,8 +184,8 @@ function isTableSeparator(line: string): boolean {
   return /^[\s|:-]+$/.test(line) && line.includes('-') && line.includes('|')
 }
 
-/** 块级 Markdown 渲染（可递归，用于引用块）。 */
-function renderMarkdown(src: string): string {
+/** 块级 Markdown 渲染（可递归，用于引用块）。导出供试卷夹等模块复用。 */
+export function renderMarkdown(src: string): string {
   const lines = (src || '')
     .replace(/\r\n?/g, '\n')
     .replace(/\u0000/g, '')
@@ -466,12 +488,12 @@ export function exportCardHtml(card: ExportCard): string {
 }
 
 /**
- * 打印 / 导出 PDF：创建隐藏 iframe → 写入完整 HTML → 自动调起浏览器原生打印。
+ * 打印 / 导出 PDF 通用链路：创建隐藏 iframe → 写入完整 HTML → 自动调起浏览器原生打印。
  * 用户在打印窗口选择「另存为 PDF」即可得到 PDF；中文由系统字体渲染，零乱码。
+ * （html 需自带 autoPrint 脚本与 @media print 规则，参考 buildCardHtml / 试卷导出）
  */
-export function printCard(card: ExportCard): void {
+export function printHtmlDocument(html: string): void {
   if (typeof document === 'undefined') return
-  const html = buildCardHtml(card, { autoPrint: true })
 
   const iframe = document.createElement('iframe')
   iframe.setAttribute('aria-hidden', 'true')
@@ -505,6 +527,12 @@ export function printCard(card: ExportCard): void {
   setTimeout(cleanup, 10 * 60 * 1000)
 }
 
+/** 打印 / 导出 PDF（背诵卡）：buildCardHtml → 隐藏 iframe 打印链路。 */
+export function printCard(card: ExportCard): void {
+  if (typeof document === 'undefined') return
+  printHtmlDocument(buildCardHtml(card, { autoPrint: true }))
+}
+
 // ---------------------------------------------------------------------------
 // JSON 备份导出
 // ---------------------------------------------------------------------------
@@ -531,4 +559,120 @@ export function exportCardJson(card: ExportCard): string {
     new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }),
   )
   return filename
+}
+
+// ---------------------------------------------------------------------------
+// PNG 图片导出（html-to-image，离屏白底卡片）
+// ---------------------------------------------------------------------------
+
+/** exportCardPng 可选项 */
+export interface CardPngOptions {
+  /** 卡片渲染宽度（px，默认 720） */
+  width?: number
+  /** 像素倍率（默认 2，即 2x 高清图） */
+  pixelRatio?: number
+  /** 底色（默认纯白 #ffffff） */
+  background?: string
+}
+
+/** PNG 导出用卡片样式（选择器全部限定在 #bs-card-png 容器内，临时注入不污染页面）。 */
+const CARD_PNG_STYLES = `#bs-card-png { box-sizing: border-box; padding: 48px 40px 40px; color: #26262a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', sans-serif; font-size: 17px; line-height: 1.9; -webkit-font-smoothing: antialiased; }
+#bs-card-png * { box-sizing: border-box; }
+#bs-card-png .c-title { margin: 0 0 10px; font-size: 1.7em; line-height: 1.45; font-weight: 700; text-align: center; }
+#bs-card-png .c-meta { margin: 0 0 36px; text-align: center; font-size: 13px; color: #9a9aa0; }
+#bs-card-png .c-content h1, #bs-card-png .c-content h2, #bs-card-png .c-content h3, #bs-card-png .c-content h4, #bs-card-png .c-content h5, #bs-card-png .c-content h6 { margin: 1.4em 0 0.6em; line-height: 1.5; font-weight: 700; }
+#bs-card-png .c-content h1 { font-size: 1.4em; }
+#bs-card-png .c-content h2 { font-size: 1.25em; }
+#bs-card-png .c-content h3 { font-size: 1.12em; }
+#bs-card-png .c-content h4, #bs-card-png .c-content h5, #bs-card-png .c-content h6 { font-size: 1em; }
+#bs-card-png .c-content p { margin: 0 0 1.1em; }
+#bs-card-png img { max-width: 100%; height: auto; border-radius: 10px; margin: 6px 0; }
+#bs-card-png a { color: #0e9f6e; }
+#bs-card-png ul, #bs-card-png ol { margin: 0 0 1.1em; padding-left: 1.8em; }
+#bs-card-png li { margin: 0.35em 0; }
+#bs-card-png hr { border: 0; border-top: 1px solid #e6e6e0; margin: 2em auto; width: 55%; }
+#bs-card-png code { font-family: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'Courier New', monospace; background: #f2f2ee; border-radius: 5px; padding: 2px 6px; font-size: 0.86em; }
+#bs-card-png pre { background: #f6f6f2; border: 1px solid #e6e6e0; border-radius: 12px; padding: 14px 18px; overflow-x: hidden; line-height: 1.65; font-size: 0.86em; }
+#bs-card-png pre code { background: none; border: 0; padding: 0; font-size: 1em; }
+#bs-card-png blockquote { margin: 1.1em 0; padding: 2px 18px; border-left: 4px solid #d8d8d0; border-radius: 0 10px 10px 0; background: #fafaf6; color: #55555c; }
+#bs-card-png table { border-collapse: collapse; width: 100%; margin: 1.2em 0; font-size: 0.92em; }
+#bs-card-png th, #bs-card-png td { border: 1px solid #dcdcd4; padding: 8px 12px; text-align: left; vertical-align: top; }
+#bs-card-png th { background: #f2f2ec; font-weight: 600; }
+#bs-card-png .c-blocks { margin-top: 44px; }
+#bs-card-png .c-blocks > h2 { font-size: 1.22em; text-align: center; letter-spacing: 0.2em; margin: 0 0 26px; font-weight: 700; }
+#bs-card-png .qa { border: 1px solid #e6e6e0; border-radius: 14px; background: #fdfdfb; padding: 16px 20px; margin: 0 0 14px; }
+#bs-card-png .qa > h3 { margin: 0 0 10px; font-size: 1.02em; color: #0b7a5b; font-weight: 700; }
+#bs-card-png .qa .back p { margin: 0 0 0.85em; }
+#bs-card-png .c-footer { margin-top: 44px; padding-top: 16px; border-top: 1px solid #e6e6e0; text-align: center; color: #a0a0a6; font-size: 12.5px; }`
+
+/**
+ * 导出卡片为 PNG 图片：动态创建离屏 DOM（白底卡片：标题 + 字数/日期 + 正文 +
+ * 记忆素材 + 页脚；正文复用 renderMarkdown 的 HTML 输出），html-to-image toPng
+ * 以 pixelRatio（默认 2x）渲染后下载。仅浏览器环境可用。
+ *
+ * @param card  卡片（ExportCard 宽松子集，blocks 兼容数组或 JSON 字符串）
+ * @param opts  width 渲染宽度（默认 720）/ pixelRatio 倍率（默认 2）/ background 底色（默认白）
+ * @returns 实际下载的文件名（<安全化标题>.png）
+ */
+export async function exportCardPng(card: ExportCard, opts: CardPngOptions = {}): Promise<string> {
+  if (typeof document === 'undefined') throw new Error('exportCardPng 仅可在浏览器中调用')
+  const { toPng } = await import('html-to-image')
+  const width = Math.max(320, Math.round(opts.width ?? 720))
+  const pixelRatio = Math.max(1, opts.pixelRatio ?? 2)
+  const background = opts.background ?? '#ffffff'
+
+  const title = (card.title ?? '').trim() || '未命名背诵'
+  const content = (card.content ?? '').trim()
+  const blocks = normalizeBlocks(card).filter((b) => b.front.trim() || b.back.trim())
+  const charCount = (content + blocks.map((b) => `${b.front}${b.back}`).join('')).replace(/\s/g, '')
+    .length
+
+  // 离屏白底卡片（fixed 定位移出视口；图片等待解码后再截图）
+  const holder = document.createElement('div')
+  holder.setAttribute('aria-hidden', 'true')
+  holder.style.cssText = `position:fixed;left:-99999px;top:0;width:${width}px;background:${background};`
+  holder.innerHTML = `<style>${CARD_PNG_STYLES}</style>
+<div id="bs-card-png">
+  <h1 class="c-title">${escapeHtml(title)}</h1>
+  <p class="c-meta">共 ${charCount} 字 · ${fmtDate(card.updatedAt ?? card.createdAt)}</p>${content ? `\n  <div class="c-content">${renderMarkdown(content)}</div>` : ''}${blocks.length ? `\n  <section class="c-blocks">
+    <h2>记忆素材（${blocks.length} 条）</h2>${blocks
+      .map(
+        (b) => `
+    <div class="qa">${b.front.trim() ? `\n      <h3>${escapeHtml(b.front.trim())}</h3>` : ''}${b.back.trim() ? `\n      <div class="back">${renderMarkdown(b.back)}</div>` : ''}
+    </div>`,
+      )
+      .join('')}
+  </section>` : ''}
+  <p class="c-footer">导出自「背书吧」 · ${fmtDate()}</p>
+</div>`
+  document.body.appendChild(holder)
+  try {
+    const imgs = Array.from(holder.querySelectorAll('img'))
+    await Promise.all(
+      imgs.map((im) =>
+        im.complete
+          ? undefined
+          : new Promise<void>((r) => {
+              im.addEventListener('load', () => r(), { once: true })
+              im.addEventListener('error', () => r(), { once: true })
+            }),
+      ),
+    )
+    const dataUrl = await toPng(holder, {
+      pixelRatio,
+      backgroundColor: background,
+      // 卡片为系统字体栈（无 webfont），跳过字体内嵌加速导出
+      skipFonts: true,
+    })
+    const filename = `${safeFilename(card.title)}.png`
+    const a = document.createElement('a')
+    a.href = dataUrl
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    return filename
+  } finally {
+    holder.remove()
+  }
 }

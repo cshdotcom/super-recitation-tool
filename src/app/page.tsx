@@ -478,19 +478,40 @@ export default function Page() {
     [settings?.aiAutoCloze],
   )
 
-  /** 导入路径确认：AI 标记后带标记内容+分块进入编辑器 */
+  /** 导入路径确认：先（可选）AI 智能排版，再 AI 标记，带标记内容+分块进入编辑器 */
   const handleAiMarkConfirm = React.useCallback(
     async (options: AiMarkOptionsT) => {
       const payload = aiMarkPayload
       if (!payload) return
       setAiMarkLoading(true)
+      // 阶段 1（可选）：AI 智能排版 — 整理段落/标题层级/列表（原文逐字保留）；失败不中断，用原文继续
+      let workingContent = payload.content
+      if (options.format) {
+        const fid = toast.loading('AI 智能排版中…')
+        try {
+          const res = await fetch('/api/autoformat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: payload.content }),
+          })
+          const data = (await res.json().catch(() => ({}))) as { content?: string; error?: string }
+          if (!res.ok || !data.content) throw new Error(data.error || 'AI 排版失败')
+          workingContent = data.content
+          toast.success('AI 排版完成', { id: fid })
+        } catch (err) {
+          toast.error((err instanceof Error ? err.message : 'AI 排版失败') + '，将继续使用原文', {
+            id: fid,
+          })
+        }
+      }
+      // 阶段 2：AI 自动标记（标记 + 语义分块）
       const tid = toast.loading('AI 正在标记导入内容…')
       try {
         const res = await fetch('/api/automark', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            content: payload.content,
+            content: workingContent,
             title: payload.title,
             options,
           }),
@@ -526,12 +547,12 @@ export default function Page() {
           (err instanceof Error ? err.message : 'AI 标记失败') + '；已改为直接导入',
           { id: tid },
         )
-        // 失败回退：不标记直接进编辑器
+        // 失败回退：不标记直接进编辑器（排版成功时保留排版结果）
         setAiMarkOpen(false)
         setImportOpen(false)
         setEditorMode('create')
         setEditorTitle(payload.title || '')
-        setEditorDraft({ title: payload.title || '', content: payload.content, blocks: [] })
+        setEditorDraft({ title: payload.title || '', content: workingContent, blocks: [] })
         setView('material-editor')
       } finally {
         setAiMarkLoading(false)
@@ -1259,6 +1280,7 @@ export default function Page() {
           }
         }}
         defaultOptions={aiMarkDefaults}
+        defaultFormat={settings?.aiAutoFormat ?? false}
         loading={aiMarkLoading}
         context="import"
         contentPreview={aiMarkPayload?.content ?? aiMarkCard?.content ?? undefined}

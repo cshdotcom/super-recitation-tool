@@ -18,6 +18,8 @@ import {
   Crosshair,
   Copy,
   Crop,
+  FileAudio,
+  FileVideo,
   Maximize2,
   Network,
   PencilRuler,
@@ -31,8 +33,8 @@ import { cn } from '@/lib/utils'
 import {
   MEDIA_KIND_LABEL,
   extractMediaRefs,
-  type MediaKind,
   type MediaRef,
+  type MediaRefKind,
 } from '@/components/recitation/media-refs'
 
 export type MediaAction =
@@ -46,13 +48,15 @@ export type MediaAction =
   | 'zoomIn'
   | 'zoomOut'
 
-const KIND_ICON: Record<MediaKind, React.ComponentType<{ className?: string; strokeWidth?: number }>> = {
+const KIND_ICON: Record<MediaRefKind, React.ComponentType<{ className?: string; strokeWidth?: number }>> = {
   image: Plus,
   table: Table2,
   mermaid: Network,
   svg: PencilRuler,
   code: Code2,
   formula: Braces,
+  audio: FileAudio,
+  video: FileVideo,
 }
 
 const THUMB_SIZES = ['h-16 w-16', 'h-24 w-24', 'h-32 w-32'] as const
