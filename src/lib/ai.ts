@@ -350,7 +350,7 @@ export function extractQuestionObjects(raw: string): unknown[] {
 
 // ---------- 富媒体代码生成（/api/media-ai：编辑器 AI 助理 / AI 修复） ----------
 
-export type MediaCodegenKind = 'mermaid' | 'svg' | 'table' | 'formula' | 'code'
+export type MediaCodegenKind = 'mermaid' | 'svg' | 'html' | 'table' | 'formula' | 'code'
 
 export interface MediaCodegenHistoryItem {
   role: 'user' | 'assistant'
@@ -364,11 +364,17 @@ export interface MediaCodegenParams {
   instruction: string
   /** 最近对话（用户指令 + AI 代码），最多 20 条 */
   history?: MediaCodegenHistoryItem[]
+  /** 可选附图（data:image/ URI，最多 2 张）— 走视觉模型，AI 可「看图生成代码」
+   *  （如根据手绘草图生成 SVG / mermaid） */
+  images?: string[]
+  /** 可选采样温度（0~1.5）；不传时不发送，走服务端默认 */
+  temperature?: number
 }
 
 const MEDIA_KIND_DESC: Record<MediaCodegenKind, string> = {
   mermaid: 'mermaid 图表源码（mindmap 思维导图 或 graph/flowchart 流程图/树状图）',
   svg: 'SVG 图形源码（单个 <svg>…</svg>，禁止 <script> 与 on* 事件）',
+  html: '自包含 HTML 片段（单根元素、内联样式、不依赖外部资源，禁止 <script>）',
   table: 'markdown 表格源码（| 表头 | … |，含 |---| 分隔行）',
   formula: 'LaTeX 公式源码（不含 $$ / $ 定界符，可用 \\ce{} 化学式）',
   code: '纯代码内容（不带 markdown 围栏）',
@@ -390,6 +396,20 @@ export function stripCodeFence(text: string): string {
   // 4) 散落的首尾围栏行
   t = t.replace(/^```[A-Za-z0-9_-]*[ \t]*\r?\n?/, '').replace(/\r?\n?```[ \t]*$/, '')
   return t.trim() !== '' ? t : (text || '').trim()
+}
+
+/** media-ai 附图上限（张）与单张 base64 长度上限（字符）。 */
+const MEDIA_AI_MAX_IMAGES = 2
+const MEDIA_AI_MAX_IMAGE_LEN = 2 * 1024 * 1024
+
+/** HTML 生成结果的服务端加固：去 <script> / on* 事件 / javascript: 链接
+ *  （与 rich-content 沙盒 sanitizeEmbeddedHtml 同一规则，双保险）。 */
+function sanitizeHtmlCode(code: string): string {
+  return code
+    .replace(/<script[\s\S]*?<\/script\s*>/gi, '')
+    .replace(/<script\b[^>]*>/gi, '')
+    .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/((?:xlink:)?href\s*=\s*)(?:"\s*javascript:[^"]*"|'\s*javascript:[^']*')/gi, '$1"#"')
 }
 
 /**
@@ -415,6 +435,20 @@ export async function mediaCodegen(
     .slice(-20)
     .map((m) => ({ role: m.role, content: m.content.slice(0, 12000) }))
   const isEdit = currentCode !== ''
+  // 附图（视觉模型链路）：仅保留合法 data:image/ 前缀，限 2 张、单张 ≤2MB
+  const images = (params.images || [])
+    .filter(
+      (img): img is string =>
+        typeof img === 'string' &&
+        img.startsWith('data:image/') &&
+        img.length <= MEDIA_AI_MAX_IMAGE_LEN,
+    )
+    .slice(0, MEDIA_AI_MAX_IMAGES)
+  // 温度：有限数才下发（normalizeSampling 内部会裁剪到 0~2）
+  const options =
+    typeof params.temperature === 'number' && Number.isFinite(params.temperature)
+      ? { temperature: params.temperature }
+      : undefined
 
   const sys = `你是背诵学习应用的富媒体代码助手，当前任务类型：${MEDIA_KIND_DESC[kind]}。
 要求：
@@ -422,6 +456,10 @@ export async function mediaCodegen(
     isEdit
       ? '用户给出了现有代码：在保留其主体结构与内容的前提下，按用户指令做最小必要修改，不要大幅重写。'
       : '用户没有现成代码：按用户指令从零生成完整代码。'
+  }${
+    images.length > 0
+      ? '\n- 用户消息附带了图片（可能是手绘草图、示意图、截图等）：请仔细观察图中的文字、图形与结构，把图的内容忠实地转成代码。'
+      : ''
   }
 - 只返回最终的完整代码本身：不要任何解释、说明、前后缀文字，不要用代码围栏（\`\`\`）包裹。${
     kind === 'mermaid'
@@ -430,6 +468,10 @@ export async function mediaCodegen(
   }${
     kind === 'svg'
       ? '\n- 输出单个完整 <svg xmlns="http://www.w3.org/2000/svg" viewBox="…" …>…</svg>，图形布局清晰、大小适中（viewBox 约 600x400）。'
+      : ''
+  }${
+    kind === 'html'
+      ? '\n- 输出自包含的 HTML 片段（或完整小页面）：最外层只用一个根元素包裹全部内容；全部样式用内联 style 属性，不依赖任何外部 CSS/JS/图片资源；内容宽度必须适配移动端（确保在 600px 宽容器内不溢出，元素 max-width:100%）；严禁 <script>、on* 事件属性与 javascript: 链接。'
       : ''
   }${
     kind === 'table'
@@ -452,9 +494,13 @@ export async function mediaCodegen(
     [
       { role: 'system', content: sys },
       ...history,
-      { role: 'user', content: userMsg },
+      // 附图挂在用户消息上（chatComplete 检测到 images 自动升级视觉模型请求）
+      images.length > 0
+        ? { role: 'user' as const, content: userMsg, images }
+        : { role: 'user' as const, content: userMsg },
     ],
     config,
+    options,
   )
 
   let code = stripCodeFence(reply || '')
@@ -468,13 +514,18 @@ export async function mediaCodegen(
     const m = code.match(/<svg[\s\S]*<\/svg\s*>/i)
     if (m) code = m[0]
   }
+  if (kind === 'html') {
+    // 服务端加固：剥离 script / on* / javascript:（沙盒渲染侧还有一道同样规则）
+    code = sanitizeHtmlCode(code)
+  }
   return code
 }
 
 // ---------- AI 智能排版（/api/autoformat：导入内容段落/标题/列表整理） ----------
 
-/** AI 智能排版单次输入上限（超长截断，保留前 8000 字） */
-const AUTO_FORMAT_MAX_CHARS = 8000
+/** AI 智能排版单次输入上限（超长截断，保留前 8000 字）。
+ *  导出供 /api/autoformat 做同口径的原文保真对比（原文与结果须同长度口径）。 */
+export const AUTO_FORMAT_MAX_CHARS = 8000
 
 /**
  * AI 智能排版：把混乱的导入文本（拍照识别 / 复制粘贴 / 文件解析得到的）
@@ -482,11 +533,15 @@ const AUTO_FORMAT_MAX_CHARS = 8000
  * 最高规则是原文逐字保留，只允许添加 Markdown 结构符号与换行。
  * 直接返回整理后的文本（trim 后）；失败时 throw。
  * 超时控制由调用方（route）用 Promise.race 实现。
+ *
+ * @param opts.strict 首次结果未通过保真校验时的重试模式：提示词附加更严格
+ *   的「逐字保留」硬约束（禁止增删改任何原文字符 / 禁止翻译总结 / 禁止纠错）。
  */
 export async function autoFormatText(
   content: string,
   instruction?: string,
   config?: AIConfig,
+  opts?: { strict?: boolean },
 ): Promise<string> {
   const text = (content || '').slice(0, AUTO_FORMAT_MAX_CHARS)
   const extra = (instruction || '').trim().slice(0, 1000)
@@ -496,10 +551,16 @@ export async function autoFormatText(
     '1. 识别主题句/小节主旨，转换为 # / ## / ### 标题，形成清晰的标题层级（全文主旨用一个 #，其下逐级使用 ## / ###）。',
     '2. 并列的内容整理为 - 无序列表（一项一行）；原文自带序号（如「一、」「1.」「①」）时，序号文字按原样保留在条目里，不要再叠加 - 等多余的项目符号，避免出现「- 1. …」这类冗余双重符号。',
     '3. 合理分段：一段只讲一件事，段落之间用空行分隔。',
-    '4. 最高规则：逐字保留原文每一个字符，绝不改写、删减、增加、翻译任何内容文字；只允许添加 Markdown 结构符号（#、-）、换行与空行。',
+    '4. 最高规则：逐字保留原文每一个字符。绝对禁止增、删、改原文的任何字符；绝对禁止翻译、总结、缩写、扩写、同义替换；绝对禁止纠正错别字与标点；只允许添加 Markdown 结构符号（#、-）、换行与空行。',
     '5. 原文已有的 Markdown 语法（表格、公式、图片、围栏代码块）必须原样保留，不要嵌套破坏，也不要重新包裹。',
     '6. 输出中的富媒体引用（如 ![图片](url)、[[audio:...]]）必须保持完整一行，绝不拆断、绝不改动其中的链接与语法。',
+    '7. 输出前自检：把你的输出与原文逐字对照一遍，确认没有遗漏段落、没有改动任何内容字符、没有新增任何原文没有的内容文字；发现差异必须修正后再输出。',
     '只输出整理后的全文本身：不要任何解释、前后缀文字，不要用代码围栏（```）包裹。',
+    ...(opts?.strict
+      ? [
+          '【重要：上一次输出未通过原文保真校验】你上一次的输出改动/丢失/新增了原文的内容字符，这是绝对禁止的。这次必须：把原文当作只读数据，除了添加 #、-、换行、空行这四类纯排版符号之外，原文的每一个字符（含错别字、标点、数字、英文、空格）都必须原样出现在输出中，且不得新增任何原文没有的文字。逐段复制原文再插入排版符号，是唯一正确的做法。',
+        ]
+      : []),
   ].join('\n')
 
   const userMsg = extra

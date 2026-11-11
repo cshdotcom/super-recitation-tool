@@ -6,6 +6,7 @@
 //             cardId?, cardTitle?, conversationId? }
 // 即可在底部弹出「🔍 追问」弹层：
 //   • 选中文本预览（≤3行截断）+ 来源标签
+//   • 一键追问模板（解释内容 / 举例说明 / 和原文对比 / 如何背诵 / 自定义问题）
 //   • 追问输入框 + 语音输入（VoiceInput）+ 附图（≤2张，canvas 压缩 ≤800px）
 //   • 「自我思考」开关（默认读 GET /api/settings 的 aiSelfThinking，本地覆盖本次）
 // 提交分支：
@@ -74,6 +75,14 @@ const MAX_IMAGES = 2
 const MAX_IMAGE_DIM = 800
 /** 小于该体积（字节）的图片直接保留原 dataURL。 */
 const COMPRESS_OVER = 120 * 1024
+
+/** 一键追问模板：点击即发送（引用上下文自动附带，见 submit）。 */
+const FOLLOWUP_TEMPLATES: { key: string; emoji: string; label: string; question: string }[] = [
+  { key: 'explain', emoji: '💡', label: '解释内容', question: '请解释这段内容的含义，讲清关键词与背景。' },
+  { key: 'example', emoji: '🧩', label: '举例说明', question: '请举例说明这段内容，举 2~3 个典型例子。' },
+  { key: 'compare', emoji: '📖', label: '和原文对比', question: '请把这段内容与课文原文逐句对比，指出异同与出入。' },
+  { key: 'memorize', emoji: '🧠', label: '如何背诵', question: '如何背诵这段内容？请给出背诵方法、口诀或记忆线索。' },
+]
 
 interface FollowupPopoverProps {
   /**
@@ -248,10 +257,15 @@ export function FollowupPopover({ getActiveConversationId }: FollowupPopoverProp
     setImages((prev) => prev.filter((p) => p.id !== id))
   }
 
-  const submit = async () => {
+  /**
+   * 提交追问：@param overrideQuestion 模板按钮直接传入固定问题（不经过输入框）。
+   * 消息内容统一包裹引用上下文「关于「选中文本」：问题」，对话模式下 AI
+   * 携带最近对话历史，天然具备上下文。
+   */
+  const submit = async (overrideQuestion?: string) => {
     if (!detail || submitting) return
     const selected = detail.text.trim()
-    const q = question.trim()
+    const q = (overrideQuestion ?? question).trim()
     if (!selected || !q) return
     setSubmitting(true)
     const imgs = images.map((p) => p.dataUrl)
@@ -402,6 +416,31 @@ export function FollowupPopover({ getActiveConversationId }: FollowupPopoverProp
                   className="overflow-x-auto text-[13px] leading-relaxed text-foreground/85"
                 />
               </React.Suspense>
+            </div>
+
+            {/* 一键追问模板（点击即发送；自定义问题 → 聚焦输入框） */}
+            <div className="mt-2.5 flex gap-1.5 overflow-x-auto pb-0.5 [scrollbar-width:thin] [&::-webkit-scrollbar]:h-1 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border">
+              {FOLLOWUP_TEMPLATES.map((t) => (
+                <button
+                  key={t.key}
+                  type="button"
+                  disabled={submitting}
+                  onClick={() => void submit(t.question)}
+                  className="flex h-9 shrink-0 items-center gap-1 rounded-full border border-border bg-muted/40 px-3 text-xs font-medium transition-colors hover:border-emerald-500/50 hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-50"
+                >
+                  <span aria-hidden>{t.emoji}</span>
+                  {t.label}
+                </button>
+              ))}
+              <button
+                type="button"
+                disabled={submitting}
+                onClick={() => inputRef.current?.focus()}
+                className="flex h-9 shrink-0 items-center gap-1 rounded-full border border-dashed border-emerald-500/50 px-3 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-50 dark:text-emerald-300"
+              >
+                <span aria-hidden>✏️</span>
+                自定义问题
+              </button>
             </div>
 
             {/* 附图预览 */}

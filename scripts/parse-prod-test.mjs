@@ -181,3 +181,102 @@ await parseOne('t.srt', readFileSync(`${FILE_DIR}/t.srt`), 'application/x-subrip
 }
 
 console.log('\n✅ 全部生产解析测试通过')
+
+// ================= v2.6.0 新链路生产验证（无 AI 依赖，纯 DB/API）=================
+
+// 10. /api/version 版本探针
+{
+  const res = await fetch(`${BASE}/api/version`)
+  const body = await res.json()
+  console.log(`--- /api/version: HTTP ${res.status}`, JSON.stringify(body))
+  assert.equal(res.status, 200)
+  assert.ok(typeof body.version === 'string' && body.version.length > 0, 'version 字段缺失')
+}
+
+// 11. 卡片 → 试卷 → 试卷分享 → 公开读取分享（v2.6.0 试卷分享链路）
+{
+  // 建卡
+  const cardRes = await fetch(`${BASE}/api/cards`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify({ title: '生产测试卡', content: '春望杜甫国破山河在，城春草木深。感时花溅泪，恨别鸟惊心。' }),
+  })
+  const cardBody = await cardRes.json()
+  console.log(`--- POST /api/cards: HTTP ${cardRes.status}`)
+  assert.ok([200, 201].includes(cardRes.status), `建卡失败: ${JSON.stringify(cardBody).slice(0, 200)}`)
+  const cardId = cardBody.card?.id
+  assert.ok(cardId, 'cardId 缺失')
+
+  // 建卷
+  const paperRes = await fetch(`${BASE}/api/papers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify({
+      cardId,
+      title: '生产测试卷',
+      items: [
+        { type: 'choice', stem: '国破___在？', options: ['山河', '江湖'], answer: 'A', explanation: '出自原文' },
+        { type: 'fill', stem: '感时花___泪', answer: '溅' },
+      ],
+    }),
+  })
+  const paperBody = await paperRes.json()
+  console.log(`--- POST /api/papers: HTTP ${paperRes.status}`)
+  assert.ok([200, 201].includes(paperRes.status), `建卷失败: ${JSON.stringify(paperBody).slice(0, 200)}`)
+  const paperId = paperBody.paper?.id
+  assert.ok(paperId, 'paperId 缺失')
+
+  // 分享试卷
+  const shareRes = await fetch(`${BASE}/api/shares`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify({ action: 'create', kind: 'paper', paperId, days: 7 }),
+  })
+  const shareBody = await shareRes.json()
+  console.log(`--- POST /api/shares (paper): HTTP ${shareRes.status}`)
+  assert.ok([200, 201].includes(shareRes.status), `试卷分享失败: ${JSON.stringify(shareBody).slice(0, 300)}`)
+  const token = shareBody.share?.token
+  assert.ok(token, 'share token 缺失')
+
+  // 公开读取分享（无需登录）
+  const pubRes = await fetch(`${BASE}/api/share/${token}`)
+  const pubBody = await pubRes.json()
+  console.log(`--- GET /api/share/<token>: HTTP ${pubRes.status}`)
+  assert.equal(pubRes.status, 200, `公开读取分享失败: ${JSON.stringify(pubBody).slice(0, 300)}`)
+  assert.ok(pubBody.paper && Array.isArray(pubBody.paper.items) && pubBody.paper.items.length === 2, '分享页试卷数据不完整')
+  console.log('    试卷分享链路 ✓（建卡→建卷→分享→公开读取，2 题）')
+
+  // 分享列表包含试卷
+  const listRes = await fetch(`${BASE}/api/shares`, { headers: { Cookie: cookie } })
+  const listBody = await listRes.json()
+  const paperShares = (listBody.shares || []).filter((s) => s.kind === 'paper')
+  console.log(`--- GET /api/shares: HTTP ${listRes.status}（试卷分享 ${paperShares.length} 条）`)
+  assert.ok(paperShares.length >= 1, '分享列表未包含试卷类型')
+
+  // 清理：删除分享与试卷快照（DELETE ids）
+  const delRes = await fetch(`${BASE}/api/shares?ids=${shareBody.share.id}`, {
+    method: 'DELETE',
+    headers: { Cookie: cookie },
+  })
+  console.log(`--- DELETE /api/shares: HTTP ${delRes.status}`)
+}
+
+// 12. /api/autoformat 路由存在性（CI 无 AI 凭据，允许 中文错误 的 422/500，不允许 404/挂死）
+{
+  const res = await fetch(`${BASE}/api/autoformat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Cookie: cookie },
+    body: JSON.stringify({ content: '测试排版内容一二三四五六七八九十' }),
+  })
+  const text = await res.text()
+  console.log(`--- /api/autoformat: HTTP ${res.status}`, text.slice(0, 120))
+  assert.ok([200, 422, 500].includes(res.status), `autoformat 路由异常: ${res.status}`)
+  let ok = false
+  try {
+    const b = JSON.parse(text)
+    ok = typeof b.content === 'string' || typeof b.error === 'string'
+  } catch { /* ignore */ }
+  assert.ok(ok, 'autoformat 响应必须是 JSON（content 或中文 error）')
+}
+
+console.log('\n✅ v2.6.0 新链路生产测试全部通过（版本探针/试卷分享/autoformat）')

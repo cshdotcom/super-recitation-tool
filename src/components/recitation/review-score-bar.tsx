@@ -3,12 +3,14 @@
 import * as React from 'react'
 
 import type { ReviewAction } from '@/lib/types'
-import { REVIEW_ACTIONS } from '@/lib/types'
+import { SCHEME_SCORE_ACTIONS, type ReviewScheme } from '@/lib/card'
 import { cn } from '@/lib/utils'
 
 interface ReviewScoreBarProps {
   onScore: (action: ReviewAction) => void
   disabled?: boolean
+  /** 复习方案（评分档位与之匹配）：sm2=熟悉/模糊/忘记（默认） fixed=记得/模糊/忘记 simple=会/不会 */
+  scheme?: ReviewScheme
 }
 
 const ACTION_BG: Record<ReviewAction, string> = {
@@ -17,8 +19,10 @@ const ACTION_BG: Record<ReviewAction, string> = {
   forget: 'bg-[#ef4444]',
 }
 
-// 背诵页底部评分条：熟悉(蓝紫) / 模糊(橙) / 忘记(红)，点击后短暂显示选中态。
-export function ReviewScoreBar({ onScore, disabled }: ReviewScoreBarProps) {
+// 背诵页/复习会话底部评分条：档位随复习方案变化
+// （SM-2 艾宾浩斯=熟悉/模糊/忘记；固定间隔=记得/模糊/忘记；简单模式=会/不会），
+// 点击后短暂显示选中态。
+export function ReviewScoreBar({ onScore, disabled, scheme = 'sm2' }: ReviewScoreBarProps) {
   const [picked, setPicked] = React.useState<ReviewAction | null>(null)
   const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
 
@@ -37,7 +41,7 @@ export function ReviewScoreBar({ onScore, disabled }: ReviewScoreBarProps) {
 
   return (
     <div className="flex gap-3">
-      {REVIEW_ACTIONS.map((a) => (
+      {SCHEME_SCORE_ACTIONS[scheme].map((a) => (
         <button
           key={a.value}
           type="button"

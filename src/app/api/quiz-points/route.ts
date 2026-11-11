@@ -2,10 +2,12 @@
 // POST /api/quiz-points  { content, images?: string[] }
 //   -> { points: [{ text, importance: 'core' | 'secondary' }] }
 //
-// 图片出题：images 为 `data:image/` URI（最多 3 张，单张 base64 ≤ 400KB）。
+// 图片出题：images 为 `data:image/` URI（最多 5 张，单张 base64 ≤ 400KB）。
 // 有图片时走视觉链路（chatComplete 在消息携带 images 时自动升级为
 // createVision / OpenAI 多模态，见 src/lib/ai.ts）：先 OCR 识别图中文字，
 // 与用户提供的文字合并后再提炼知识点；content 为空时以 OCR 文本作为课文。
+// content 里的 `![alt](url)` 图片引用会替换为 `[图片: alt]` 文字提示
+//（URL 对模型无意义，实际图片已随 images 走视觉链路）。
 import { NextRequest, NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { chatComplete, extractJSON } from '@/lib/ai'
@@ -14,9 +16,17 @@ import type { ChatMessage } from '@/lib/types'
 
 const MAX_CONTENT = 6000
 const MAX_POINTS = 12
-const MAX_IMAGES = 3
+const MAX_IMAGES = 5
 // Base64 字符上限（≈300KB 二进制）— 客户端压缩输出不超过该值。
 const MAX_IMAGE_B64_LENGTH = 400 * 1024
+
+/** 把 content 里的图片引用 `![alt](url)` 替换为 `[图片: alt]`：alt 并入文字上下文，URL 剥离。 */
+function imageRefsToTextHints(content: string): string {
+  return content.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m: string, alt: string) => {
+    const label = String(alt ?? '').trim()
+    return label ? `[图片: ${label}]` : '[图片]'
+  })
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -70,7 +80,7 @@ export async function POST(req: NextRequest) {
     }提炼 6 到 12 个适合用来出题的知识点。每个知识点用一句简洁的话概括（25 字以内）。重要程度标注规则：importance="core" 表示核心考点（中心思想、必背字词、关键句意等必须掌握的内容）；importance="secondary" 表示次要知识点（背景、细节、扩展信息）。角度尽量覆盖全面：字词、句意、段落大意、主旨、修辞、文学常识等。只返回严格 JSON，格式：{"points":[{"text":"知识点描述","importance":"core"}]}，不要任何解释。`
 
     const user = content.trim()
-      ? `课文：\n${content.slice(0, MAX_CONTENT)}`
+      ? `课文：\n${imageRefsToTextHints(content).slice(0, MAX_CONTENT)}`
       : '（用户未提供文字，请先识别图片中的文字作为课文内容，再据此提炼知识点。）'
 
     // images 挂在 user 消息上 — chatComplete 自动升级为视觉请求。

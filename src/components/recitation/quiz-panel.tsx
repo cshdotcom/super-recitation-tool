@@ -92,10 +92,64 @@ const MULTI_SEP = '\u0001'
 const MAX_POINT_IMAGES = 3
 /** 服务端 /api/quiz-points 单图 base64 上限（与路由一致）。 */
 const IMAGE_B64_LIMIT = 400 * 1024
+/** /api/quiz-points 的 images 参数上限（服务端 MAX_IMAGES，与路由一致）。 */
+const MAX_QUIZ_IMAGES = 5
+/** 自动提取卡内容课文图片的上限（补充在手动上传之后）。 */
+const MAX_AUTO_IMAGES = 3
 
 interface QuizImageItem {
   id: string
   dataUrl: string
+}
+
+/** 加载图片元素（dataURL / 任意同源 url）。 */
+function loadImageEl(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = () => reject(new Error('图片解析失败，请换一张试试'))
+    img.src = src
+  })
+}
+
+/** 多档尺寸逐级缩小 + 逐级降质，压缩到 ≤400KB base64（手动上传 / 自动带图共用）。 */
+function compressImageElToLimit(img: HTMLImageElement): Promise<string> {
+  return new Promise((resolve, reject) => {
+    try {
+      const scales = [1024, 768, 512, 384]
+      for (const maxSide of scales) {
+        let w = img.width
+        let h = img.height
+        if (w > maxSide || h > maxSide) {
+          const scale = Math.min(maxSide / w, maxSide / h)
+          w = Math.round(w * scale)
+          h = Math.round(h * scale)
+        }
+        const canvas = document.createElement('canvas')
+        canvas.width = w
+        canvas.height = h
+        const ctx = canvas.getContext('2d')
+        if (!ctx) {
+          reject(new Error('无法处理图片，请换一张试试'))
+          return
+        }
+        ctx.drawImage(img, 0, 0, w, h)
+        let quality = 0.85
+        let out = canvas.toDataURL('image/jpeg', quality)
+        while (out.length > IMAGE_B64_LIMIT && quality > 0.4) {
+          quality -= 0.15
+          out = canvas.toDataURL('image/jpeg', quality)
+        }
+        if (out.length <= IMAGE_B64_LIMIT) {
+          resolve(out)
+          return
+        }
+      }
+      reject(new Error('图片过大压缩后仍超限，请裁剪或换一张更小的图片'))
+    } catch {
+      reject(new Error('图片压缩失败，请换一张试试'))
+    }
+  })
 }
 
 /** 读取图片文件并压缩为 ≤1024px 的 JPEG dataURL（canvas 压缩，同 chat-tool 模式）。 */
@@ -104,49 +158,51 @@ function compressQuizImage(file: File): Promise<string> {
     const reader = new FileReader()
     reader.onerror = () => reject(new Error('图片读取失败，请换一张试试'))
     reader.onload = () => {
-      const img = new Image()
-      img.onerror = () => reject(new Error('图片解析失败，请换一张试试'))
-      img.onload = () => {
-        try {
-          // 多档尺寸逐级缩小 + 逐级降质，确保最终不超过服务端 400KB base64 限制
-          const scales = [1024, 768, 512, 384]
-          for (const maxSide of scales) {
-            let w = img.width
-            let h = img.height
-            if (w > maxSide || h > maxSide) {
-              const scale = Math.min(maxSide / w, maxSide / h)
-              w = Math.round(w * scale)
-              h = Math.round(h * scale)
-            }
-            const canvas = document.createElement('canvas')
-            canvas.width = w
-            canvas.height = h
-            const ctx = canvas.getContext('2d')
-            if (!ctx) {
-              reject(new Error('无法处理图片，请换一张试试'))
-              return
-            }
-            ctx.drawImage(img, 0, 0, w, h)
-            let quality = 0.85
-            let out = canvas.toDataURL('image/jpeg', quality)
-            while (out.length > IMAGE_B64_LIMIT && quality > 0.4) {
-              quality -= 0.15
-              out = canvas.toDataURL('image/jpeg', quality)
-            }
-            if (out.length <= IMAGE_B64_LIMIT) {
-              resolve(out)
-              return
-            }
-          }
-          reject(new Error('图片过大压缩后仍超限，请裁剪或换一张更小的图片'))
-        } catch {
-          reject(new Error('图片压缩失败，请换一张试试'))
-        }
-      }
-      img.src = reader.result as string
+      loadImageEl(String(reader.result))
+        .then((img) => compressImageElToLimit(img))
+        .catch((err) => reject(err instanceof Error ? err : new Error('图片压缩失败，请换一张试试')))
     }
     reader.readAsDataURL(file)
   })
+}
+
+/** 从卡内容中提取图片引用（![alt](url)，去重；仅本站 / 相对 / http(s) 地址，跳过 data: 内联）。
+ *  用于 AI 出题时自动把课文图片放入视觉上下文。 */
+function extractCardImageUrls(content: string, limit: number): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  const re = /!\[([^\]]*)\]\(([^)\s]+)\)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(content)) !== null) {
+    const url = m[2]
+    if (!url || url.startsWith('data:')) continue
+    if (!(url.startsWith('/') || url.startsWith('http://') || url.startsWith('https://'))) continue
+    if (seen.has(url)) continue
+    seen.add(url)
+    out.push(url)
+    if (out.length >= limit) break
+  }
+  return out
+}
+
+/** fetch 站内图片 URL → 压缩 dataURI；失败返回 null（自动带图链路静默跳过，不阻塞出题）。 */
+async function urlToQuizImage(url: string): Promise<string | null> {
+  try {
+    const res = await fetch(url)
+    if (!res.ok) return null
+    const blob = await res.blob()
+    if (!blob.type.startsWith('image/')) return null
+    const dataUrl = await new Promise<string>((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(String(r.result))
+      r.onerror = () => reject(new Error('read fail'))
+      r.readAsDataURL(blob)
+    })
+    const img = await loadImageEl(dataUrl)
+    return await compressImageElToLimit(img)
+  } catch {
+    return null
+  }
 }
 
 /** 把 /api/quiz、/api/quiz-points 的报错转成可读中文
@@ -699,20 +755,32 @@ export function QuizPanel({
   )
 
   // ---- Step1：AI 提炼知识点（可附带课文图片，服务端先 OCR 再提炼） ----
+  // 出题时自动把卡内容里的课文图片（![alt](/api/upload/…)）转成 dataURI 随
+  // images 参数发出（≤MAX_AUTO_IMAGES 张，失败静默跳过）；与手动上传的图片合并后
+  // 不超过服务端 MAX_IMAGES（5 张）。
   const fetchPoints = React.useCallback(async () => {
     if (!content.trim() && pointImages.length === 0) return
     setPointsLoading(true)
     setPointsError(null)
     startStages(POINT_STAGES.length)
     try {
+      const images: string[] = [...pointImages.map((i) => i.dataUrl)]
+      const room = Math.max(0, Math.min(MAX_AUTO_IMAGES, MAX_QUIZ_IMAGES - images.length))
+      if (room > 0 && content.trim()) {
+        const urls = extractCardImageUrls(content, room)
+        if (urls.length > 0) {
+          const settled = await Promise.allSettled(urls.map((u) => urlToQuizImage(u)))
+          for (const s of settled) {
+            if (s.status === 'fulfilled' && s.value) images.push(s.value)
+          }
+        }
+      }
       const res = await fetch('/api/quiz-points', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           content,
-          ...(pointImages.length > 0
-            ? { images: pointImages.map((i) => i.dataUrl) }
-            : {}),
+          ...(images.length > 0 ? { images } : {}),
         }),
       })
       if (!res.ok) {

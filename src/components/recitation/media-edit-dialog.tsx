@@ -7,14 +7,17 @@
 //   mermaid graph/flowchart → 画布式流程图编辑器（SVG 拖拽 / 锚点连线 / 缩放平移 /
 //     subgraph 分组 + 列表模式，两模式共享同一 FlowDoc 与撤销栈）
 //   svg → SVG 可视化编辑器（形状面板 / 画布拖拽 / 属性栏，复杂元素源码保留）
+//   html → HTML 可视化编辑器（元素结构树 + 属性面板 + 快速插入模板 +
+//     Shadow DOM 沙盒实时预览 + 源码校验/格式化）
 //   其他 code → 实时预览 + 源码编辑
 // 容错（apply 前校验 + 部分加载 + AI 修复）：
 //   • mermaid：mermaid.parse 校验；失败时按错误行号逐行剥离出「净化版」预览，
 //     顶部黄色横幅提示「第 X 行有误已忽略」，可 AI 修复 / 仍用原文
-//   • svg：DOMParser parsererror 校验；formula：katex renderToString 校验
+//   • svg：DOMParser parsererror 校验；html：DOMParser + 标签配对自检；
+//     formula：katex renderToString 校验
 //   • AI 修复：调 /api/media-ai 返回修复代码先预览 → 接纳 / 撤销
-// AI 助理：右下角临时悬浮对话（AiAssistPopover），生成代码一键写入编辑器，
-//   写入后自动切回可视化继续编辑。
+// AI 助理：右下角临时悬浮对话（AiAssistPopover，支持语音输入/看图生成/技能模板），
+//   生成代码一键写入编辑器，写入后自动切回可视化继续编辑。
 // 应用后 onApply(newSrc) 由宿主替换块文本中的原文（可撤销）。
 
 import * as React from 'react'
@@ -30,6 +33,7 @@ import {
   ChevronDown,
   ChevronRight,
   Code2,
+  Copy,
   Eye,
   Hand,
   Loader2,
@@ -42,6 +46,7 @@ import {
   Redo2,
   Sparkles,
   Trash2,
+  Type,
   Undo2,
   Wand2,
   ZoomIn,
@@ -2641,6 +2646,847 @@ function FlowGraphEditor({
   )
 }
 
+// ---------- HTML 可视化编辑器（```html 围栏：结构树 + 属性面板 + 沙盒预览） ----------
+//
+// 数据流：源码 → DOMParser 宽容解析为可序列化的 HtmlTreeNode 树（script /
+// on* / js: 在解析侧即剔除）→ 元素树 / 属性面板 / 快速插入的可视化操作
+// 不可变更新 → serializeHtmlTree 写回宿主 src → 既有校验容错链
+// （validateHtmlSrc 黄条 + AI 修复 + 仍用原文）照常工作。
+// 自己 emit 的源码跳过回环解析（防打断输入焦点）；外部变化（源码 tab 手改 /
+// AI 写入 / 重新打开引用）自动重解析。序列化输出保证：无 script、无 on*、
+// 无 js: 链接（防溢出由渲染端沙盒的 max-width:100% 兜底）。
+
+/** 嵌入 HTML 本地净化（与 rich-content 沙盒 sanitizeEmbeddedHtml 同一规则：
+ *  去 <script> / on* 事件 / javascript: 链接）。 */
+function sanitizeHtmlCode(code: string): string {
+  return code
+    .replace(/<script[\s\S]*?<\/script\s*>/gi, '')
+    .replace(/<script\b[^>]*>/gi, '')
+    .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/((?:xlink:)?href\s*=\s*)(?:"\s*javascript:[^"]*"|'\s*javascript:[^']*')/gi, '$1"#"')
+}
+
+/** 可编辑树节点：元素（标签 + 属性 + 子节点）或文本 */
+type HtmlTreeNode =
+  | { type: 'el'; tag: string; attrs: Record<string, string>; children: HtmlTreeNode[] }
+  | { type: 'text'; text: string }
+
+type HtmlElNode = Extract<HtmlTreeNode, { type: 'el' }>
+
+/** HTML void 元素（无闭合标签；序列化不输出 </tag>，校验不参与配对） */
+const HTML_VOID_TAGS = new Set([
+  'br', 'hr', 'img', 'input', 'meta', 'link', 'source', 'area', 'base', 'col', 'embed', 'track', 'wbr',
+])
+
+/** 块级元素集合（格式化时独立成行缩进；行内元素保持单行） */
+const HTML_BLOCK_TAGS = new Set([
+  'div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'table', 'thead', 'tbody',
+  'tfoot', 'tr', 'td', 'th', 'blockquote', 'section', 'article', 'header', 'footer', 'nav',
+  'aside', 'main', 'figure', 'figcaption', 'form', 'details', 'summary', 'hr',
+])
+
+/** 标签变更候选（p↔h1..h6↔div 等常见互换） */
+const HTML_RENAME_TAGS = [
+  'div', 'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'span', 'blockquote', 'section',
+] as const
+
+const htmlEl = (tag: string, children: HtmlTreeNode[] = [], attrs: Record<string, string> = {}): HtmlElNode => ({
+  type: 'el',
+  tag,
+  attrs,
+  children,
+})
+const htmlText = (text: string): HtmlTreeNode => ({ type: 'text', text })
+
+/** 快速插入图片的占位图（内联 SVG data URI，不依赖外部资源） */
+const HTML_PLACEHOLDER_IMG =
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80"><rect width="100%" height="100%" fill="#e4e4e7"/><text x="50%" y="50%" text-anchor="middle" dy="0.35em" font-size="12" fill="#71717a">图片</text></svg>',
+  )
+
+/** DOM 节点 → 可编辑树节点（script 剔除；on* 事件 / js: 属性剔除；空白文本丢弃） */
+function domToHtmlNode(node: Node): HtmlTreeNode | null {
+  if (node.nodeType === Node.TEXT_NODE) {
+    const text = (node.textContent ?? '').replace(/\s+/g, ' ')
+    return text.trim() ? { type: 'text', text } : null
+  }
+  if (node.nodeType !== Node.ELEMENT_NODE) return null // 注释等不参与可视化
+  const el = node as Element
+  if (el.tagName.toLowerCase() === 'script') return null
+  const attrs: Record<string, string> = {}
+  for (const a of Array.from(el.attributes)) {
+    if (/^on/i.test(a.name)) continue
+    if (/^href$/i.test(a.name) && /^\s*javascript:/i.test(a.value)) continue
+    attrs[a.name] = a.value
+  }
+  const children: HtmlTreeNode[] = []
+  for (const c of Array.from(el.childNodes)) {
+    const n = domToHtmlNode(c)
+    if (n) children.push(n)
+  }
+  return { type: 'el', tag: el.tagName.toLowerCase(), attrs, children }
+}
+
+/** HTML 源码 → 顶层节点列表（DOMParser 宽容解析；异常回空树，原码不丢） */
+function parseHtmlFragment(code: string): HtmlTreeNode[] {
+  const t = (code || '').trim()
+  if (!t) return []
+  try {
+    const doc = new DOMParser().parseFromString(t, 'text/html')
+    // 常规片段：取 body 子节点；完整小页面（head 里有内容）时回退 documentElement
+    let list = Array.from(doc.body.childNodes)
+    if (list.length === 0 && doc.documentElement) list = Array.from(doc.documentElement.childNodes)
+    const out: HtmlTreeNode[] = []
+    for (const c of list) {
+      const n = domToHtmlNode(c)
+      if (n) out.push(n)
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+function escapeHtmlText(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+function escapeHtmlAttr(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+}
+
+/** 属性表 → 源码片段（输出侧再过滤一道 on* 事件 / js:，与解析侧双保险） */
+function serializeHtmlAttrs(attrs: Record<string, string>): string {
+  const parts = Object.entries(attrs)
+    .filter(
+      ([k, v]) => !/^on/i.test(k) && !(/^href$/i.test(k) && /^\s*javascript:/i.test(v)),
+    )
+    .map(([k, v]) => (v === '' ? k : `${k}="${escapeHtmlAttr(v)}"`))
+  return parts.length ? ' ' + parts.join(' ') : ''
+}
+
+/** 树 → HTML 源码（script 不输出；void 元素不闭合；文本/属性转义） */
+function serializeHtmlTree(nodes: HtmlTreeNode[]): string {
+  const out = (n: HtmlTreeNode): string => {
+    if (n.type === 'text') return escapeHtmlText(n.text)
+    if (n.tag === 'script') return ''
+    const open = `<${n.tag}${serializeHtmlAttrs(n.attrs)}>`
+    if (HTML_VOID_TAGS.has(n.tag)) return open
+    return `${open}${n.children.map(out).join('')}</${n.tag}>`
+  }
+  return nodes.map(out).join('\n')
+}
+
+// ---------- 路径操作（不可变更新） ----------
+
+/** 取路径上的节点（null = 路径失效） */
+function getNodeAt(nodes: HtmlTreeNode[], path: number[]): HtmlTreeNode | null {
+  let cur: HtmlTreeNode | null = null
+  let list: HtmlTreeNode[] = nodes
+  for (const idx of path) {
+    cur = list[idx] ?? null
+    if (!cur) return null
+    list = cur.type === 'el' ? cur.children : []
+  }
+  return cur
+}
+
+/** 按路径替换节点（不可变） */
+function updateNodeAt(
+  nodes: HtmlTreeNode[],
+  path: number[],
+  fn: (n: HtmlTreeNode) => HtmlTreeNode,
+): HtmlTreeNode[] {
+  if (path.length === 0) return nodes
+  const [head, ...rest] = path
+  return nodes.map((n, i) => {
+    if (i !== head) return n
+    if (rest.length === 0) return fn(n)
+    if (n.type !== 'el') return n
+    return { ...n, children: updateNodeAt(n.children, rest, fn) }
+  })
+}
+
+/** 删除路径上的节点（不可变） */
+function removeNodeAt(nodes: HtmlTreeNode[], path: number[]): HtmlTreeNode[] {
+  if (path.length === 0) return nodes
+  const parentPath = path.slice(0, -1)
+  const idx = path[path.length - 1]
+  return updateNodeAt(nodes, parentPath, (p) =>
+    p.type === 'el' ? { ...p, children: p.children.filter((_, i) => i !== idx) } : p,
+  )
+}
+
+/** 在路径节点之后插入兄弟（不可变） */
+function insertAfterAt(nodes: HtmlTreeNode[], path: number[], node: HtmlTreeNode): HtmlTreeNode[] {
+  if (path.length === 0) return [...nodes, node]
+  const parentPath = path.slice(0, -1)
+  const idx = path[path.length - 1]
+  return updateNodeAt(nodes, parentPath, (p) =>
+    p.type === 'el'
+      ? { ...p, children: [...p.children.slice(0, idx + 1), node, ...p.children.slice(idx + 1)] }
+      : p,
+  )
+}
+
+/** 兄弟序上移/下移（不可变；越界原样返回） */
+function moveSiblingAt(nodes: HtmlTreeNode[], path: number[], dir: -1 | 1): HtmlTreeNode[] {
+  if (path.length === 0) return nodes
+  const parentPath = path.slice(0, -1)
+  const idx = path[path.length - 1]
+  const j = idx + dir
+  return updateNodeAt(nodes, parentPath, (p) => {
+    if (p.type !== 'el') return p
+    if (j < 0 || j >= p.children.length) return p
+    const children = [...p.children]
+    const [x] = children.splice(idx, 1)
+    children.splice(j, 0, x)
+    return { ...p, children }
+  })
+}
+
+/** 深拷贝（复制元素用；树节点是纯数据） */
+function cloneHtmlNode(n: HtmlTreeNode): HtmlTreeNode {
+  return JSON.parse(JSON.stringify(n)) as HtmlTreeNode
+}
+
+// ---------- 内联样式 ⇄ 键值表 ----------
+
+/** style 内联样式串 → 键值表（容错按 ; 与 : 拆分，键统一小写） */
+function parseInlineStyle(style: string): Record<string, string> {
+  const rec: Record<string, string> = {}
+  for (const part of (style || '').split(';')) {
+    const i = part.indexOf(':')
+    if (i <= 0) continue
+    const k = part.slice(0, i).trim().toLowerCase()
+    const v = part.slice(i + 1).trim()
+    if (k && v) rec[k] = v
+  }
+  return rec
+}
+
+/** 键值表 → style 串（保持插入顺序；空值剔除） */
+function buildInlineStyle(rec: Record<string, string>): string {
+  return Object.entries(rec)
+    .filter(([, v]) => v !== '')
+    .map(([k, v]) => `${k}: ${v}`)
+    .join('; ')
+}
+
+/** 任意 CSS 颜色值 → 可供 <input type="color"> 的 #rrggbb（解析不了回退默认） */
+function toHexColor(v: string | undefined, fallback: string): string {
+  const t = (v ?? '').trim().toLowerCase()
+  if (/^#[0-9a-f]{6}$/.test(t)) return t
+  const m = t.match(/^#([0-9a-f]{3})$/)
+  if (m) return '#' + m[1].split('').map((c) => c + c).join('')
+  return fallback
+}
+
+// ---------- 源码格式化（块级元素换行 + 两空格缩进） ----------
+
+function prettyHtmlNodes(nodes: HtmlTreeNode[], depth: number): string[] {
+  const pad = '  '.repeat(depth)
+  const lines: string[] = []
+  for (const n of nodes) {
+    if (n.type === 'text') {
+      const t = n.text.trim()
+      if (t) lines.push(pad + escapeHtmlText(t))
+      continue
+    }
+    // 行内元素（span/a/b/strong…）→ 保持单行（serializeHtmlTree 已含转义与子级）
+    if (!HTML_BLOCK_TAGS.has(n.tag)) {
+      lines.push(pad + serializeHtmlTree([n]))
+      continue
+    }
+    // 块级元素：子级全是文本/行内元素 → 单行（p/h*/li/td 等最常见、最可读）
+    const inlineOnly = n.children.every(
+      (c) => c.type === 'text' || (c.type === 'el' && !HTML_BLOCK_TAGS.has(c.tag)),
+    )
+    if (inlineOnly) {
+      lines.push(pad + serializeHtmlTree([n]))
+      continue
+    }
+    const open = `<${n.tag}${serializeHtmlAttrs(n.attrs)}>`
+    lines.push(pad + open)
+    lines.push(...prettyHtmlNodes(n.children, depth + 1))
+    lines.push(`${pad}</${n.tag}>`)
+  }
+  return lines
+}
+
+/** HTML 源码格式化：解析后按块级元素缩进重排（解析失败原样返回） */
+function prettyPrintHtml(code: string): string {
+  const nodes = parseHtmlFragment(code)
+  if (nodes.length === 0) return code || ''
+  return prettyHtmlNodes(nodes, 0).join('\n')
+}
+
+// ---------- 编辑器子组件 ----------
+
+/** 编辑器内联预览：Shadow DOM 沙盒（样式/布局双向隔离 + max-width 防溢出） */
+function HtmlPreviewSandbox({ html }: { html: string }) {
+  const hostRef = React.useRef<HTMLDivElement>(null)
+  React.useEffect(() => {
+    const host = hostRef.current
+    if (!host) return
+    const root = host.shadowRoot ?? host.attachShadow({ mode: 'open' })
+    // 与 rich-content 的 HtmlSandbox 同款基础样式：内容永不撑破容器
+    root.innerHTML = `<style>
+      :host { display: block; max-width: 100%; overflow-x: auto; contain: layout style; }
+      * { max-width: 100%; }
+      img { max-width: 100%; height: auto; }
+      table { max-width: 100%; border-collapse: collapse; }
+    </style>${sanitizeHtmlCode(html)}`
+  }, [html])
+  return <div ref={hostRef} className="min-w-0 max-w-full overflow-x-auto" />
+}
+
+/** 元素树节点行（递归；点击选中，可折叠） */
+function HtmlTreeItemView({
+  node,
+  path,
+  sel,
+  onSelect,
+}: {
+  node: HtmlTreeNode
+  path: number[]
+  sel: number[] | null
+  onSelect: (p: number[]) => void
+}) {
+  const [open, setOpen] = React.useState(true)
+  const isSel = sel != null && sel.length === path.length && sel.every((v, i) => v === path[i])
+  const hasElChildren = node.type === 'el' && node.children.some((c) => c.type === 'el')
+  const label =
+    node.type === 'text'
+      ? node.text.trim().slice(0, 14) || '（空文本）'
+      : (node.children.find((c) => c.type === 'text') as { text?: string } | undefined)?.text
+          ?.trim()
+          .slice(0, 14) ?? ''
+  return (
+    <div>
+      <div
+        className={cn(
+          'flex items-center gap-1 rounded-lg px-1',
+          isSel && 'bg-accent',
+        )}
+      >
+        {hasElChildren ? (
+          <button
+            type="button"
+            aria-label={open ? '折叠' : '展开'}
+            onClick={() => setOpen((o) => !o)}
+            className="shrink-0 rounded p-0.5 text-muted-foreground"
+          >
+            {open ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+          </button>
+        ) : (
+          <span className="w-[18px] shrink-0" />
+        )}
+        <button
+          type="button"
+          onClick={() => onSelect(path)}
+          aria-label={`选中节点 ${node.type === 'el' ? node.tag : '文本'}`}
+          className="flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-1 text-left"
+        >
+          {node.type === 'el' ? (
+            <span
+              className={cn(
+                'shrink-0 rounded bg-muted px-1 py-0.5 font-mono text-[10px] font-semibold',
+                isSel && 'bg-primary/15 text-primary',
+              )}
+            >
+              {node.tag}
+            </span>
+          ) : (
+            <Type className="size-3 shrink-0 text-muted-foreground" />
+          )}
+          <span className="truncate text-[11px] text-muted-foreground">{label}</span>
+        </button>
+      </div>
+      {node.type === 'el' && open && node.children.length > 0 && (
+        <div className="ml-3 border-l border-border pl-1">
+          {node.children.map((c, i) => (
+            <HtmlTreeItemView
+              key={`${i}-${c.type === 'el' ? c.tag : 'text'}`}
+              node={c}
+              path={[...path, i]}
+              sel={sel}
+              onSelect={onSelect}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 选中节点 → 属性面板：文字 / 标签 / 常用内联样式 / 专属属性 / 复制删除移动 */
+function HtmlNodePanel({
+  node,
+  isFirst,
+  isLast,
+  onPatch,
+  onDelete,
+  onDuplicate,
+  onMoveUp,
+  onMoveDown,
+}: {
+  node: HtmlTreeNode
+  /** 兄弟序：首个/末个（上移/下移禁用） */
+  isFirst: boolean
+  isLast: boolean
+  /** 不可变更新当前节点 */
+  onPatch: (fn: (n: HtmlTreeNode) => HtmlTreeNode) => void
+  onDelete: () => void
+  onDuplicate: () => void
+  onMoveUp: () => void
+  onMoveDown: () => void
+}) {
+  const labelSm = 'text-[11px] font-medium text-muted-foreground'
+
+  // ---- 文本节点：只编辑文字 ----
+  if (node.type === 'text') {
+    return (
+      <div className="space-y-2">
+        <p className="text-xs font-semibold">文本节点</p>
+        <Textarea
+          value={node.text}
+          onChange={(e) => onPatch(() => ({ type: 'text', text: e.target.value }))}
+          aria-label="文本内容"
+          rows={3}
+          className="min-h-16 resize-none rounded-xl bg-muted/40 text-sm"
+        />
+        <div className="flex flex-wrap gap-1.5">
+          <Button variant="outline" size="sm" className="h-8 rounded-full text-xs" disabled={isFirst} onClick={onMoveUp}>
+            <ArrowUp className="size-3.5" /> 上移
+          </Button>
+          <Button variant="outline" size="sm" className="h-8 rounded-full text-xs" disabled={isLast} onClick={onMoveDown}>
+            <ArrowDown className="size-3.5" /> 下移
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 rounded-full text-xs text-destructive hover:bg-destructive/10"
+            onClick={onDelete}
+          >
+            <Trash2 className="size-3.5" /> 删除
+          </Button>
+        </div>
+      </div>
+    )
+  }
+
+  const el = node
+  const style = parseInlineStyle(el.attrs.style ?? '')
+  const textOnly = el.children.every((c) => c.type === 'text')
+  const textContent = el.children.map((c) => (c.type === 'text' ? c.text : '')).join(' ')
+
+  /** 改内联样式的单个键（null = 删除该键） */
+  const patchStyle = (key: string, value: string | null) => {
+    onPatch((n) => {
+      if (n.type !== 'el') return n
+      const rec = parseInlineStyle(n.attrs.style ?? '')
+      if (value == null || value === '') delete rec[key]
+      else rec[key] = value
+      const styleStr = buildInlineStyle(rec)
+      const attrs = { ...n.attrs }
+      if (styleStr) attrs.style = styleStr
+      else delete attrs.style
+      return { ...n, attrs }
+    })
+  }
+  /** 改普通属性（空值删除） */
+  const patchAttr = (name: string, value: string) => {
+    onPatch((n) => {
+      if (n.type !== 'el') return n
+      const attrs = { ...n.attrs }
+      if (value === '') delete attrs[name]
+      else attrs[name] = value
+      return { ...n, attrs }
+    })
+  }
+  /** 编辑纯文字内容（仅当子节点全为文本时可用） */
+  const patchText = (text: string) => {
+    onPatch((n) =>
+      n.type === 'el'
+        ? { ...n, children: text.trim() ? [{ type: 'text' as const, text }] : [] }
+        : n,
+    )
+  }
+
+  const bold = /^(bold|[7-9]00)$/i.test(style['font-weight'] ?? '')
+  const italic = /^(italic|oblique)$/i.test(style['font-style'] ?? '')
+  const tagOptions = (HTML_RENAME_TAGS as readonly string[]).includes(el.tag)
+    ? [...HTML_RENAME_TAGS]
+    : [el.tag, ...HTML_RENAME_TAGS]
+
+  return (
+    <div className="space-y-2.5">
+      <p className="font-mono text-xs font-semibold">
+        &lt;{el.tag}&gt; 元素
+      </p>
+
+      {/* 标签变更 */}
+      <div className="flex items-center gap-2">
+        <span className={labelSm}>标签</span>
+        <Select
+          value={el.tag}
+          onValueChange={(v) => onPatch((n) => (n.type === 'el' ? { ...n, tag: v } : n))}
+        >
+          <SelectTrigger className="h-8 flex-1 rounded-lg text-xs" aria-label="变更标签">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {tagOptions.map((t) => (
+              <SelectItem key={t} value={t} className="font-mono text-xs">
+                {t}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/* 文字内容（纯文本子节点可直接编辑） */}
+      {textOnly ? (
+        <div>
+          <span className={labelSm}>文字内容</span>
+          <Textarea
+            value={textContent}
+            onChange={(e) => patchText(e.target.value)}
+            aria-label="元素文字内容"
+            rows={2}
+            className="mt-1 min-h-14 resize-none rounded-xl bg-muted/40 text-sm"
+          />
+        </div>
+      ) : (
+        <p className="rounded-lg bg-muted/40 px-2 py-1.5 text-[11px] leading-relaxed text-muted-foreground">
+          该元素包含子元素：请在左侧元素树中选择子节点编辑文字，或切换到源码模式
+        </p>
+      )}
+
+      {/* 专属属性：img 的 src/alt、a 的 href */}
+      {el.tag === 'img' && (
+        <div className="grid gap-1.5">
+          <div>
+            <span className={labelSm}>图片地址 src</span>
+            <Input
+              value={el.attrs.src ?? ''}
+              onChange={(e) => patchAttr('src', e.target.value)}
+              aria-label="图片地址"
+              className="mt-0.5 h-8 rounded-lg text-xs"
+            />
+          </div>
+          <div>
+            <span className={labelSm}>替代文字 alt</span>
+            <Input
+              value={el.attrs.alt ?? ''}
+              onChange={(e) => patchAttr('alt', e.target.value)}
+              aria-label="图片替代文字"
+              className="mt-0.5 h-8 rounded-lg text-xs"
+            />
+          </div>
+        </div>
+      )}
+      {el.tag === 'a' && (
+        <div>
+          <span className={labelSm}>链接地址 href</span>
+          <Input
+            value={el.attrs.href ?? ''}
+            onChange={(e) => patchAttr('href', e.target.value)}
+            aria-label="链接地址"
+            className="mt-0.5 h-8 rounded-lg text-xs"
+          />
+        </div>
+      )}
+
+      {/* 常用内联样式 */}
+      <div className="space-y-1.5">
+        <span className={labelSm}>常用样式（内联 style）</span>
+        <div className="grid grid-cols-2 gap-1.5">
+          <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            字色
+            <input
+              type="color"
+              value={toHexColor(style.color, '#18181b')}
+              onChange={(e) => patchStyle('color', e.target.value)}
+              aria-label="文字颜色"
+              className="h-7 w-8 shrink-0 cursor-pointer rounded border border-border bg-transparent p-0.5"
+            />
+            <button
+              type="button"
+              aria-label="清除文字颜色"
+              title="清除"
+              onClick={() => patchStyle('color', null)}
+              className="rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground"
+            >
+              <Trash2 className="size-3" />
+            </button>
+          </label>
+          <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            背景
+            <input
+              type="color"
+              value={toHexColor(style['background-color'], '#ffffff')}
+              onChange={(e) => patchStyle('background-color', e.target.value)}
+              aria-label="背景颜色"
+              className="h-7 w-8 shrink-0 cursor-pointer rounded border border-border bg-transparent p-0.5"
+            />
+            <button
+              type="button"
+              aria-label="清除背景颜色"
+              title="清除"
+              onClick={() => patchStyle('background-color', null)}
+              className="rounded p-0.5 text-muted-foreground/60 hover:bg-muted hover:text-foreground"
+            >
+              <Trash2 className="size-3" />
+            </button>
+          </label>
+          <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
+            字号
+            <Input
+              value={style['font-size'] ?? ''}
+              onChange={(e) => patchStyle('font-size', e.target.value || null)}
+              placeholder="如 16px"
+              aria-label="字号"
+              className="h-7 flex-1 rounded-lg text-[11px]"
+            />
+          </label>
+          <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
+            边距
+            <Input
+              value={style.margin ?? ''}
+              onChange={(e) => patchStyle('margin', e.target.value || null)}
+              placeholder="如 8px"
+              aria-label="边距"
+              className="h-7 flex-1 rounded-lg text-[11px]"
+            />
+          </label>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Button
+            variant={bold ? 'default' : 'outline'}
+            size="sm"
+            aria-pressed={bold}
+            className="h-7 rounded-full px-2.5 text-[11px]"
+            onClick={() => patchStyle('font-weight', bold ? null : 'bold')}
+          >
+            加粗
+          </Button>
+          <Button
+            variant={italic ? 'default' : 'outline'}
+            size="sm"
+            aria-pressed={italic}
+            className="h-7 rounded-full px-2.5 text-[11px]"
+            onClick={() => patchStyle('font-style', italic ? null : 'italic')}
+          >
+            斜体
+          </Button>
+          <Select
+            value={style['text-align'] ?? 'none'}
+            onValueChange={(v) => patchStyle('text-align', v === 'none' ? null : v)}
+          >
+            <SelectTrigger className="h-7 w-24 rounded-full text-[11px]" aria-label="对齐方式">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none" className="text-xs">默认对齐</SelectItem>
+              <SelectItem value="left" className="text-xs">左对齐</SelectItem>
+              <SelectItem value="center" className="text-xs">居中</SelectItem>
+              <SelectItem value="right" className="text-xs">右对齐</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      {/* 结构操作 */}
+      <div className="flex flex-wrap gap-1.5 border-t border-border pt-2">
+        <Button variant="outline" size="sm" className="h-8 rounded-full text-xs" disabled={isFirst} onClick={onMoveUp}>
+          <ArrowUp className="size-3.5" /> 上移
+        </Button>
+        <Button variant="outline" size="sm" className="h-8 rounded-full text-xs" disabled={isLast} onClick={onMoveDown}>
+          <ArrowDown className="size-3.5" /> 下移
+        </Button>
+        <Button variant="outline" size="sm" className="h-8 rounded-full text-xs" onClick={onDuplicate}>
+          <Copy className="size-3.5" /> 复制
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8 rounded-full text-xs text-destructive hover:bg-destructive/10"
+          onClick={onDelete}
+        >
+          <Trash2 className="size-3.5" /> 删除
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+/** 快速插入模板（常用块） */
+const HTML_TEMPLATES: Array<{ label: string; make: () => HtmlTreeNode }> = [
+  { label: '标题', make: () => htmlEl('h2', [htmlText('标题文字')]) },
+  { label: '段落', make: () => htmlEl('p', [htmlText('段落文字')]) },
+  {
+    label: '列表',
+    make: () => htmlEl('ul', [htmlEl('li', [htmlText('条目一')]), htmlEl('li', [htmlText('条目二')])]),
+  },
+  {
+    label: '表格',
+    make: () =>
+      htmlEl('table', [
+        htmlEl('tbody', [
+          htmlEl('tr', [htmlEl('td', [htmlText('表头一')]), htmlEl('td', [htmlText('表头二')])]),
+          htmlEl('tr', [htmlEl('td', [htmlText('内容')]), htmlEl('td', [htmlText('内容')])]),
+        ]),
+      ]),
+  },
+  {
+    label: '图片',
+    make: () => htmlEl('img', [], { src: HTML_PLACEHOLDER_IMG, alt: '图片说明' }),
+  },
+  { label: '分割线', make: () => htmlEl('hr') },
+  { label: '引用块', make: () => htmlEl('blockquote', [htmlEl('p', [htmlText('引用内容')])]) },
+  {
+    label: '两栏布局',
+    make: () =>
+      htmlEl(
+        'div',
+        [htmlEl('div', [htmlText('左栏')]), htmlEl('div', [htmlText('右栏')])],
+        { style: 'display: flex; gap: 12px' },
+      ),
+  },
+]
+
+/** HTML 可视化编辑器：实时沙盒预览 + 元素树 + 属性面板 + 快速插入 */
+function HtmlVisualEditor({ code, onChange }: { code: string; onChange: (c: string) => void }) {
+  const [nodes, setNodes] = React.useState<HtmlTreeNode[]>([])
+  const [sel, setSel] = React.useState<number[] | null>(null)
+  /** 自己 emit 出去的最新源码（跳过回环解析，防打断输入焦点） */
+  const emittedRef = React.useRef<string | null>(null)
+
+  // 外部变化（源码 tab 手改 / AI 写入）→ 重解析；自己 emit 的跳过
+  React.useEffect(() => {
+    if (code === emittedRef.current) return
+    setNodes(parseHtmlFragment(code))
+    setSel(null)
+  }, [code])
+
+  /** 不可变更新树 + 序列化写回宿主 src */
+  const emit = (next: HtmlTreeNode[]) => {
+    setNodes(next)
+    const out = serializeHtmlTree(next)
+    emittedRef.current = out
+    onChange(out)
+  }
+
+  const selNode = sel ? getNodeAt(nodes, sel) : null
+  /** 选中节点所在的兄弟列表（用于判断首末位置） */
+  const siblingList = sel
+    ? (() => {
+        const parent = sel.length > 1 ? getNodeAt(nodes, sel.slice(0, -1)) : null
+        return parent && parent.type === 'el' ? parent.children : nodes
+      })()
+    : nodes
+  const selIndex = sel ? sel[sel.length - 1] : -1
+
+  const patchSelected = (fn: (n: HtmlTreeNode) => HtmlTreeNode) => {
+    if (!sel) return
+    emit(updateNodeAt(nodes, sel, fn))
+  }
+  const deleteSelected = () => {
+    if (!sel) return
+    emit(removeNodeAt(nodes, sel))
+    setSel(null)
+  }
+  const duplicateSelected = () => {
+    if (!sel) return
+    const node = getNodeAt(nodes, sel)
+    if (!node) return
+    emit(insertAfterAt(nodes, sel, cloneHtmlNode(node)))
+  }
+  const moveSelected = (dir: -1 | 1) => {
+    if (!sel) return
+    emit(moveSiblingAt(nodes, sel, dir))
+  }
+  /** 快速插入：有选中 → 插到其后；无选中 → 追加到末尾 */
+  const insertTemplate = (make: () => HtmlTreeNode) => {
+    const node = make()
+    emit(sel ? insertAfterAt(nodes, sel, node) : [...nodes, node])
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      {/* 实时预览（沙盒隔离 + 防溢出滚动） */}
+      <div className="max-h-72 overflow-auto rounded-xl border border-border bg-background p-3">
+        {nodes.length === 0 ? (
+          <p className="py-6 text-center text-xs text-muted-foreground">
+            暂无内容：用下方模板快速插入，或切换到源码模式粘贴 HTML
+          </p>
+        ) : (
+          <HtmlPreviewSandbox html={serializeHtmlTree(nodes)} />
+        )}
+      </div>
+
+      {/* 快速插入 */}
+      <div className="flex flex-wrap gap-1.5">
+        {HTML_TEMPLATES.map((t) => (
+          <Button
+            key={t.label}
+            variant="outline"
+            size="sm"
+            className="h-8 rounded-full text-xs"
+            onClick={() => insertTemplate(t.make)}
+          >
+            <Plus className="size-3.5" /> {t.label}
+          </Button>
+        ))}
+      </div>
+
+      {/* 元素树 + 属性面板（各自滚动；小屏单列堆叠，375px 可用） */}
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div className="max-h-56 overflow-y-auto rounded-xl border border-border p-1.5">
+          {nodes.length === 0 ? (
+            <p className="py-4 text-center text-[11px] text-muted-foreground">元素树为空</p>
+          ) : (
+            nodes.map((n, i) => (
+              <HtmlTreeItemView
+                key={`${i}-${n.type === 'el' ? n.tag : 'text'}`}
+                node={n}
+                path={[i]}
+                sel={sel}
+                onSelect={setSel}
+              />
+            ))
+          )}
+        </div>
+        <div className="max-h-64 overflow-y-auto rounded-xl border border-border p-2.5">
+          {selNode ? (
+            <HtmlNodePanel
+              node={selNode}
+              isFirst={selIndex <= 0}
+              isLast={selIndex < 0 || selIndex >= siblingList.length - 1}
+              onPatch={patchSelected}
+              onDelete={deleteSelected}
+              onDuplicate={duplicateSelected}
+              onMoveUp={() => moveSelected(-1)}
+              onMoveDown={() => moveSelected(1)}
+            />
+          ) : (
+            <p className="py-4 text-center text-[11px] leading-relaxed text-muted-foreground">
+              点击左侧元素树中的节点，
+              <br />
+              在这里编辑文字、标签与样式
+            </p>
+          )}
+        </div>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        预览即最终效果；修改实时写回源码（自动去除 script 等不安全内容），应用后替换原引用
+      </p>
+    </div>
+  )
+}
+
 // ---------- 语法校验 + 部分加载 ----------
 
 type Verdict = { ok: true } | { ok: false; message: string; line?: number }
@@ -2694,9 +3540,55 @@ function validateFormulaSrc(code: string): Verdict {
   }
 }
 
+/**
+ * HTML 源码校验：DOMParser 宽容解析（text/html 从不抛 parsererror，但确认 DOM
+ * 可建）+ 标签配对自检（非 void 标签必须按序正确闭合；HTML5 自动闭合的
+ * `<p>a<p>b` 也会被标记，便于统一交给 AI 修复规范化）。
+ */
+function validateHtmlSrc(code: string): Verdict {
+  const t = (code || '').trim()
+  if (!t) return { ok: true }
+  // 1) DOMParser 宽容解析（异常即失败）
+  try {
+    new DOMParser().parseFromString(t, 'text/html')
+  } catch (e) {
+    return { ok: false, message: ('HTML 解析失败：' + (e instanceof Error ? e.message : '')).slice(0, 200) }
+  }
+  // 2) 标签配对自检：扫描标签 token，非 void 元素开闭配对、嵌套有序
+  const stack: Array<{ tag: string; line: number }> = []
+  const tagRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g
+  let m: RegExpExecArray | null
+  while ((m = tagRe.exec(t)) !== null) {
+    const closing = m[1] === '/'
+    const tag = m[2].toLowerCase()
+    if (HTML_VOID_TAGS.has(tag)) continue
+    if (!closing) {
+      if (!m[3].endsWith('/')) {
+        stack.push({ tag, line: t.slice(0, m.index).split('\n').length })
+      }
+    } else {
+      const top = stack.pop()
+      if (!top) return { ok: false, message: `</${tag}> 没有对应的开始标签` }
+      if (top.tag !== tag) {
+        return {
+          ok: false,
+          message: `第 ${top.line} 行的 <${top.tag}> 未闭合（与 </${tag}> 不匹配）`,
+          line: top.line,
+        }
+      }
+    }
+  }
+  if (stack.length > 0) {
+    const top = stack[stack.length - 1]
+    return { ok: false, message: `第 ${top.line} 行的 <${top.tag}> 标签未闭合`, line: top.line }
+  }
+  return { ok: true }
+}
+
 async function validateMediaSrc(kind: MediaKind, code: string): Promise<Verdict> {
   if (kind === 'mermaid') return validateMermaidSrc(code)
   if (kind === 'svg') return validateSvgSrc(code)
+  if (kind === 'html') return validateHtmlSrc(code)
   if (kind === 'formula') return validateFormulaSrc(code)
   return { ok: true } // table / code / image 不校验
 }
@@ -2739,8 +3631,14 @@ type CheckState =
   | { status: 'partial'; clean: string; removedOrig: number[]; message: string }
 
 /** MediaKind → /api/media-ai kind */
-function apiKindOf(ref: MediaRef): 'mermaid' | 'svg' | 'table' | 'formula' | 'code' {
-  if (ref.kind === 'mermaid' || ref.kind === 'svg' || ref.kind === 'table' || ref.kind === 'formula') {
+function apiKindOf(ref: MediaRef): 'mermaid' | 'svg' | 'html' | 'table' | 'formula' | 'code' {
+  if (
+    ref.kind === 'mermaid' ||
+    ref.kind === 'svg' ||
+    ref.kind === 'html' ||
+    ref.kind === 'table' ||
+    ref.kind === 'formula'
+  ) {
     return ref.kind
   }
   return 'code'
@@ -2758,6 +3656,8 @@ function renderableOf(kind: MediaKind, code: string): string {
       return '```mermaid\n' + code + '\n```'
     case 'svg':
       return '```svg\n' + code + '\n```'
+    case 'html':
+      return '```html\n' + code + '\n```'
     case 'table':
       return code
     case 'formula':
@@ -2859,10 +3759,10 @@ export function MediaEditDialog({
     }
   }, [mediaRef, parseFlowFromSrc])
 
-  // 实时校验（mermaid / svg / formula，防抖 600ms；mermaid 失败尝试部分加载）
+  // 实时校验（mermaid / svg / html / formula，防抖 600ms；mermaid 失败尝试部分加载）
   React.useEffect(() => {
     const kind = mediaRef?.kind
-    if (!kind || (kind !== 'mermaid' && kind !== 'svg' && kind !== 'formula')) {
+    if (!kind || (kind !== 'mermaid' && kind !== 'svg' && kind !== 'formula' && kind !== 'html')) {
       setCheck({ status: 'ok' })
       return
     }
@@ -2899,12 +3799,13 @@ export function MediaEditDialog({
   if (!mediaRef) return null
   const ref = mediaRef
 
-  // 可视化模式可用性（svg 始终可用：编辑器内部容错解析）
+  // 可视化模式可用性（svg / html 始终可用：编辑器内部容错解析）
   const visualAvailable =
     (ref.kind === 'table' && !!grid) ||
     (ref.kind === 'mermaid' && (!!tree || !!flowDoc)) ||
     ref.kind === 'formula' ||
-    ref.kind === 'svg'
+    ref.kind === 'svg' ||
+    ref.kind === 'html'
   const activeTab: EditTab = tab === 'visual' && !visualAvailable ? 'source' : tab
 
   // 预览用源码：mermaid 部分加载成功时用净化版
@@ -2937,9 +3838,20 @@ export function MediaEditDialog({
         ? !!parseTable(code)
         : ref.kind === 'mermaid'
           ? !!(parseMindmap(code) || parseFlowDoc(code))
-          : ref.kind === 'formula' || ref.kind === 'svg'
+          : ref.kind === 'formula' || ref.kind === 'svg' || ref.kind === 'html'
     setTab(can ? 'visual' : 'source')
     toast.success('AI 代码已写入，可继续可视化编辑')
+  }
+
+  /** 源码模式「格式化」（html 专属：块级元素换行缩进重排） */
+  const handleFormatHtml = () => {
+    const pretty = prettyPrintHtml(src)
+    if (!pretty.trim()) {
+      toast.warning('源码为空或无法解析，请先修正')
+      return
+    }
+    setSrc(pretty)
+    toast.success('已格式化（块级元素缩进重排）')
   }
 
   /** AI 修复语法错误（结果先预览，接纳 / 撤销） */
@@ -3021,7 +3933,10 @@ export function MediaEditDialog({
         setApplying(false)
       }
     }
-    onApply(ref, newSrc)
+    // html kind：宿主（material-editor）按 kind 决定围栏包裹（mermaid/svg/code 会包
+    // ```lang 围栏），'html' 不在其列 → 以 kind 'code' + lang 'html' 传回，宿主即包出
+    // 正确的 ```html 围栏（raw 仍是原文定位，不受影响）。
+    onApply(ref.kind === 'html' ? { ...ref, kind: 'code' } : ref, newSrc)
   }
 
   /**
@@ -3213,6 +4128,8 @@ export function MediaEditDialog({
                 <FlowGraphEditor doc={flowDoc} warn={flowWarn} onDocChange={syncFlowDoc} />
               ) : ref.kind === 'svg' ? (
                 <SvgVisualEditor code={src} onChange={setSrc} />
+              ) : ref.kind === 'html' ? (
+                <HtmlVisualEditor code={src} onChange={setSrc} />
               ) : null
             ) : (
               <div className="flex flex-col gap-3">
@@ -3223,6 +4140,16 @@ export function MediaEditDialog({
                   placeholder="编辑源码…"
                   className="min-h-36 resize-none rounded-xl bg-muted/40 font-mono text-sm"
                 />
+                {ref.kind === 'html' && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 self-start rounded-full text-xs"
+                    onClick={handleFormatHtml}
+                  >
+                    <Wand2 className="size-3.5" /> 格式化
+                  </Button>
+                )}
                 {ref.kind !== 'formula' && (
                   <div className="max-h-40 overflow-auto rounded-xl bg-muted/50 p-2">
                     <p className="pb-1 text-[11px] text-muted-foreground">

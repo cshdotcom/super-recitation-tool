@@ -10,7 +10,7 @@
 //   [[audio:<uuid>]] / [[video:<uuid>]]，可选标题 [[audio:<uuid>|标题]]，
 //   播放地址固定为 /api/upload/<uuid>。
 
-export type MediaKind = 'image' | 'table' | 'mermaid' | 'svg' | 'code' | 'formula'
+export type MediaKind = 'image' | 'table' | 'mermaid' | 'svg' | 'html' | 'code' | 'formula'
 
 /** MediaRef.kind 的完整集合：MediaKind 基础上扩展音视频引用（[[audio:]] / [[video:]]）。 */
 export type MediaRefKind = MediaKind | 'audio' | 'video'
@@ -37,6 +37,7 @@ export const MEDIA_KIND_LABEL: Record<MediaRefKind, string> = {
   table: '表格',
   mermaid: '思维导图',
   svg: 'SVG 图',
+  html: 'HTML',
   code: '代码',
   formula: '公式',
   audio: '音频',
@@ -69,7 +70,10 @@ export function extractMediaRefs(text: string): MediaRef[] {
   while ((m = fenceRe.exec(text)) !== null) {
     const lang = (m[1] || '').toLowerCase()
     const src = m[2]
-    const kind: MediaKind = lang === 'mermaid' ? 'mermaid' : lang === 'svg' || lang === 'html' ? 'svg' : 'code'
+    // html 与 svg 分离：```html 是 HTML 片段（沙盒渲染 + HTML 可视化编辑器），
+    // 不再误入 SVG 编辑器（修「编辑 SVG 图会错误识别 html」bug）
+    const kind: MediaKind =
+      lang === 'mermaid' ? 'mermaid' : lang === 'svg' ? 'svg' : lang === 'html' ? 'html' : 'code'
     refs.push({
       kind,
       raw: m[0],
@@ -339,8 +343,23 @@ export function downloadMedia(ref: MediaRef): void {
     return
   }
   const ext =
-    ref.kind === 'table' ? 'md' : ref.kind === 'formula' ? 'tex' : ref.lang === 'svg' ? 'svg' : ref.kind === 'mermaid' ? 'mmd' : 'txt'
-  const mime = ref.lang === 'svg' || ref.kind === 'svg' ? 'image/svg+xml' : 'text/plain;charset=utf-8'
+    ref.kind === 'table'
+      ? 'md'
+      : ref.kind === 'formula'
+        ? 'tex'
+        : ref.kind === 'html' || ref.lang === 'html'
+          ? 'html'
+          : ref.lang === 'svg'
+            ? 'svg'
+            : ref.kind === 'mermaid'
+              ? 'mmd'
+              : 'txt'
+  const mime =
+    ref.kind === 'html' || ref.lang === 'html'
+      ? 'text/html;charset=utf-8'
+      : ref.lang === 'svg' || ref.kind === 'svg'
+        ? 'image/svg+xml'
+        : 'text/plain;charset=utf-8'
   const blob = new Blob([ref.src], { type: mime })
   downloadBlobFile(`${MEDIA_KIND_LABEL[ref.kind]}-${fileTimestamp()}.${ext}`, blob)
 }

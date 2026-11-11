@@ -32,6 +32,7 @@ function statusInfo(
 }
 
 // 复习总览页：全部背书卡的复习状态网格 + 右下角新建按钮。
+// 进入时自取「待复习」列表，到期卡片标「待复习」徽标，点击直达背书页。
 export function ReviewOverviewView({
   cards,
   statuses,
@@ -39,6 +40,23 @@ export function ReviewOverviewView({
   onOpenCard,
   onNew,
 }: ReviewOverviewViewProps) {
+  // 到期待复习的卡片 id（SM-2 到期；null = 尚未加载完成，不显示徽标）
+  const [dueIds, setDueIds] = React.useState<Set<string> | null>(null)
+
+  React.useEffect(() => {
+    let alive = true
+    fetch('/api/review/due')
+      .then((r) => (r.ok ? r.json() : { cards: [] }))
+      .then((res: { cards?: { id: string }[] }) => {
+        if (alive) setDueIds(new Set((res.cards ?? []).map((c) => c.id)))
+      })
+      .catch(() => {
+        if (alive) setDueIds(new Set())
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
   return (
     <div className="flex min-h-screen flex-col bg-muted/40">
       {/* 顶栏 */}
@@ -82,7 +100,14 @@ export function ReviewOverviewView({
                   )}
                 >
                   <FilesStackIll className="mx-auto w-16" />
-                  <p className="mt-3 w-full truncate text-sm font-semibold">{card.title}</p>
+                  <div className="mt-3 flex w-full items-center justify-center gap-1.5">
+                    <p className="min-w-0 truncate text-sm font-semibold">{card.title}</p>
+                    {dueIds?.has(card.id) && (
+                      <span className="shrink-0 rounded-full border border-amber-600/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
+                        待复习
+                      </span>
+                    )}
+                  </div>
                   <p className={cn('mt-1 text-sm', info.cls)}>{info.text}</p>
                 </button>
               )

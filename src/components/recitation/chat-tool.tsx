@@ -27,6 +27,11 @@
 //   • TTS 朗读：每条 AI 回复可点击喇叭播放（useQuickTts，按 ask/supervise
 //     上下文取音色）；顶栏可开关「自动朗读」（默认关，/api/state 记忆）与
 //     「音色设置」（引擎/音色/倍速，PATCH /api/settings + sb-voice-prefs-changed）。
+//   • 选中文字 / 长按消息菜单（SelectionToolbar）：拖选或长按选词后在选区
+//     附近弹自定义浮动条（朗读 / 复制 / 追问 / 划重点 / 取消）；长按消息
+//     空白处或右键弹消息菜单（朗读 / 复制 / 引用追问 / 多选 / 删除）。桌面
+//     拖选+右键、移动端长按选词（selectionchange 延迟 300ms）；ask /
+//     supervise / 对话模式通用，多选模式自动禁用，浮层无遮罩不阻挡滚动。
 //   • 移动端：visualViewport 感知软键盘并等量收窄面板高度（输入框不被遮挡）；
 //     小图标按钮用 after 伪元素把触控热区扩到 ≥44px（视觉不变）。
 import * as React from 'react'
@@ -37,6 +42,7 @@ import {
   ChevronRight,
   Copy,
   Download,
+  Highlighter,
   ImagePlus,
   ListChecks,
   Loader2,
@@ -539,6 +545,568 @@ function ThinkingBlock({ text }: { text: string }) {
   )
 }
 
+// ---------- 选中文字 / 长按消息菜单（SelectionToolbar） ----------
+
+/** 长按/右键消息时由 data-mid 反查出的消息信息。 */
+interface SelectionMessageInfo {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  /** 在 messages 数组中的下标（删除/朗读定位用）。 */
+  index: number
+}
+
+/** 选择浮动条状态（fixed 视口坐标 + 选中文本快照）。 */
+interface SelectionBarState {
+  text: string
+  top: number
+  left: number
+}
+
+/** 消息长按/右键菜单状态。 */
+interface MessageMenuState {
+  msg: SelectionMessageInfo
+  top: number
+  left: number
+}
+
+type MessageMenuKey = 'speak' | 'copy' | 'followup' | 'select' | 'delete'
+
+interface SelectionToolbarProps {
+  /** 消息滚动容器：选区/长按目标必须位于其中才弹菜单。 */
+  containerRef: { readonly current: HTMLDivElement | null }
+  /** 多选模式等场景整体禁用。 */
+  disabled?: boolean
+  /** 朗读选中文字（复用消息级 TTS，音色/倍速一致）。 */
+  onSpeak: (text: string) => void
+  /** 停止朗读选中文字。 */
+  onStopSpeak: () => void
+  /** 正在朗读选中文字（「朗读」按钮切换为「停止」）。 */
+  reading: boolean
+  /** 追问选中文字（对话模式弹追问层 / 卡片模式预填输入框）。 */
+  onFollowup: (text: string) => void
+  /** 按 data-mid 反查消息（返回 null 则不弹长按菜单）。 */
+  resolveMessage: (mid: string) => SelectionMessageInfo | null
+  /** 长按/右键菜单动作分发。 */
+  onMessageAction: (key: MessageMenuKey, msg: SelectionMessageInfo) => void
+  /** 是否提供「多选消息」动作（对话模式）。 */
+  canSelectMessages?: boolean
+  /** 正在朗读的消息 id（长按菜单中该消息显示「停止朗读」）。 */
+  speakingMessageId?: string | null
+}
+
+/** 选择浮动条估高（含内边距，定位估算用）。 */
+const SEL_BAR_H = 46
+const SEL_BAR_GAP = 10
+/** 长按消息菜单尺寸（与 long-press-menu 视觉一致）。 */
+const MSG_MENU_W = 176
+const MSG_ROW_H = 42
+const MSG_MENU_PAD = 14
+/** 长按延时：略晚于系统选词（~500ms），长按文字时优先出现选择菜单。 */
+const LONG_PRESS_MS = 600
+const MOVE_TOLERANCE = 10
+const VIEWPORT_INSET = 8
+
+/** 选择条按钮（≥36px 触控高度，图标 + 文字）。 */
+function SelectionToolbarButton({
+  label,
+  active,
+  onClick,
+  children,
+}: {
+  label: string
+  active?: boolean
+  onClick: () => void
+  children: React.ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'flex h-9 shrink-0 items-center gap-1 rounded-xl px-2.5 text-xs font-medium transition-colors',
+        active
+          ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+          : 'text-foreground/85 hover:bg-accent hover:text-foreground',
+      )}
+    >
+      <span className="flex size-3.5 shrink-0 items-center justify-center">{children}</span>
+      {label}
+    </button>
+  )
+}
+
+/**
+ * 消息区自定义文本选择菜单 + 消息长按/右键菜单（portal 到 body，z-[92]）。
+ *
+ * 选择浮动条：桌面拖选（mouseup 确认）/ 移动端长按选词、拖动手柄
+ * （selectionchange 防抖 300ms）→ 在选区附近弹出横向滚动浮动条
+ * （朗读 / 复制 / 追问 / 划重点 / 取消）；选区收起、滚动、Esc 自动隐藏。
+ * 消息菜单：移动端长按消息无选区处（600ms，避开系统选词）、桌面右键 →
+ * 竖排菜单（朗读 / 复制 / 引用追问 / 多选 / 删除）。
+ * 全部监听挂在 document/window 并按 containerRef 过滤，多实例互不干扰。
+ */
+function SelectionToolbar({
+  containerRef,
+  disabled = false,
+  onSpeak,
+  onStopSpeak,
+  reading,
+  onFollowup,
+  resolveMessage,
+  onMessageAction,
+  canSelectMessages = false,
+  speakingMessageId = null,
+}: SelectionToolbarProps) {
+  const [sel, setSel] = React.useState<SelectionBarState | null>(null)
+  const [msgMenu, setMsgMenu] = React.useState<MessageMenuState | null>(null)
+  const [mounted, setMounted] = React.useState(false)
+  const barRef = React.useRef<HTMLDivElement | null>(null)
+  const menuRef = React.useRef<HTMLDivElement | null>(null)
+  const checkTimerRef = React.useRef<number | null>(null)
+  const pressTimerRef = React.useRef<number | null>(null)
+  const pressStartRef = React.useRef<{ x: number; y: number } | null>(null)
+  const coarseRef = React.useRef(false)
+  const suppressClickUntilRef = React.useRef(0)
+  /** 超时/事件闭包里需要读取的最新 props 与浮层状态（effect 镜像，避免渲染期写 ref）。 */
+  const latestRef = React.useRef({ disabled, resolveMessage, canSelectMessages })
+  const selRef = React.useRef<SelectionBarState | null>(null)
+  const msgMenuRef = React.useRef<MessageMenuState | null>(null)
+  React.useEffect(() => {
+    latestRef.current = { disabled, resolveMessage, canSelectMessages }
+    selRef.current = sel
+    msgMenuRef.current = msgMenu
+  })
+
+  React.useEffect(() => {
+    setMounted(true)
+    return () => setMounted(false)
+  }, [])
+
+  // 禁用（多选模式等）时立即收起全部浮层
+  React.useEffect(() => {
+    if (disabled) {
+      setSel(null)
+      setMsgMenu(null)
+    }
+  }, [disabled])
+
+  /** 读取位于消息区内、且与消息行相交的非空选区（文字 + 选区矩形）。 */
+  const readSelection = React.useCallback((): { text: string; rect: DOMRect } | null => {
+    const container = containerRef.current
+    if (!container) return null
+    const s = window.getSelection()
+    if (!s || s.isCollapsed || s.rangeCount === 0) return null
+    const text = s.toString().trim()
+    if (!text) return null
+    const range = s.getRangeAt(0)
+    const node = range.commonAncestorContainer
+    const el = node instanceof Element ? node : node.parentElement
+    if (!el || !container.contains(el)) return null
+    // 仅消息行（data-mid）内的文字算数：空状态提示 / 加载动画等不弹菜单
+    const rows = container.querySelectorAll('[data-mid]')
+    let hitsMessage = false
+    for (const row of rows) {
+      if (range.intersectsNode(row)) {
+        hitsMessage = true
+        break
+      }
+    }
+    if (!hitsMessage) return null
+    const rect = range.getBoundingClientRect()
+    if (rect.width <= 0 && rect.height <= 0) return null
+    return { text, rect }
+  }, [containerRef])
+
+  // ---------- 全局监听（document / window 级；容器外事件自动忽略） ----------
+  React.useEffect(() => {
+    try {
+      coarseRef.current = window.matchMedia('(pointer: coarse)').matches
+    } catch {
+      coarseRef.current = false
+    }
+    const clearCheck = () => {
+      if (checkTimerRef.current !== null) {
+        window.clearTimeout(checkTimerRef.current)
+        checkTimerRef.current = null
+      }
+    }
+    const clearPress = () => {
+      if (pressTimerRef.current !== null) {
+        window.clearTimeout(pressTimerRef.current)
+        pressTimerRef.current = null
+      }
+      pressStartRef.current = null
+    }
+    const hideAll = () => {
+      clearCheck()
+      setSel(null)
+      setMsgMenu(null)
+    }
+    /** 选区附近定位（fixed）：桌面优先选区上方，触摸端避开系统菜单放下方。 */
+    const positionBar = (rect: DOMRect): { top: number; left: number } => {
+      const vw = window.innerWidth
+      const vh = window.innerHeight
+      const estW = Math.min(vw - VIEWPORT_INSET * 2, 360)
+      const left = Math.max(VIEWPORT_INSET, Math.min(rect.left, vw - estW - VIEWPORT_INSET))
+      const topAbove = rect.top - SEL_BAR_H - SEL_BAR_GAP
+      const topBelow = rect.bottom + SEL_BAR_GAP
+      const fitsAbove = topAbove >= VIEWPORT_INSET
+      const fitsBelow = topBelow + SEL_BAR_H <= vh - VIEWPORT_INSET
+      let top: number
+      if (coarseRef.current) {
+        top = fitsBelow ? topBelow : fitsAbove ? topAbove : Math.max(VIEWPORT_INSET, topBelow)
+      } else {
+        top = fitsAbove ? topAbove : fitsBelow ? topBelow : Math.max(VIEWPORT_INSET, topAbove)
+      }
+      return { top, left }
+    }
+    /** 防抖确认选区：有选区 → 显示/更新浮动条；无 → 收起。 */
+    const scheduleCheck = (delay: number) => {
+      clearCheck()
+      checkTimerRef.current = window.setTimeout(() => {
+        checkTimerRef.current = null
+        const r = readSelection()
+        if (r) {
+          setMsgMenu(null) // 选区菜单优先于长按菜单
+          setSel({ text: r.text, ...positionBar(r.rect) })
+        } else {
+          setSel(null)
+        }
+      }, delay)
+    }
+    /** 打开消息长按/右键菜单（坐标钳制到视口内）。 */
+    const openMessageMenu = (info: SelectionMessageInfo, x: number, y: number) => {
+      const rows = 4 + (latestRef.current.canSelectMessages ? 1 : 0)
+      const menuH = rows * MSG_ROW_H + MSG_MENU_PAD
+      const left = Math.max(
+        VIEWPORT_INSET,
+        Math.min(x, window.innerWidth - MSG_MENU_W - VIEWPORT_INSET),
+      )
+      const top = Math.max(
+        VIEWPORT_INSET,
+        Math.min(y, window.innerHeight - menuH - VIEWPORT_INSET),
+      )
+      suppressClickUntilRef.current = Date.now() + 400 // 吞掉长按后紧跟的 click
+      setSel(null)
+      setMsgMenu({ msg: info, top, left })
+    }
+    // ---- 选区变化：触摸端延迟 300ms（等系统选词/拖动手柄稳定），桌面 80ms ----
+    const onSelectionChange = () => {
+      const s = window.getSelection()
+      if (s && !s.isCollapsed && s.rangeCount > 0) {
+        clearPress() // 有选区 → 长按菜单让位
+        scheduleCheck(coarseRef.current ? 300 : 80)
+        return
+      }
+      // 选区收起：稍候再收起浮动条（点菜单按钮时选区可能被瞬时清空）
+      if (selRef.current) scheduleCheck(220)
+    }
+    // ---- 桌面拖选结束 / 触摸抬手：尽快确认 ----
+    const onMouseUp = (e: MouseEvent) => {
+      if (coarseRef.current || e.button !== 0) return
+      scheduleCheck(40)
+    }
+    const onTouchEnd = () => {
+      if (coarseRef.current) scheduleCheck(300)
+    }
+    // ---- 滚动 / 缩放：收起浮层（浮层无遮罩，本身不阻挡滚动） ----
+    const onScrollOrResize = () => {
+      if (selRef.current || msgMenuRef.current) hideAll()
+    }
+    // ---- Esc：收起浮层（捕获 + 阻断，全屏模式下先收菜单不退出全屏） ----
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      if (!selRef.current && !msgMenuRef.current) return
+      e.preventDefault()
+      e.stopPropagation()
+      hideAll()
+      try {
+        window.getSelection()?.removeAllRanges()
+      } catch {
+        /* 忽略 */
+      }
+    }
+    // ---- 长按消息（触摸/手写笔）：长按处无选区才弹消息菜单 ----
+    const onPointerDown = (e: PointerEvent) => {
+      if (e.pointerType === 'mouse') return // 桌面走右键菜单
+      const container = containerRef.current
+      if (!container) return
+      const target = e.target
+      if (!(target instanceof Element) || !container.contains(target)) return
+      clearPress()
+      if (latestRef.current.disabled) return
+      pressStartRef.current = { x: e.clientX, y: e.clientY }
+      pressTimerRef.current = window.setTimeout(() => {
+        pressTimerRef.current = null
+        const p = pressStartRef.current
+        pressStartRef.current = null
+        if (!p || latestRef.current.disabled) return
+        if (readSelection()) return // 文字已被系统选中 → 交给选择浮动条
+        const row = target.closest('[data-mid]')
+        if (!(row instanceof HTMLElement)) return
+        const info = latestRef.current.resolveMessage(row.getAttribute('data-mid') ?? '')
+        if (!info) return
+        try {
+          navigator.vibrate?.(20)
+        } catch {
+          /* 不支持震动忽略 */
+        }
+        openMessageMenu(info, p.x, p.y)
+      }, LONG_PRESS_MS)
+    }
+    const onPointerMove = (e: PointerEvent) => {
+      const p = pressStartRef.current
+      if (!p || pressTimerRef.current === null) return
+      if (Math.hypot(e.clientX - p.x, e.clientY - p.y) > MOVE_TOLERANCE) clearPress()
+    }
+    const onPointerEnd = () => {
+      if (pressTimerRef.current !== null) clearPress()
+    }
+    // ---- 桌面右键消息：消息菜单；右键落在选区内：保留选择浮动条 ----
+    const onContextMenu = (e: MouseEvent) => {
+      const container = containerRef.current
+      if (!container) return
+      const target = e.target
+      if (!(target instanceof Element) || !container.contains(target)) return
+      if (latestRef.current.disabled) return
+      clearPress() // Android 长按会先派发 contextmenu，避免重复触发
+      const cur = readSelection()
+      if (cur) {
+        const inside =
+          e.clientX >= cur.rect.left &&
+          e.clientX <= cur.rect.right &&
+          e.clientY >= cur.rect.top &&
+          e.clientY <= cur.rect.bottom
+        if (inside) {
+          e.preventDefault()
+          setMsgMenu(null)
+          setSel({ text: cur.text, ...positionBar(cur.rect) })
+          return
+        }
+      }
+      const row = target.closest('[data-mid]')
+      if (!(row instanceof HTMLElement)) return
+      const info = latestRef.current.resolveMessage(row.getAttribute('data-mid') ?? '')
+      if (!info) return
+      e.preventDefault()
+      openMessageMenu(info, e.clientX, e.clientY)
+    }
+    // ---- 消息菜单打开时：点菜单外任意处收起 ----
+    const onDocPointerDown = (e: PointerEvent) => {
+      if (!msgMenuRef.current) return
+      const menu = menuRef.current
+      if (menu && e.target instanceof Node && menu.contains(e.target)) return
+      setMsgMenu(null)
+    }
+    // ---- 吞掉长按开菜单后紧跟的 click（防误触消息/按钮） ----
+    const onClickCapture = (e: MouseEvent) => {
+      if (Date.now() > suppressClickUntilRef.current) return
+      const t = e.target
+      if (!(t instanceof Node)) return
+      if (barRef.current?.contains(t) || menuRef.current?.contains(t)) return
+      const container = containerRef.current
+      if (!container || !container.contains(t)) return
+      e.preventDefault()
+      e.stopPropagation()
+    }
+
+    document.addEventListener('selectionchange', onSelectionChange)
+    document.addEventListener('mouseup', onMouseUp)
+    document.addEventListener('touchend', onTouchEnd, { passive: true })
+    window.addEventListener('scroll', onScrollOrResize, true)
+    window.addEventListener('resize', onScrollOrResize)
+    window.addEventListener('keydown', onKey, true)
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('pointermove', onPointerMove)
+    document.addEventListener('pointerup', onPointerEnd)
+    document.addEventListener('pointercancel', onPointerEnd)
+    document.addEventListener('contextmenu', onContextMenu)
+    document.addEventListener('pointerdown', onDocPointerDown)
+    document.addEventListener('click', onClickCapture, true)
+    return () => {
+      clearCheck()
+      clearPress()
+      document.removeEventListener('selectionchange', onSelectionChange)
+      document.removeEventListener('mouseup', onMouseUp)
+      document.removeEventListener('touchend', onTouchEnd)
+      window.removeEventListener('scroll', onScrollOrResize, true)
+      window.removeEventListener('resize', onScrollOrResize)
+      window.removeEventListener('keydown', onKey, true)
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('pointermove', onPointerMove)
+      document.removeEventListener('pointerup', onPointerEnd)
+      document.removeEventListener('pointercancel', onPointerEnd)
+      document.removeEventListener('contextmenu', onContextMenu)
+      document.removeEventListener('pointerdown', onDocPointerDown)
+      document.removeEventListener('click', onClickCapture, true)
+    }
+  }, [readSelection, containerRef])
+
+  // 浮动条实际宽度超出视口时左移收回（宽度随内容自适应，估算值可能偏小）
+  React.useEffect(() => {
+    if (!sel) return
+    const bar = barRef.current
+    if (!bar) return
+    const w = bar.getBoundingClientRect().width
+    const maxLeft = window.innerWidth - w - VIEWPORT_INSET
+    if (sel.left > maxLeft) {
+      setSel((prev) => (prev ? { ...prev, left: Math.max(VIEWPORT_INSET, maxLeft) } : prev))
+    }
+  }, [sel])
+
+  /** 收起全部浮层并清除系统选区。 */
+  const closeAll = () => {
+    setSel(null)
+    setMsgMenu(null)
+    try {
+      window.getSelection()?.removeAllRanges()
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  /** 复制选中文字（划重点 = 包上 ==高亮== 语法）。 */
+  const copySelection = async (text: string, highlight: boolean) => {
+    const out = highlight ? `==${text}==` : text
+    try {
+      await navigator.clipboard.writeText(out)
+      toast.success(highlight ? '已复制划重点格式（==高亮==）' : '已复制选中文字')
+    } catch {
+      toast.error('复制失败')
+    }
+  }
+
+  if (!mounted) return null
+
+  const isSpeakingMsg = !!msgMenu && speakingMessageId === msgMenu.msg.id
+  const msgActions: Array<{ key: MessageMenuKey; label: string; icon: React.ReactNode; danger?: boolean }> = msgMenu
+    ? [
+        {
+          key: 'speak',
+          label: isSpeakingMsg ? '停止朗读' : '朗读',
+          icon: isSpeakingMsg ? (
+            <Pause className="size-4" strokeWidth={2} />
+          ) : (
+            <Volume2 className="size-4" strokeWidth={1.75} />
+          ),
+        },
+        { key: 'copy', label: '复制', icon: <Copy className="size-4" strokeWidth={1.75} /> },
+        {
+          key: 'followup',
+          label: '引用追问',
+          icon: <MessageCircleQuestion className="size-4" strokeWidth={1.75} />,
+        },
+        ...(canSelectMessages
+          ? [
+              {
+                key: 'select' as const,
+                label: '多选消息',
+                icon: <ListChecks className="size-4" strokeWidth={1.75} />,
+              },
+            ]
+          : []),
+        {
+          key: 'delete',
+          label: msgMenu.msg.role === 'assistant' ? '删除问答' : '删除消息',
+          icon: <Trash2 className="size-4" strokeWidth={1.75} />,
+          danger: true,
+        },
+      ]
+    : []
+
+  return createPortal(
+    <>
+      {/* 选择浮动条：朗读 / 复制 / 追问 / 划重点 / 取消（可横向滚动） */}
+      {sel && (
+        <div
+          ref={barRef}
+          role="toolbar"
+          aria-label="选中文字操作"
+          className="fixed z-[92] max-w-[calc(100vw-1rem)] animate-in fade-in slide-in-from-bottom-1 duration-150"
+          style={{ top: sel.top, left: sel.left }}
+          onMouseDown={(e) => e.preventDefault()} // 防止点菜单按钮时选区被清空
+        >
+          <div className="flex items-center gap-0.5 overflow-x-auto rounded-2xl border border-border/70 bg-popover/95 p-1 shadow-xl backdrop-blur [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            <SelectionToolbarButton
+              label={reading ? '停止' : '朗读'}
+              active={reading}
+              onClick={() => (reading ? onStopSpeak() : onSpeak(sel.text))}
+            >
+              {reading ? (
+                <Pause className="size-3.5" strokeWidth={2} />
+              ) : (
+                <Volume2 className="size-3.5" strokeWidth={1.75} />
+              )}
+            </SelectionToolbarButton>
+            <SelectionToolbarButton
+              label="复制"
+              onClick={() => {
+                void copySelection(sel.text, false)
+                closeAll()
+              }}
+            >
+              <Copy className="size-3.5" strokeWidth={1.75} />
+            </SelectionToolbarButton>
+            <SelectionToolbarButton
+              label="追问"
+              onClick={() => {
+                onFollowup(sel.text)
+                closeAll()
+              }}
+            >
+              <MessageCircleQuestion className="size-3.5" strokeWidth={1.75} />
+            </SelectionToolbarButton>
+            <SelectionToolbarButton
+              label="划重点"
+              onClick={() => {
+                void copySelection(sel.text, true)
+                closeAll()
+              }}
+            >
+              <Highlighter className="size-3.5" strokeWidth={1.75} />
+            </SelectionToolbarButton>
+            <SelectionToolbarButton label="取消" onClick={closeAll}>
+              <X className="size-3.5" strokeWidth={1.75} />
+            </SelectionToolbarButton>
+          </div>
+        </div>
+      )}
+
+      {/* 消息长按/右键菜单：朗读 / 复制 / 引用追问 / 多选 / 删除 */}
+      {msgMenu && (
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label="消息操作"
+          className="fixed z-[92] w-44 animate-in fade-in zoom-in-95 duration-150 rounded-2xl border border-white/10 bg-zinc-900/95 p-1.5 text-white shadow-2xl backdrop-blur"
+          style={{ top: msgMenu.top, left: msgMenu.left }}
+        >
+          {msgActions.map((a) => (
+            <button
+              key={a.key}
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setMsgMenu(null)
+                onMessageAction(a.key, msgMenu.msg)
+              }}
+              className={cn(
+                'flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13px] transition-colors',
+                a.danger ? 'text-red-400 hover:bg-red-500/15' : 'text-zinc-100 hover:bg-white/10',
+              )}
+            >
+              <span className="flex size-4 shrink-0 items-center justify-center">{a.icon}</span>
+              <span className="truncate">{a.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </>,
+    document.body,
+  )
+}
+
 // ---------- main component ----------
 
 export function ChatTool({
@@ -561,6 +1129,8 @@ export function ChatTool({
   const [historyReady, setHistoryReady] = React.useState(false)
   const scrollRef = React.useRef<HTMLDivElement>(null)
   const fileInputRef = React.useRef<HTMLInputElement>(null)
+  /** 输入框（选中文字追问预填后聚焦）。 */
+  const inputRef = React.useRef<HTMLInputElement>(null)
   const seededRef = React.useRef(false)
   const copyTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
   const idRef = React.useRef(0)
@@ -684,6 +1254,8 @@ export function ChatTool({
   const tts = useQuickTts(voiceCtx, effectiveSettings)
   /** 正在朗读的消息 id（用于切换播放/暂停图标）。 */
   const [speakingId, setSpeakingId] = React.useState<string | null>(null)
+  /** 正在朗读「选中文字」（选择菜单里的朗读按钮状态）。 */
+  const [speakingSelection, setSpeakingSelection] = React.useState(false)
   /** 自动朗读：默认关闭（避免打扰），尊重服务端记忆。 */
   const [autoSpeak, setAutoSpeak] = React.useState(false)
   const autoSpeakRef = React.useRef(false)
@@ -691,9 +1263,12 @@ export function ChatTool({
   const voiceDirtyRef = React.useRef(false)
   const browserVoices = useBrowserVoiceList(voiceOpen && tts.pref.provider === 'browser')
 
-  // 朗读结束 / 失败 → 清除播放中图标
+  // 朗读结束 / 失败 → 清除播放中图标（含选中文字朗读）
   React.useEffect(() => {
-    if (!tts.speaking) setSpeakingId(null)
+    if (!tts.speaking) {
+      setSpeakingId(null)
+      setSpeakingSelection(false)
+    }
   }, [tts.speaking])
 
   // 加载自动朗读开关（服务端记忆，默认关）
@@ -1417,6 +1992,104 @@ export function ChatTool({
           method: 'DELETE',
         }).catch(() => {})
       }
+    }
+  }
+
+  // ---------- 选中文字 / 长按消息菜单（SelectionToolbar 回调） ----------
+
+  /** 朗读选中文字（复用 useQuickTts：音色/倍速与消息朗读一致）。 */
+  const speakSelection = (text: string) => {
+    tts.stop()
+    setSpeakingId(null)
+    setSpeakingSelection(true)
+    tts.speak(text)
+  }
+
+  const stopSpeakSelection = () => {
+    tts.stop()
+    setSpeakingSelection(false)
+  }
+
+  /**
+   * 追问选中文字：对话模式 → 派发 `app:followup` 弹全局追问层（模板追问 +
+   * 当前对话接续）；卡片模式 → 预填输入框「关于「…」：」并聚焦。
+   */
+  const handleSelectionFollowup = (text: string) => {
+    const t = text.trim()
+    if (!t) return
+    const cid = convIdRef.current
+    if (cid) {
+      window.dispatchEvent(
+        new CustomEvent('app:followup', {
+          detail: { text: t.slice(0, 2000), source: 'chat', conversationId: cid },
+        }),
+      )
+      return
+    }
+    const quote = t.replace(/\s+/g, ' ').slice(0, 60)
+    setInput(`关于「${quote}${t.length > 60 ? '…' : ''}」：`)
+    window.setTimeout(() => inputRef.current?.focus(), 60)
+    toast.info('已引用选中内容，输入你的问题吧')
+  }
+
+  /** 长按/右键菜单：按 data-mid 反查消息。 */
+  const resolveMessageByMid = React.useCallback(
+    (mid: string): SelectionMessageInfo | null => {
+      const idx = messages.findIndex((m) => (m.sid ?? m.id) === mid)
+      if (idx < 0) return null
+      const m = messages[idx]
+      return { id: m.id, role: m.role, content: m.content, index: idx }
+    },
+    [messages],
+  )
+
+  /** 删除单条用户消息（长按菜单；服务端同步，失败静默）。 */
+  const deleteUserMessage = (m: UIMessage) => {
+    if (speakingId === m.id) tts.stop()
+    setMessages((prev) => prev.filter((x) => x.id !== m.id))
+    const cid = convIdRef.current
+    if (cid && m.sid) {
+      void fetch(`/api/conversations/${encodeURIComponent(cid)}/messages`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: [m.sid] }),
+      }).catch(() => {})
+    } else if (!cid && cardId && m.sid) {
+      void fetch(`/api/chat-log?id=${encodeURIComponent(m.sid)}`, {
+        method: 'DELETE',
+      }).catch(() => {})
+    }
+    toast.success('已删除该消息')
+  }
+
+  /** 长按/右键消息菜单动作分发（与选择菜单功能对齐）。 */
+  const handleMessageMenuAction = (
+    key: 'speak' | 'copy' | 'followup' | 'select' | 'delete',
+    msg: SelectionMessageInfo,
+  ) => {
+    const target = messages[msg.index]
+    const same = target && target.id === msg.id ? target : undefined
+    switch (key) {
+      case 'speak':
+        if (same) speakMessage(same)
+        break
+      case 'copy':
+        if (same) void copyReply(same)
+        break
+      case 'followup': {
+        const quote = msg.content.replace(/\s+/g, ' ').trim().slice(0, 120)
+        if (quote) handleSelectionFollowup(quote)
+        break
+      }
+      case 'select':
+        setSelectMode(true)
+        setSelectedIds(new Set([msg.id]))
+        break
+      case 'delete':
+        if (!same) break
+        if (same.role === 'assistant') deleteReply(msg.index)
+        else deleteUserMessage(same)
+        break
     }
   }
 
@@ -2325,6 +2998,20 @@ export function ChatTool({
         </div>
       </div>
 
+      {/* 选中文字 / 长按消息菜单：朗读 / 复制 / 追问 / 划重点 / 多选 / 删除 */}
+      <SelectionToolbar
+        containerRef={scrollRef}
+        disabled={selectMode}
+        reading={speakingSelection}
+        onSpeak={speakSelection}
+        onStopSpeak={stopSpeakSelection}
+        onFollowup={handleSelectionFollowup}
+        resolveMessage={resolveMessageByMid}
+        onMessageAction={handleMessageMenuAction}
+        canSelectMessages={inConvMode}
+        speakingMessageId={speakingId}
+      />
+
       {/* pending image thumbnails */}
       {allowImages && pending.length > 0 && (
         <div className="flex flex-wrap gap-2 px-1">
@@ -2373,6 +3060,7 @@ export function ChatTool({
           </>
         )}
         <Input
+          ref={inputRef}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onFocus={keepInputVisible}

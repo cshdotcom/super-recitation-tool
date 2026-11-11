@@ -6,7 +6,7 @@ import { Copy, Eraser, Eye, Flag, GripVertical, RotateCcw, Volume2 } from 'lucid
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
-import { parseSpanDirective } from '@/lib/inline-style'
+import { tokenizeInlineRuns, type InlineStyleRun } from '@/lib/inline-style'
 import {
   computeBlankRanges,
   occAt,
@@ -41,8 +41,11 @@ interface CharToken {
 }
 
 // ---------------------------------------------------------------------------
-// 轻量富文本内联解析：加粗/斜体/删除线/行内代码/荧光笔/字色/行内公式。
+// 轻量富文本内联解析：加粗/斜体/删除线/行内代码/荧光笔/字色/下划线/字号/行内公式。
 // plain = 去掉标记后的纯文本（挖空关键词与位置都基于 plain 计算）。
+// v2：解析改走共享分词器（src/lib/inline-style.ts），支持任意跨标记嵌套
+// （`**%%u|x%%**`、`%%u|**x**%%`、`==%%fs:18|x%%==`、三层 `**%%u|==x==%%**` …），
+// 嵌套样式叠加渲染；单层格式的 plain/runs 与旧扁平解析器逐字节一致。
 // ---------------------------------------------------------------------------
 
 interface InlineRun {
@@ -62,58 +65,34 @@ interface InlineRun {
   image?: { alt: string; src: string }
 }
 
-const INLINE_RE =
-  /\$\$([^$\n]+?)\$\$|\$([^$\n]+)\$|%%([^|\n]+)\|([^%\n]*)%%|==([^=\n]+)==|\*\*([^*\n]+)\*\*|~~([^~\n]+)~~|`([^`\n]+)`|\*([^*\n]+)\*|!\[([^\]]*)\]\(([^)]+)\)/g
+/** 把共享分词器的扁平 run 映射为本组件的 InlineRun（cls 由嵌套标记合成） */
+function mapRun(r: InlineStyleRun): InlineRun {
+  const cls = [
+    r.bold && 'font-bold',
+    r.italic && 'italic',
+    r.strike && 'line-through opacity-70',
+    r.highlight && 'rounded-sm bg-amber-300/70 px-0.5 dark:bg-amber-500/40',
+    r.underline && 'underline',
+    r.math && !r.mathDisplay && 'italic text-primary/90',
+  ]
+    .filter(Boolean)
+    .join(' ')
+  return {
+    text: r.text,
+    start: r.start,
+    cls: cls || undefined,
+    code: r.code || undefined,
+    color: r.color,
+    fontSize: r.fontSize,
+    math: r.math,
+    mathDisplay: r.mathDisplay,
+    image: r.image,
+  }
+}
 
 function parseInline(line: string): { runs: InlineRun[]; plain: string } {
-  const runs: InlineRun[] = []
-  let plain = ''
-  let last = 0
-  let m: RegExpExecArray | null
-  INLINE_RE.lastIndex = 0
-  while ((m = INLINE_RE.exec(line)) !== null) {
-    if (m.index > last) {
-      runs.push({ text: line.slice(last, m.index), start: plain.length })
-      plain += line.slice(last, m.index)
-    }
-    if (m[1] !== undefined) {
-      // 行内出现的 $$…$$ 展示公式（同行前有文字时也能渲染）
-      runs.push({ text: m[1], start: plain.length, math: m[1], mathDisplay: true })
-      plain += m[1]
-    } else if (m[2] !== undefined) {
-      runs.push({ text: m[2], start: plain.length, cls: 'italic text-primary/90', math: m[2] })
-      plain += m[2]
-    } else if (m[3] !== undefined) {
-      // %%样式|文字%%：共享解析器支持颜色（#hex/名称）与字号 fs:18，可组合 %%color:#dc2626;fs:18|文%%
-      const st = parseSpanDirective(m[3])
-      runs.push({ text: m[4] ?? '', start: plain.length, color: st.color, fontSize: st.fontSize })
-      plain += m[4] ?? ''
-    } else if (m[5] !== undefined) {
-      runs.push({ text: m[5], start: plain.length, cls: 'rounded-sm bg-amber-300/70 px-0.5 dark:bg-amber-500/40' })
-      plain += m[5]
-    } else if (m[6] !== undefined) {
-      runs.push({ text: m[6], start: plain.length, cls: 'font-bold' })
-      plain += m[6]
-    } else if (m[7] !== undefined) {
-      runs.push({ text: m[7], start: plain.length, cls: 'line-through opacity-70' })
-      plain += m[7]
-    } else if (m[8] !== undefined) {
-      runs.push({ text: m[8], start: plain.length, code: true })
-      plain += m[8]
-    } else if (m[9] !== undefined) {
-      runs.push({ text: m[9], start: plain.length, cls: 'italic' })
-      plain += m[9]
-    } else if (m[10] !== undefined) {
-      // 行内图片（alt 可含 / 等特殊字符）：原位渲染，不进入 plain、不可挖空，
-      // 从而 alt 与 base64 永不会作为可见文本泄漏
-      runs.push({ text: '', start: plain.length, image: { alt: m[10], src: m[11] ?? '' } })
-    }
-    last = m.index + m[0].length
-  }
-  if (last < line.length) {
-    runs.push({ text: line.slice(last), start: plain.length })
-    plain += line.slice(last)
-  }
+  const { runs: tokenRuns, plain } = tokenizeInlineRuns(line)
+  const runs = tokenRuns.map(mapRun)
   if (runs.length === 0 && line) runs.push({ text: line, start: 0 })
   return { runs, plain }
 }
@@ -1801,8 +1780,9 @@ export function ClozeText({
         const nextBlank = ctx.blanks.find((bb) => bb.start > pos && bb.start < runEndAbs)
         const segEnd = nextBlank ? Math.min(nextBlank.start, runEndAbs) : runEndAbs
         const segPlain = pPlain.slice(pos - pStart, segEnd - pStart)
+        // 嵌套组合时（如 **`代码`** 加粗套行内代码）样式叠加，而非二选一
         const runCls = run.code
-          ? 'rounded bg-muted px-1 py-0.5 font-mono text-[0.92em]'
+          ? cn('rounded bg-muted px-1 py-0.5 font-mono text-[0.92em]', run.cls)
           : run.cls
         const styleProp =
           run.color || run.fontSize

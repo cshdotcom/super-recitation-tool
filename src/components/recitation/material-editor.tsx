@@ -85,7 +85,7 @@ import { FreeCropBox, type CropBox, type CropOffset } from '@/components/recitat
 
 import type { CardData, MaterialBlock } from '@/lib/types'
 import { extractClozeMarks, wrapClozeMark } from '@/lib/editor-cloze'
-import { parseSpanDirective, spanStyleCss } from '@/lib/inline-style'
+import { expandSpanDirectives } from '@/lib/inline-style'
 import { transformImage } from '@/lib/image-transform'
 import { cn } from '@/lib/utils'
 import { VoiceInput } from '@/components/recitation/voice-input'
@@ -145,6 +145,12 @@ const LINE_OPTIONS = [
   { label: '标准', value: 1.7 },
   { label: '宽松', value: 2 },
 ] as const
+
+// 选中文字字号（%%fs:N|文字%%）：预设档 + 自定义档（10–48px 任意整数，
+// 与共享解析器 clampPx 的夹取范围一致）
+const FONT_SIZE_PRESETS = [12, 14, 16, 18, 20, 24, 28] as const
+const FONT_SIZE_MIN = 10
+const FONT_SIZE_MAX = 48
 
 const TABLE_TEMPLATE = [
   '| 表头 1 | 表头 2 | 表头 3 |',
@@ -328,20 +334,108 @@ function buildTableTemplate(rows: number, cols: number): string {
   return [head, sep, ...body].join('\n') + '\n'
 }
 
-/** 预览用：把 {{挖空}} 显示为加粗（关键词提取用 extractClozeMarks） */
+/** 样式(Aa) 弹层：选中文字字号选择器 —— 预设 7 档 + 「自定义」展开输入框（10–48px）
+ *  应用后以 %%fs:N|选中文字%% 包裹（insertMarkdown 处理选区/占位文字）。 */
+function FontSizePicker({ onPick }: { onPick: (px: number) => void }) {
+  const [customOpen, setCustomOpen] = React.useState(false)
+  const [custom, setCustom] = React.useState('')
+
+  const applyCustom = () => {
+    const raw = custom.trim()
+    const n = Math.floor(Number(raw))
+    if (!raw || !Number.isFinite(n)) {
+      toast.warning('请输入字号数值')
+      return
+    }
+    if (n < FONT_SIZE_MIN || n > FONT_SIZE_MAX) {
+      toast.warning(`自定义字号需在 ${FONT_SIZE_MIN}–${FONT_SIZE_MAX}px 之间`)
+      return
+    }
+    onPick(n)
+    setCustom('')
+    setCustomOpen(false)
+  }
+
+  const presetBtn =
+    'h-9 rounded-lg border border-border text-xs font-medium text-foreground transition-colors hover:bg-muted'
+
+  return (
+    <div>
+      <span className="text-sm font-medium">选中文字字号</span>
+      <div className="mt-2 grid grid-cols-4 gap-1">
+        {FONT_SIZE_PRESETS.map((px) => (
+          <button
+            key={px}
+            type="button"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => onPick(px)}
+            className={presetBtn}
+            title={`把选中文字设为 ${px}px`}
+          >
+            {px}
+          </button>
+        ))}
+        {/* 第 8 格：自定义入口（点开小输入框，10–48px 任意值） */}
+        <button
+          type="button"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => setCustomOpen((v) => !v)}
+          aria-expanded={customOpen}
+          className={cn(
+            presetBtn,
+            'border-dashed text-muted-foreground',
+            customOpen && 'border-solid border-primary text-primary',
+          )}
+          title="自定义字号（10–48px）"
+        >
+          自定义
+        </button>
+        {customOpen && (
+          <div className="col-span-4 mt-1 flex items-center gap-1.5">
+            <Input
+              value={custom}
+              inputMode="numeric"
+              placeholder={`${FONT_SIZE_MIN}-${FONT_SIZE_MAX}`}
+              aria-label="自定义字号（px）"
+              className="h-9 w-24"
+              onChange={(e) => setCustom(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  applyCustom()
+                }
+              }}
+            />
+            <span className="text-xs text-muted-foreground">px</span>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={applyCustom}
+              className="h-9 rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+            >
+              应用
+            </button>
+          </div>
+        )}
+      </div>
+      <p className="mt-1.5 text-[11px] text-muted-foreground">
+        先选中文字，再点字号即可只改选区（不选时插入占位文字）；自定义支持 {FONT_SIZE_MIN}–{FONT_SIZE_MAX}px 任意值
+      </p>
+    </div>
+  )
+}
+
+/** 预览用：{{挖空}} 显示为加粗；==高亮==/%%样式|文字%%/嵌套组合统一走共享展开器
+ *（src/lib/inline-style.ts，与阅读页 rich-content 同一链路，嵌套样式叠加） */
 function toPreviewMarkdown(text: string): string {
-  return String(text ?? '')
-    .replace(/\{\{([^{}]*)\}\}/g, (_m, inner: string) => {
-      const kw = inner.trim()
-      return kw ? `**${kw}**` : inner
-    })
-    // 荧光笔 ==x== → <mark>
-    .replace(/==([^=\n]+)==/g, '<mark>$1</mark>')
-    // 字色/字号 %%dir|文字%% → <span style>（共享解析器，含自定义色与 fs 字号）
-    .replace(/%%([^|\n]+)\|([^%\n]*)%%/g, (_m, dir: string, inner: string) => {
-      const css = spanStyleCss(parseSpanDirective(dir))
-      return css ? `<span style="${css}">${inner}</span>` : inner
-    })
+  // {{挖空}} → **加粗**（关键词提取用 extractClozeMarks）
+  const withCloze = String(text ?? '').replace(/\{\{([^{}]*)\}\}/g, (_m, inner: string) => {
+    const kw = inner.trim()
+    return kw ? `**${kw}**` : inner
+  })
+  // ==高亮== → <mark>；字色/字号/下划线 %%dir|文字%% → <span style>；
+  // 容器内嵌套的 **/* /~~ → <strong>/<em>/<del>（对 react-markdown + rehype-raw 友好）
+  return expandSpanDirectives(withCloze)
 }
 
 // ---------- 块内富媒体引用条：见 media-ref-strip.tsx（图片/表格/导图/公式统一引用机制） ----------
@@ -1900,26 +1994,7 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                 >
                   <div className="space-y-4">
                     {/* 选中文字字号：直接作用于选区（%%fs:N|文字%%），非全局 */}
-                    <div>
-                      <span className="text-sm font-medium">选中文字字号</span>
-                      <div className="mt-2 grid grid-cols-5 gap-1">
-                        {[14, 16, 18, 20, 24].map((px) => (
-                          <button
-                            key={px}
-                            type="button"
-                            onMouseDown={(e) => e.preventDefault()}
-                            onClick={() => insertMarkdown(`%%fs:${px}|`, '%%', '文字')}
-                            className="h-9 rounded-lg border border-border text-xs font-medium text-foreground transition-colors hover:bg-muted"
-                            title={`把选中文字设为 ${px}px`}
-                          >
-                            {px}
-                          </button>
-                        ))}
-                      </div>
-                      <p className="mt-1.5 text-[11px] text-muted-foreground">
-                        先选中文字，再点字号即可只改选区（不选时插入占位文字）
-                      </p>
-                    </div>
+                    <FontSizePicker onPick={(px) => insertMarkdown(`%%fs:${px}|`, '%%', '文字')} />
                     <div className="h-px bg-border" aria-hidden />
                     <div>
                       <div className="flex items-center justify-between">

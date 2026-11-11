@@ -48,8 +48,11 @@ function toRenderContent(ref: MediaRef): string {
     case 'mermaid':
       return '```mermaid\n' + ref.src + '\n```'
     case 'svg':
-      // lang=svg → 围栏原生渲染；lang=html → 裸源码走 HTML 沙盒
+      // lang=svg → 围栏原生渲染；lang=html（旧数据兼容）→ 裸源码走 HTML 沙盒
       return ref.lang === 'svg' ? '```svg\n' + ref.src + '\n```' : ref.src
+    case 'html':
+      // ```html 围栏 → RichContent 的 HTML 沙盒（Shadow DOM 隔离 + 防溢出）渲染
+      return '```html\n' + ref.src + '\n```'
     case 'audio':
     case 'video':
       // 音视频：RichContent 原生识别 [[audio:<uuid>|标题]] 播放器；弹窗另有专用播放区

@@ -17,8 +17,10 @@ import type { QuizReportStats, QuizType, WrongStats } from '@/lib/types'
 
 const QUIZ_TYPES: readonly string[] = ['fill', 'short', 'choice']
 
+/** tzOffsetMin = Date#getTimezoneOffset()（UTC+8 为 -480），当地墙上时间 = UTC − tzOffsetMin
+ *  （原实现 `+ tzOffsetMin` 方向反了：东八区 0:00-8:00 的答题被记到前一天，与 /api/review 同款修正）。 */
 function dayKey(d: Date, tzOffsetMin: number): string {
-  return new Date(d.getTime() + tzOffsetMin * 60000).toISOString().slice(0, 10)
+  return new Date(d.getTime() - tzOffsetMin * 60000).toISOString().slice(0, 10)
 }
 
 function serializeItem(row: {

@@ -13,9 +13,11 @@ const MAX_BG_LENGTH = 400000
 const NAME_MAX = 30
 
 /** Day key 'YYYY-MM-DD' for a date shifted by the client's timezone offset
- *  (same pattern as /api/review). */
+ *  (same pattern as /api/review).
+ *  tzOffsetMin = Date#getTimezoneOffset()（UTC+8 为 -480），当地墙上时间 = UTC − tzOffsetMin
+ *  （原实现 `+ tzOffsetMin` 方向反了：东八区 0:00-8:00 的记录被记到前一天，与 /api/review 同款修正）。 */
 function dayKey(d: Date, tzOffsetMin: number): string {
-  return new Date(d.getTime() + tzOffsetMin * 60000).toISOString().slice(0, 10)
+  return new Date(d.getTime() - tzOffsetMin * 60000).toISOString().slice(0, 10)
 }
 
 type FocusRow = {

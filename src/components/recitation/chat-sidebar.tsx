@@ -5,13 +5,14 @@
 //
 // 功能：
 //   • 对话列表：主对话「AI问问」永远置顶第一位（Sparkles 图标 + 主对话徽标 +
-//     置顶钉；长按/右键/⋮ 菜单仅「清空消息」）+ 置顶分组 + 排序。
+//     置顶钉；长按/右键/⋮ 菜单仅「导出 / 清空消息」）+ 置顶分组 + 排序。
 //   • 排序（头部控件，偏好存 localStorage）：
 //     自定义拖动（@dnd-kit 触摸拖动，PATCH /api/conversations reorder 持久化）
 //     / 最近更新 / 创建时间 / 标题 × 正序/倒序；主对话不参与排序。
-//   • 每行更多菜单：置顶、重命名、AI 智能重命名（PATCH autoRename）、分享
-//     （先选有效期 → POST /api/shares → 复制链接）、导出（格式选择弹窗）、
-//     删除（确认）。主对话仅「清空消息」。
+//   • 每行更多菜单（⋮ 下拉 + 长按/右键同款菜单）：置顶、重命名、
+//     AI 智能重命名（PATCH autoRename）、分享（先选有效期 → POST
+//     /api/shares → 复制链接）、导出（格式选择弹窗）、删除（确认）。
+//     主对话仅「导出 / 清空消息」；批量管理模式下长按菜单禁用。
 //   • 顶部新建对话（类型：自由对话/题目解析/收藏解析/追问）。
 //   • 一级全局搜索：GET /api/conversations?q= →「标题命中」对话列表 +
 //     「内容命中」消息列表（关键词高亮，点击跳转该对话）。
@@ -832,7 +833,7 @@ export function ChatSidebar({
 
   // ---------- 行渲染 ----------
 
-  /** 主对话行：Sparkles 图标 + 主对话徽标 + 置顶钉；长按/右键仅「清空消息」。 */
+  /** 主对话行：Sparkles 图标 + 主对话徽标 + 置顶钉；长按/右键仅「导出/清空消息」。 */
   const renderMainRow = (c: ConversationSummary) => {
     const active = activeConversationId === c.id
     const checked = selected.has(c.id)
@@ -841,9 +842,13 @@ export function ChatSidebar({
         key={c.id}
         className="block w-full"
         actions={[
+          { key: 'export', label: '导出', icon: <Download className="size-4" /> },
           { key: 'clear', label: '清空消息', icon: <Trash2 className="size-4" />, danger: true },
         ]}
-        onAction={() => setClearMainTarget(c)}
+        onAction={(key) => {
+          if (key === 'export') void openExportDialog([c])
+          else setClearMainTarget(c)
+        }}
       >
         <div
           className={cn(
@@ -910,6 +915,10 @@ export function ChatSidebar({
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-40">
+                <DropdownMenuItem onClick={() => void openExportDialog([c])}>
+                  <Download className="size-4" />
+                  导出
+                </DropdownMenuItem>
                 <DropdownMenuItem
                   variant="destructive"
                   onClick={() => setClearMainTarget(c)}
@@ -1042,12 +1051,66 @@ export function ChatSidebar({
         )}
       </div>
     )
+    // 长按/右键菜单（与 ⋮ 更多菜单同款操作；批量管理模式下禁用）
+    const withMenu = manageMode ? (
+      inner
+    ) : (
+      <LongPressMenu
+        className="block w-full"
+        actions={[
+          {
+            key: 'pin',
+            label: c.pinned ? '取消置顶' : '置顶',
+            icon: c.pinned ? <PinOff className="size-4" /> : <Pin className="size-4" />,
+          },
+          { key: 'rename', label: '重命名', icon: <Pencil className="size-4" /> },
+          {
+            key: 'aiRename',
+            label: 'AI 智能重命名',
+            icon:
+              aiRenamingId === c.id ? (
+                <Loader2 className="size-4 animate-spin" />
+              ) : (
+                <Sparkles className="size-4" />
+              ),
+          },
+          { key: 'share', label: '分享', icon: <Share2 className="size-4" /> },
+          { key: 'export', label: '导出', icon: <Download className="size-4" /> },
+          { key: 'delete', label: '删除', icon: <Trash2 className="size-4" />, danger: true },
+        ]}
+        onAction={(key) => {
+          switch (key) {
+            case 'pin':
+              handleTogglePin(c)
+              break
+            case 'rename':
+              setRenameTarget(c)
+              setRenameValue(c.title)
+              break
+            case 'aiRename':
+              void handleAiRename(c)
+              break
+            case 'share':
+              setShareTarget(c)
+              break
+            case 'export':
+              void openExportDialog([c])
+              break
+            case 'delete':
+              setDeleteTarget(c)
+              break
+          }
+        }}
+      >
+        {inner}
+      </LongPressMenu>
+    )
     return sortable ? (
       <SortableRow key={c.id} id={c.id} disabled={manageMode}>
-        {inner}
+        {withMenu}
       </SortableRow>
     ) : (
-      <React.Fragment key={c.id}>{inner}</React.Fragment>
+      <React.Fragment key={c.id}>{withMenu}</React.Fragment>
     )
   }
 

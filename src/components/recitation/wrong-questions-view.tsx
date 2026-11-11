@@ -1,9 +1,13 @@
 'use client'
 
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 import {
+  ArrowUpDown,
+  Check,
   ChevronDown,
   ChevronLeft,
+  Copy,
   Download,
   EyeOff,
   FolderPlus,
@@ -12,16 +16,19 @@ import {
   MoreVertical,
   Play,
   Printer,
+  Search,
   Sparkles,
   Square,
   Star,
   Trash2,
   Volume2,
+  X,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type { AutoRemoveThreshold, QuizItemData, QuizType, WrongStats } from '@/lib/types'
 import { cn } from '@/lib/utils'
+import { useLocalStorage } from '@/lib/use-local-storage'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -91,6 +98,98 @@ const TIME_OPTIONS: { key: TimeKey; label: string }[] = [
 /** 告知 AI 可用富文本格式回答（拼进 user prompt，回答由 RichContent 原样渲染） */
 const RICH_FORMAT_HINT =
   '你可以在回答中使用以下格式，会原样渲染：Markdown（标题/列表/表格/加粗）、LaTeX 公式（$...$ 行内与 $$...$$ 展示）、mermaid 图表（```mermaid 代码块，支持思维导图 mindmap / 树状图 / 流程图）、HTML 片段、代码块。请按需选择最清晰的表达格式。'
+
+// ---------- 排序（与收藏夹同款；useLocalStorage 记忆，key 各自独立） ----------
+type SortKey = 'time-desc' | 'time-asc' | 'alpha-asc' | 'alpha-desc'
+
+const SORT_OPTIONS: { key: SortKey; label: string; short: string }[] = [
+  { key: 'time-desc', label: '时间 · 最新在前', short: '最新在前' },
+  { key: 'time-asc', label: '时间 · 最早在前', short: '最早在前' },
+  { key: 'alpha-asc', label: '题目 · A→Z', short: 'A→Z' },
+  { key: 'alpha-desc', label: '题目 · Z→A', short: 'Z→A' },
+]
+
+/** 搜索：多个关键词（空白分隔）全部命中才算匹配（题目/答案/书名/选项） */
+function matchQuery(item: QuizItemData, q: string): boolean {
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean)
+  if (words.length === 0) return true
+  const hay = [item.question, item.answer, item.cardTitle, ...item.options]
+    .join('\n')
+    .toLowerCase()
+  return words.every((w) => hay.includes(w))
+}
+
+// 高亮搜索命中词（大小写不敏感，最多标 10 处；与目录/搜索浮层同款样式）
+function Highlight({ text, query }: { text: string; query: string }) {
+  if (!query) return <>{text}</>
+  const lower = text.toLowerCase()
+  const ql = query.toLowerCase()
+  const parts: React.ReactNode[] = []
+  let cursor = 0
+  let pos = lower.indexOf(ql)
+  let k = 0
+  while (pos >= 0 && k < 10) {
+    k++
+    if (pos > cursor) parts.push(text.slice(cursor, pos))
+    parts.push(
+      <mark
+        key={`hl-${k}`}
+        className="rounded-sm bg-[#4f5cd1]/15 px-0.5 font-semibold text-[#4f5cd1]"
+      >
+        {text.slice(pos, pos + query.length)}
+      </mark>,
+    )
+    cursor = pos + query.length
+    pos = lower.indexOf(ql, cursor)
+  }
+  parts.push(text.slice(cursor))
+  return <>{parts}</>
+}
+
+/** 触发浏览器下载（CSV/MD/TXT 共用） */
+function downloadBlob(content: string, filename: string, type: string) {
+  const blob = new Blob([content], { type })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+// 空状态简笔画：错题本（浅紫本子 + 黑描边 + 红色 ✗，与收藏夹空态插画同风格）
+function EmptyWrongIllustration() {
+  return (
+    <svg viewBox="0 0 140 120" className="h-28 w-32" fill="none" aria-hidden role="img">
+      {/* 放射短线 */}
+      <path
+        d="M70 26 V12 M48 30 l-7 -10 M92 30 l7 -10 M30 44 l-11 -6 M110 44 l11 -6"
+        stroke="#171717"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+      {/* 本子主体 */}
+      <rect x="34" y="40" width="72" height="60" rx="6" fill="#dcdcfb" stroke="#171717" strokeWidth="2" />
+      {/* 书脊装订线 */}
+      <path d="M44 40 v60" stroke="#171717" strokeWidth="2" strokeLinecap="round" />
+      {/* 内页横线 */}
+      <path
+        d="M52 54 h44 M52 66 h44 M52 78 h30"
+        stroke="#171717"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        opacity="0.45"
+      />
+      {/* 红色 ✗ */}
+      <path
+        d="M84 66 l20 20 M104 66 l-20 20"
+        stroke="#ef4444"
+        strokeWidth="4"
+        strokeLinecap="round"
+      />
+    </svg>
+  )
+}
 
 const DISPLAY_LABEL: Record<string, string> = {
   fill: '填空',
@@ -200,6 +299,10 @@ export function WrongQuestionsView({
   const settings = useSettingsLite()
   const tts = useQuickTts('quiz', settings)
 
+  // ---- 搜索 / 排序（排序用 useLocalStorage 记忆，key 与收藏夹各自独立） ----
+  const [query, setQuery] = React.useState('')
+  const [sortKey, setSortKey] = useLocalStorage<SortKey>('bb-wrong-sort', 'time-desc')
+
   // ---- 筛选 ----
   const [cardFilter, setCardFilter] = React.useState<string>('all')
   const [timeFilter, setTimeFilter] = React.useState<TimeKey>('all')
@@ -235,12 +338,21 @@ export function WrongQuestionsView({
   /** 勾选练习的错题子集（null = 全部筛选错题）。 */
   const [practiceItems, setPracticeItems] = React.useState<QuizItemData[] | null>(null)
 
-  // ---- AI 解析 ----
-  const [explainItem, setExplainItem] = React.useState<QuizItemData | null>(null)
+  // ---- AI 解析（单题）/ AI 批量讲解汇总 + 选中文本追问 ----
+  const [explainItems, setExplainItems] = React.useState<QuizItemData[] | null>(null)
   const [explainLoading, setExplainLoading] = React.useState(false)
   const [explainReply, setExplainReply] = React.useState('')
   const [explainError, setExplainError] = React.useState('')
   const explainAbortRef = React.useRef<AbortController | null>(null)
+  // 选中文本追问（解析 Dialog 内浮动按钮）
+  const [explainFollow, setExplainFollow] = React.useState<{
+    text: string
+    x: number
+    y: number
+  } | null>(null)
+  const explainContentRef = React.useRef<HTMLDivElement>(null)
+  // 课文内容缓存（AI 解析上下文）：cardId -> content（'' = 已知无课文）
+  const cardContentCache = React.useRef(new Map<string, string>())
 
   // ---- 本地「我的答案」记录 ----
   const [userAnswers, setUserAnswers] = React.useState<
@@ -313,8 +425,11 @@ export function WrongQuestionsView({
 
   const filteredItems = React.useMemo(() => {
     const now = Date.now()
-    return items.filter((i) => {
+    const q = query.trim()
+    const passed = items.filter((i) => {
       if (cardFilter !== 'all' && i.cardId !== cardFilter) return false
+      // 搜索：题目 / 答案 / 书名 / 选项多关键词全命中
+      if (q && !matchQuery(i, q)) return false
       if (timeFilter === 'all') return true
       // 按错题产生时间（createdAt）筛选；自定义区间含起止当天
       const t = new Date(i.createdAt).getTime()
@@ -331,7 +446,21 @@ export function WrongQuestionsView({
       if (range.end && t > new Date(`${range.end}T23:59:59.999`).getTime()) return false
       return true
     })
-  }, [items, cardFilter, timeFilter, customRange])
+    // 排序：时间 = 错题收录时间（createdAt，与时间筛选一致）；字母 = 题干中文拼音序
+    const cmp =
+      sortKey === 'time-desc'
+        ? (a: QuizItemData, b: QuizItemData) => b.createdAt.localeCompare(a.createdAt)
+        : sortKey === 'time-asc'
+          ? (a: QuizItemData, b: QuizItemData) => a.createdAt.localeCompare(b.createdAt)
+          : sortKey === 'alpha-asc'
+            ? (a: QuizItemData, b: QuizItemData) =>
+                a.question.localeCompare(b.question, 'zh-CN') ||
+                a.createdAt.localeCompare(b.createdAt)
+            : (a: QuizItemData, b: QuizItemData) =>
+                b.question.localeCompare(a.question, 'zh-CN') ||
+                a.createdAt.localeCompare(b.createdAt)
+    return [...passed].sort(cmp)
+  }, [items, query, cardFilter, timeFilter, customRange, sortKey])
 
   // ---- 时间筛选展示文案 / 自定义区间应用 ----
   // timeActive：时间条件是否真正生效（自定义未确定范围时不算）
@@ -508,6 +637,7 @@ export function WrongQuestionsView({
       return
     }
     setSimilarBusy(true)
+    const tid = toast.loading('AI 正在生成相似新题…')
     try {
       const res = await fetch('/api/quiz', {
         method: 'POST',
@@ -564,9 +694,9 @@ export function WrongQuestionsView({
       })
       setSimilarItems(mapped)
       setMode('similar')
-      toast.success(`已生成 ${mapped.length} 道相似新题`)
+      toast.success(`已生成 ${mapped.length} 道相似新题`, { id: tid })
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : '举一反三失败')
+      toast.error(err instanceof Error ? err.message : '举一反三失败', { id: tid })
     } finally {
       setSimilarBusy(false)
     }
@@ -745,22 +875,84 @@ export function WrongQuestionsView({
     )
   }
 
-  // ---- AI 解析：讲解错题涉及的知识点 ----
-  const openExplain = (item: QuizItemData) => {
+  // ---- AI 解析：讲解错题涉及的知识点（analyze 模式，带课文上下文，与收藏夹同款） ----
+  // 课文内容缓存：一次拉全量卡，后续命中缓存
+  const getCardContent = React.useCallback(async (cardId: string): Promise<string> => {
+    if (!cardId) return ''
+    const cache = cardContentCache.current
+    const hit = cache.get(cardId)
+    if (hit !== undefined) return hit
+    try {
+      const res = await fetch('/api/cards')
+      if (res.ok) {
+        const data = (await res.json()) as { cards?: { id: string; content: string }[] }
+        for (const c of data.cards ?? []) cache.set(c.id, c.content)
+      }
+    } catch {
+      /* 上下文缺省也能解析 */
+    }
+    if (!cache.has(cardId)) cache.set(cardId, '') // 负缓存：该书已删除/无内容
+    return cache.get(cardId) ?? ''
+  }, [])
+
+  const openExplain = async (item: QuizItemData) => {
     explainAbortRef.current?.abort()
     const ctrl = new AbortController()
     explainAbortRef.current = ctrl
-    setExplainItem(item)
+    setExplainItems([item])
     setExplainReply('')
     setExplainError('')
     setExplainLoading(true)
-    const my = userAnswers[userAnswerKey(item.cardId, item.question)]?.userAnswer
+    try {
+      const context = await getCardContent(item.cardId)
+      const my = userAnswers[userAnswerKey(item.cardId, item.question)]?.userAnswer
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          mode: 'analyze',
+          question: item.question,
+          answer: item.answer || undefined,
+          context,
+          extra: my
+            ? `这是学生的错题，学生曾答「${my.slice(0, 200)}」答错了，请针对易错点重点讲解。`
+            : '这是学生的错题，请针对易错点重点讲解。',
+        }),
+      })
+      const data = (await res.json().catch(() => ({}))) as { text?: string; error?: string }
+      if (!res.ok) throw new Error(data.error || 'AI 解析失败')
+      setExplainReply(data.text || '')
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      setExplainError(err instanceof Error ? err.message : 'AI 解析失败')
+      toast.error(err instanceof Error ? err.message : 'AI 解析失败')
+    } finally {
+      if (!ctrl.signal.aborted) setExplainLoading(false)
+    }
+  }
+
+  // ---- AI 批量讲解汇总：勾选多题一次讲完（ask 模式，逐题讲解 + 共性总结，与收藏夹同款） ----
+  const openBatchExplain = (list: QuizItemData[]) => {
+    if (list.length === 0) {
+      toast('请先勾选要讲解的错题')
+      return
+    }
+    const use = list.slice(0, 8)
+    if (list.length > 8) toast('一次最多讲解 8 道题，已取前 8 道')
+    explainAbortRef.current?.abort()
+    const ctrl = new AbortController()
+    explainAbortRef.current = ctrl
+    setExplainItems(use)
+    setExplainReply('')
+    setExplainError('')
+    setExplainLoading(true)
     const lines = [
-      '讲解这道错题涉及的知识点：',
-      `题目：${item.question}`,
-      ...(item.options.length > 0 ? [`选项：${item.options.join('；')}`] : []),
-      `正确答案：${item.answer || '（无标准答案）'}`,
-      ...(my ? [`我的答案：${my}`] : []),
+      `逐题讲解下面 ${use.length} 道错题的知识点与解题思路，最后总结共性易错点：`,
+      ...use.map(
+        (i, n) =>
+          `${n + 1}. [${DISPLAY_LABEL[displayType(i)] ?? i.type}] ${i.question}${i.answer ? `（正确答案：${i.answer}）` : ''}`,
+      ),
       // 告知 AI 可用富文本格式回答（markdown/LaTeX/mermaid/HTML），回答由 RichContent 原样渲染
       RICH_FORMAT_HINT,
     ]
@@ -770,21 +962,19 @@ export function WrongQuestionsView({
       signal: ctrl.signal,
       body: JSON.stringify({
         mode: 'ask',
-        content: item.cardTitle
-          ? `来自卡片「${item.cardTitle}」的错题：${item.question}`
-          : item.question,
+        content: use[0].cardTitle ? `来自卡片「${use[0].cardTitle}」的错题` : '错题讲解',
         messages: [{ role: 'user', content: lines.join('\n') }],
       }),
     })
       .then(async (res) => {
         const data = (await res.json().catch(() => ({}))) as { reply?: string; error?: string }
-        if (!res.ok) throw new Error(data.error || 'AI 解析失败')
+        if (!res.ok) throw new Error(data.error || 'AI 讲解失败')
         setExplainReply(data.reply || '')
       })
       .catch((err) => {
         if (err instanceof DOMException && err.name === 'AbortError') return
-        setExplainError(err instanceof Error ? err.message : 'AI 解析失败')
-        toast.error(err instanceof Error ? err.message : 'AI 解析失败')
+        setExplainError(err instanceof Error ? err.message : 'AI 讲解失败')
+        toast.error(err instanceof Error ? err.message : 'AI 讲解失败')
       })
       .finally(() => {
         if (!ctrl.signal.aborted) setExplainLoading(false)
@@ -793,9 +983,82 @@ export function WrongQuestionsView({
 
   const closeExplain = () => {
     explainAbortRef.current?.abort()
-    setExplainItem(null)
+    setExplainItems(null)
     setExplainLoading(false)
+    setExplainFollow(null)
     tts.stop()
+  }
+
+  // ---- 解析 Dialog：选中文本 → 浮动「🔍 追问」按钮（与收藏夹同款；source:'analysis'） ----
+  const checkExplainSelection = React.useCallback(() => {
+    const container = explainContentRef.current
+    if (!container) {
+      setExplainFollow(null)
+      return
+    }
+    const sel = window.getSelection()
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
+      setExplainFollow(null)
+      return
+    }
+    const raw = sel.toString().trim().replace(/\s+/g, ' ')
+    if (!raw) {
+      setExplainFollow(null)
+      return
+    }
+    const node = sel.anchorNode
+    if (!node) {
+      setExplainFollow(null)
+      return
+    }
+    const el = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement
+    if (!el || !container.contains(el)) {
+      setExplainFollow(null)
+      return
+    }
+    const rect = sel.getRangeAt(0).getBoundingClientRect()
+    const vw = window.innerWidth || 375
+    const vh = window.innerHeight || 667
+    setExplainFollow({
+      text: raw.slice(0, 500),
+      x: Math.min(Math.max(rect.left + rect.width / 2, 96), vw - 96),
+      y: Math.min(rect.bottom + 10, vh - 64),
+    })
+  }, [])
+
+  React.useEffect(() => {
+    if (!explainItems || explainLoading || !explainReply) return
+    document.addEventListener('selectionchange', checkExplainSelection)
+    document.addEventListener('mouseup', checkExplainSelection)
+    document.addEventListener('touchend', checkExplainSelection)
+    return () => {
+      document.removeEventListener('selectionchange', checkExplainSelection)
+      document.removeEventListener('mouseup', checkExplainSelection)
+      document.removeEventListener('touchend', checkExplainSelection)
+      setExplainFollow(null)
+    }
+  }, [explainItems, explainLoading, explainReply, checkExplainSelection])
+
+  const sendExplainFollowup = () => {
+    if (!explainFollow) return
+    window.dispatchEvent(
+      new CustomEvent('app:followup', {
+        detail: {
+          text: explainFollow.text,
+          source: 'analysis',
+          cardId: explainItems?.[0]?.cardId ?? '',
+          cardTitle: explainItems?.[0]?.cardTitle ?? '',
+        },
+      }),
+    )
+    try {
+      window.getSelection()?.removeAllRanges()
+    } catch {
+      /* ignore */
+    }
+    setExplainFollow(null)
+    setExplainItems(null)
+    toast.success('已发送追问')
   }
 
   // ---- 导出 CSV ----
@@ -820,15 +1083,88 @@ export function WrongQuestionsView({
       ]),
     ]
     const csv = '\uFEFF' + rows.map((r) => r.map(esc).join(',')).join('\r\n')
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
     const tag = items && items.length < filteredItems.length ? `_选中${items.length}` : ''
-    a.download = `错题本_${new Date().toISOString().slice(0, 10)}${tag}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
+    downloadBlob(csv, `错题本_${new Date().toISOString().slice(0, 10)}${tag}.csv`, 'text/csv;charset=utf-8')
     toast.success(`已导出 ${list.length} 道错题`)
+  }
+
+  // ---- 导出 Markdown / TXT / 复制（与收藏夹同款格式） ----
+  // items 参数：缺省=当前筛选全部；传入子集=批量导出选中。
+  const exportList = (items?: QuizItemData[]) => {
+    const list = items ?? filteredItems
+    if (list.length === 0) {
+      toast(items ? '未选中任何错题' : '当前筛选下没有错题')
+      return null
+    }
+    return list
+  }
+
+  const buildMD = (list: QuizItemData[]) =>
+    [
+      '# 错题本导出',
+      `> 共 ${list.length} 道 · 导出于 ${new Date().toLocaleString('zh-CN')}`,
+      '',
+      ...list.flatMap((i, n) => [
+        `## ${n + 1}. [${DISPLAY_LABEL[displayType(i)] ?? i.type}] ${i.question}`,
+        `- **我的答案**：${userAnswers[userAnswerKey(i.cardId, i.question)]?.userAnswer || '（未记录）'}`,
+        `- **正确答案**：${i.answer || '（无标准答案）'}`,
+        `- **错误次数**：${i.wrongCount}`,
+        i.cardTitle ? `- **来源**：《${i.cardTitle}》` : '',
+        `- **时间**：${formatDate(i.updatedAt)}`,
+        '',
+      ]),
+    ]
+      .filter((l) => l !== '')
+      .join('\n')
+
+  const buildTXT = (list: QuizItemData[]) =>
+    [
+      `错题本导出（共 ${list.length} 道 · ${new Date().toLocaleString('zh-CN')}）`,
+      '',
+      ...list.flatMap((i, n) => [
+        `${n + 1}. [${DISPLAY_LABEL[displayType(i)] ?? i.type}] ${i.question}`,
+        `   我的答案：${userAnswers[userAnswerKey(i.cardId, i.question)]?.userAnswer || '（未记录）'}`,
+        `   正确答案：${i.answer || '（无标准答案）'}`,
+        `   错误次数：${i.wrongCount}`,
+        i.cardTitle ? `   来源：${i.cardTitle}` : '',
+        `   时间：${formatDate(i.updatedAt)}`,
+        '',
+      ]),
+    ].join('\n')
+
+  const exportMD = (items?: QuizItemData[]) => {
+    const list = exportList(items)
+    if (!list) return
+    const tag = items && items.length < filteredItems.length ? `_选中${items.length}` : ''
+    downloadBlob(
+      buildMD(list),
+      `错题本_${new Date().toISOString().slice(0, 10)}${tag}.md`,
+      'text/markdown;charset=utf-8',
+    )
+    toast.success(`已导出 Markdown（${list.length} 题）`)
+  }
+
+  const exportTXT = (items?: QuizItemData[]) => {
+    const list = exportList(items)
+    if (!list) return
+    const tag = items && items.length < filteredItems.length ? `_选中${items.length}` : ''
+    downloadBlob(
+      buildTXT(list),
+      `错题本_${new Date().toISOString().slice(0, 10)}${tag}.txt`,
+      'text/plain;charset=utf-8',
+    )
+    toast.success(`已导出 TXT（${list.length} 题）`)
+  }
+
+  const copyAll = async (items?: QuizItemData[]) => {
+    const list = exportList(items)
+    if (!list) return
+    try {
+      await navigator.clipboard.writeText(buildTXT(list))
+      toast.success(`已复制 ${list.length} 道错题`)
+    } catch {
+      toast.error('复制失败，请重试')
+    }
   }
 
   // ---- 智能选错题：按错次/收藏/时间自动勾选 ----
@@ -902,6 +1238,10 @@ export function WrongQuestionsView({
     Promise.all([loadStats(), loadItems()])
   }
 
+  // 列表渲染用的排序文案 / 高亮关键词
+  const sortLabel = SORT_OPTIONS.find((s) => s.key === sortKey)?.short ?? '最新在前'
+  const hlQuery = query.trim()
+
   return (
     <div className="min-h-dvh bg-muted/40">
       {/* 打印样式：仅显示题单 */}
@@ -956,6 +1296,15 @@ export function WrongQuestionsView({
                 <DropdownMenuContent align="end">
                   <DropdownMenuItem onClick={() => exportCSV()}>
                     <Download className="size-4" /> 导出 CSV
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => exportMD()}>
+                    <Download className="size-4" /> 导出 Markdown
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => exportTXT()}>
+                    <Download className="size-4" /> 导出 TXT
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => void copyAll()}>
+                    <Copy className="size-4" /> 复制全部
                   </DropdownMenuItem>
                   <DropdownMenuItem onClick={() => window.print()}>
                     <Printer className="size-4" /> 打印
@@ -1041,8 +1390,34 @@ export function WrongQuestionsView({
           </div>
         ) : (
           <>
+            {/* 搜索框：题目 / 答案 / 书名输入即筛（多关键词全命中） */}
+            <div className="relative">
+              <Search
+                className="pointer-events-none absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
+                strokeWidth={2}
+              />
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="搜索题目、答案或书名"
+                aria-label="搜索错题"
+                className="h-10 w-full rounded-full border border-border bg-card pl-10 pr-10 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              {query && (
+                <button
+                  type="button"
+                  aria-label="清除搜索"
+                  onClick={() => setQuery('')}
+                  className="absolute right-1.5 top-1/2 flex size-8 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                >
+                  <X className="size-4" strokeWidth={2} />
+                </button>
+              )}
+            </div>
+
             {/* 筛选行：卡片分类 + 时间 pills（含自定义时间段） */}
-            <div className="flex items-center gap-2 overflow-x-auto pb-1">
+            <div className="mt-3 flex items-center gap-2 overflow-x-auto pb-1">
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button
@@ -1151,27 +1526,61 @@ export function WrongQuestionsView({
               ))}
             </div>
 
-            {/* 错题列表 */}
-            <div className="mb-2 mt-6 flex items-center justify-between">
+            {/* 错题列表 + 排序 */}
+            <div className="mb-2 mt-6 flex items-center justify-between gap-2">
               <h2 className="text-base font-bold">
                 错题列表
                 <span className="ml-1.5 text-xs font-normal text-muted-foreground">
                   {filteredItems.length} 道
                 </span>
+                {selectMode && (
+                  <span className="ml-1 hidden text-xs font-normal text-muted-foreground sm:inline">
+                    长按或点「选择」可多选
+                  </span>
+                )}
               </h2>
-              {selectMode && (
-                <span className="text-xs text-muted-foreground">长按或点「选择」可多选</span>
-              )}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="排序方式"
+                    className="flex h-8 shrink-0 items-center gap-1.5 rounded-full border border-border bg-card px-3.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <ArrowUpDown className="size-3.5 text-muted-foreground" strokeWidth={2} />
+                    {sortLabel}
+                    <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" strokeWidth={2} />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {SORT_OPTIONS.map((s) => (
+                    <DropdownMenuItem
+                      key={s.key}
+                      onClick={() => setSortKey(s.key)}
+                      className={cn(sortKey === s.key && 'font-bold text-red-500')}
+                    >
+                      {s.label}
+                      {sortKey === s.key && <Check className="ml-auto size-3.5" />}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
 
             {filteredItems.length === 0 ? (
-              <div className="rounded-2xl bg-card py-14 text-center text-sm text-muted-foreground">
-                {items.length === 0
-                  ? '暂无错题，快去练习吧'
-                  : timeActive
-                    ? '该时间段没有错题'
-                    : '当前筛选下没有错题'}
-              </div>
+              items.length === 0 ? (
+                <div className="flex flex-col items-center gap-4 pt-4 text-center">
+                  <EmptyWrongIllustration />
+                  <p className="text-sm text-muted-foreground">暂无错题，快去练习吧</p>
+                </div>
+              ) : (
+                <div className="rounded-2xl bg-card py-14 text-center text-sm text-muted-foreground">
+                  {query.trim()
+                    ? `没有找到与「${query.trim().slice(0, 12)}」匹配的错题`
+                    : timeActive
+                      ? '该时间段没有错题'
+                      : '当前筛选下没有错题'}
+                </div>
+              )
             ) : (
               <div className="flex flex-col gap-2.5">
                 {filteredItems.map((item) => {
@@ -1228,7 +1637,7 @@ export function WrongQuestionsView({
                               !isExpanded && 'line-clamp-2',
                             )}
                           >
-                            {item.question}
+                            <Highlight text={item.question} query={hlQuery} />
                           </p>
                         </div>
                         <ChevronDown
@@ -1252,7 +1661,7 @@ export function WrongQuestionsView({
                             <p className="text-sm leading-relaxed">
                               <span className="mr-1 text-xs text-muted-foreground">正确答案：</span>
                               <span className="break-all font-medium text-emerald-700 dark:text-emerald-300">
-                                {item.answer || '（无标准答案）'}
+                                <Highlight text={item.answer || '（无标准答案）'} query={hlQuery} />
                               </span>
                             </p>
                           </div>
@@ -1260,7 +1669,11 @@ export function WrongQuestionsView({
                             <span>
                               错 {item.wrongCount} 次 · 对 {item.rightCount} 次
                             </span>
-                            {item.cardTitle && <span>来源：{item.cardTitle}</span>}
+                            {item.cardTitle && (
+                              <span>
+                                来源：<Highlight text={item.cardTitle} query={hlQuery} />
+                              </span>
+                            )}
                             <span>{formatDate(item.updatedAt)}</span>
                           </div>
                           <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
@@ -1279,7 +1692,7 @@ export function WrongQuestionsView({
                             </button>
                             <button
                               type="button"
-                              onClick={() => openExplain(item)}
+                              onClick={() => void openExplain(item)}
                               className="flex h-9 items-center gap-1.5 rounded-full border border-purple-500/40 px-3.5 text-xs font-medium text-purple-700 transition-colors hover:bg-purple-500/10 dark:text-purple-400"
                             >
                               <GraduationCap className="size-3.5" />
@@ -1388,7 +1801,7 @@ export function WrongQuestionsView({
                 练习所选（{selected.size}）
               </button>
             </div>
-            <div className="mb-2">
+            <div className="mb-2 grid grid-cols-2 gap-2">
               {/* 举一反三：弹方式选择（AI 讲解变式题 / 直接练习相似题）；有选中用所选，无选中用全部筛选错题 */}
               <button
                 type="button"
@@ -1398,29 +1811,62 @@ export function WrongQuestionsView({
                     base: selectedItems.length > 0 ? selectedItems : filteredItems,
                   })
                 }
-                className="flex h-11 w-full items-center justify-center gap-1.5 rounded-xl bg-emerald-600 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-40"
+                className="flex h-11 items-center justify-center gap-1.5 rounded-xl bg-emerald-600 px-1 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:opacity-40"
               >
                 {extendBusy || similarBusy ? (
-                  <Loader2 className="size-4 animate-spin" />
+                  <Loader2 className="size-4 shrink-0 animate-spin" />
                 ) : (
-                  <Sparkles className="size-4" />
+                  <Sparkles className="size-4 shrink-0" />
                 )}
-                举一反三
-                {selectedItems.length > 0
-                  ? `（所选 ${selectedItems.length} 道）`
-                  : `（全部 ${filteredItems.length} 道）`}
+                <span className="truncate">
+                  举一反三
+                  {selectedItems.length > 0
+                    ? `（所选 ${selectedItems.length} 道）`
+                    : `（全部 ${filteredItems.length} 道）`}
+                </span>
+              </button>
+              {/* AI 批量讲解汇总：勾选的错题一次讲完（与收藏夹同款） */}
+              <button
+                type="button"
+                disabled={selected.size === 0 || explainLoading || batchBusy}
+                onClick={() => openBatchExplain(selectedItems)}
+                className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-purple-500/40 bg-card px-1 text-sm font-medium text-purple-700 transition-colors hover:bg-purple-500/10 disabled:opacity-40 dark:text-purple-400"
+              >
+                {explainLoading ? (
+                  <Loader2 className="size-4 shrink-0 animate-spin" />
+                ) : (
+                  <GraduationCap className="size-4 shrink-0" />
+                )}
+                <span className="truncate">AI 讲解（{selected.size}）</span>
               </button>
             </div>
             <div className="grid grid-cols-4 gap-2">
-              <button
-                type="button"
-                disabled={selected.size === 0 || batchBusy}
-                onClick={() => exportCSV(selectedItems)}
-                className="flex h-11 flex-col items-center justify-center gap-0.5 rounded-xl border border-border bg-card text-[11px] font-medium transition-colors hover:bg-accent disabled:opacity-40"
-              >
-                <Download className="size-4" />
-                导出选中
-              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    disabled={selected.size === 0 || batchBusy}
+                    className="flex h-11 flex-col items-center justify-center gap-0.5 rounded-xl border border-border bg-card text-[11px] font-medium transition-colors hover:bg-accent disabled:opacity-40"
+                  >
+                    <Download className="size-4" />
+                    导出选中
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start">
+                  <DropdownMenuItem onClick={() => exportCSV(selectedItems)}>
+                    <Download className="size-4" /> 导出 CSV
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => exportMD(selectedItems)}>
+                    <Download className="size-4" /> 导出 Markdown
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => exportTXT(selectedItems)}>
+                    <Download className="size-4" /> 导出 TXT
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => void copyAll(selectedItems)}>
+                    <Copy className="size-4" /> 复制所选
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
               <button
                 type="button"
                 disabled={selected.size === 0 || batchBusy}
@@ -1511,34 +1957,88 @@ export function WrongQuestionsView({
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* AI 解析弹窗 */}
+      {/* AI 解析 / 批量讲解弹窗（RichContent 渲染 + 选中文本追问） */}
       <Dialog
-        open={!!explainItem}
+        open={!!explainItems}
         onOpenChange={(o) => {
-          if (!o) closeExplain()
+          if (!o && !explainLoading) closeExplain()
         }}
       >
         <DialogContent className="rounded-2xl sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>AI 解析</DialogTitle>
+            <DialogTitle>
+              {explainItems && explainItems.length > 1
+                ? `AI 批量讲解（${explainItems.length} 题）`
+                : 'AI 解析'}
+            </DialogTitle>
             <DialogDescription className="line-clamp-2 text-xs leading-relaxed">
-              {explainItem?.question}
+              {explainItems && explainItems.length > 1
+                ? '逐题讲解所选错题，并总结共性易错点'
+                : explainItems?.[0]?.question}
             </DialogDescription>
           </DialogHeader>
-          <div className="max-h-[60vh] overflow-y-auto overscroll-contain">
+          <div
+            ref={explainContentRef}
+            className="max-h-[60vh] overflow-y-auto overscroll-contain"
+          >
             {explainLoading ? (
               <div className="flex items-center justify-center gap-2 py-10 text-sm text-muted-foreground">
                 <Loader2 className="size-4 animate-spin" />
-                AI 正在解析…
+                {explainItems && explainItems.length > 1
+                  ? `AI 正在讲解 ${explainItems.length} 道题…`
+                  : 'AI 正在解析…'}
               </div>
             ) : explainError ? (
-              <p className="py-8 text-center text-sm text-destructive">{explainError}</p>
+              <div className="flex flex-col items-center gap-3 py-8 text-center">
+                <p className="text-sm text-destructive">{explainError}</p>
+                <Button
+                  variant="outline"
+                  className="rounded-full"
+                  onClick={() => {
+                    if (explainItems && explainItems.length === 1) void openExplain(explainItems[0])
+                    else if (explainItems) openBatchExplain(explainItems)
+                  }}
+                >
+                  重试
+                </Button>
+              </div>
             ) : (
-              <RichContent content={explainReply} />
+              /* 富媒体防护容器：讲解内容绝不撑破弹窗 */
+              <div className="min-w-0 max-w-full break-words">
+                <RichContent content={explainReply} />
+              </div>
             )}
           </div>
+          {!explainLoading && !explainError && explainReply && (
+            <p className="border-t border-border px-4 py-2 text-center text-[11px] text-muted-foreground/80">
+              选中讲解内容中的文字，可继续「追问」
+            </p>
+          )}
         </DialogContent>
       </Dialog>
+
+      {/* 解析弹窗：选中文本 → 浮动「🔍 追问」按钮（portal 到 body，避开 Dialog
+          transform 对 fixed 定位的影响；追问弹层接管，source:'analysis'） */}
+      {explainFollow &&
+        !!explainItems &&
+        createPortal(
+          <button
+            type="button"
+            onClick={sendExplainFollowup}
+            style={{ left: explainFollow.x, top: explainFollow.y }}
+            className="fixed z-[70] -translate-x-1/2 rounded-full border border-emerald-600/40 bg-background px-3.5 py-2 text-xs font-medium text-emerald-700 shadow-lg transition-transform active:scale-95 dark:text-emerald-300"
+          >
+            <span className="flex items-center gap-1.5">
+              <Search className="size-3.5" strokeWidth={2} aria-hidden />
+              追问
+              <span className="max-w-[140px] truncate text-muted-foreground">
+                {explainFollow.text.slice(0, 14)}
+                {explainFollow.text.length > 14 ? '…' : ''}
+              </span>
+            </span>
+          </button>,
+          document.body,
+        )}
 
       {/* 批量举一反三弹窗：AI 变式题讲解（RichContent 渲染）+ 存为试卷 */}
       <Dialog
@@ -1677,6 +2177,7 @@ export function WrongQuestionsView({
           共 {filteredItems.length} 道
           {cardFilter !== 'all' ? ` · ${cardLabel}` : ''}
           {timeFilterText ? ` · ${timeFilterText}` : ''}
+          {hlQuery ? ` · 搜索「${hlQuery}」` : ''}
         </p>
         {filteredItems.map((item, i) => (
           <div key={item.id} className="mb-3 border-b border-neutral-300 pb-2 text-sm">

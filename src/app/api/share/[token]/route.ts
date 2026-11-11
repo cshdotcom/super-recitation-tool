@@ -1,5 +1,6 @@
 // PUBLIC share-view endpoint (no auth).
-// GET /api/share/:token -> { card, share } | 404 { error } | 410 { error }
+// GET /api/share/:token -> { card, share } | { conversation, messages, share }
+//                       | { paper, share } | 404 { error } | 410 { error }
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 
@@ -61,6 +62,37 @@ export async function GET(
           createdAt: m.createdAt.toISOString(),
         })),
         share: {
+          token: share.token,
+          expiresAt: share.expiresAt ? share.expiresAt.toISOString() : null,
+          createdAt: share.createdAt.toISOString(),
+        },
+      })
+    }
+
+    // ---- 试卷分享（refId 指向 source='shared' 的快照试卷，只读快照内容）----
+    if (share.kind === 'paper') {
+      const paper = await db.paper.findUnique({ where: { id: share.refId } })
+      if (!paper) {
+        return NextResponse.json({ error: '分享不存在或已取消' }, { status: 404 })
+      }
+      let items: unknown[] = []
+      try {
+        const parsed: unknown = JSON.parse(paper.items)
+        if (Array.isArray(parsed)) items = parsed
+      } catch {
+        items = []
+      }
+      return NextResponse.json({
+        paper: {
+          title: paper.title,
+          cardTitle: paper.cardTitle,
+          count: items.length,
+          items,
+          createdAt: paper.createdAt.toISOString(),
+        },
+        share: {
+          kind: 'paper',
+          title: share.title || paper.title,
           token: share.token,
           expiresAt: share.expiresAt ? share.expiresAt.toISOString() : null,
           createdAt: share.createdAt.toISOString(),

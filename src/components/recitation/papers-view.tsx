@@ -14,6 +14,9 @@
 //     每题可勾选；全选/反选 + AI 智能勾选（/api/chat mode:'pick'）+ 练习所选；
 //     「开始练习」→ onPractice(items, title) 由宿主接入答题流程；
 //     导出单份 MD / TXT / HTML / PDF（打印）
+//   • 分享：与卡片/对话分享一致 — ⋮ 菜单/详情「分享」→ 有效期（无限/1/7/30/自定义）
+//     → 链接（/s/<token>）+ 复制 + 二维码 + 系统分享；已分享试卷带「已分享」标记，
+//     可更新有效期或取消共享（POST/DELETE /api/shares kind='paper'）
 //
 // API（src/app/api/papers/route.ts）：
 //   GET    /api/papers?cardId=<id> → { papers }（省略 cardId = 全部，时间倒序）
@@ -25,24 +28,31 @@ import {
   BookOpen,
   CalendarRange,
   Check,
+  Copy,
   Download,
   FileCode2,
   FileText,
   FolderOpen,
+  Link2,
   Loader2,
   MoreVertical,
   Pencil,
   Play,
   Printer,
+  QrCode,
   Search,
+  Share2,
   Sparkles,
   Square,
+  SquareArrowOutUpRight,
   Trash2,
 } from 'lucide-react'
+import QRCode from 'qrcode'
 import { toast } from 'sonner'
 
 import { cn } from '@/lib/utils'
 import { RichContent } from '@/components/recitation/rich-content'
+import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import {
   escapeHtml,
   mediaRefsToText,
@@ -52,6 +62,9 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -61,6 +74,7 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
+  AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import {
   Dialog,
@@ -106,6 +120,16 @@ export interface PaperData {
   createdAt: string
   updatedAt: string
 }
+
+/** 试卷分享信息（试卷夹「已分享」标记 + 分享面板复用更新用） */
+interface PaperShareInfo {
+  id: string
+  token: string
+  expiresAt: string | null
+}
+
+/** 分享快照试卷的 source（与 /api/shares 创建逻辑约定一致，不进入试卷夹列表） */
+const PAPER_SNAPSHOT_SOURCE = 'shared'
 
 export interface PapersViewProps {
   /** 当前书本 id（初始选中的书；空串则默认「全部书」） */
@@ -446,6 +470,10 @@ export function PapersView({
   const [batchDeleteOpen, setBatchDeleteOpen] = React.useState(false)
   const [busy, setBusy] = React.useState(false)
 
+  // ---- 分享（「已分享」标记 + 分享面板） ----
+  const [paperShares, setPaperShares] = React.useState<Map<string, PaperShareInfo>>(new Map())
+  const [sharePaperId, setSharePaperId] = React.useState<string | null>(null)
+
   // 书本跟随 props 变化（切换卡片时回到当前书）
   React.useEffect(() => {
     setBookId(cardId || 'all')
@@ -476,11 +504,14 @@ export function PapersView({
       if (!res.ok) throw new Error('加载试卷失败')
       const data = (await res.json()) as { papers?: PaperData[] }
       setPapers(
-        (data.papers ?? []).map((p) => ({
-          ...p,
-          items: Array.isArray(p.items) ? p.items : [],
-          count: typeof p.count === 'number' ? p.count : (p.items ?? []).length,
-        })),
+        (data.papers ?? [])
+          // 分享快照试卷（source='shared'）不进入试卷夹列表
+          .filter((p) => p.source !== PAPER_SNAPSHOT_SOURCE)
+          .map((p) => ({
+            ...p,
+            items: Array.isArray(p.items) ? p.items : [],
+            count: typeof p.count === 'number' ? p.count : (p.items ?? []).length,
+          })),
       )
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '加载试卷失败')
@@ -492,6 +523,36 @@ export function PapersView({
   React.useEffect(() => {
     if (open) void load()
   }, [open, load])
+
+  // ---- 试卷分享状态（GET /api/shares 只取 kind='paper'，按源试卷 id 建索引） ----
+  const loadShares = React.useCallback(async () => {
+    try {
+      const res = await fetch('/api/shares')
+      if (!res.ok) return
+      const data = (await res.json()) as {
+        shares?: Array<{
+          id: string
+          token: string
+          kind: string
+          paperId?: string
+          expiresAt?: string | null
+        }>
+      }
+      const m = new Map<string, PaperShareInfo>()
+      for (const s of data.shares ?? []) {
+        if (s.kind === 'paper' && s.paperId) {
+          m.set(s.paperId, { id: s.id, token: s.token, expiresAt: s.expiresAt ?? null })
+        }
+      }
+      setPaperShares(m)
+    } catch {
+      /* 静默降级：分享状态拉取失败不影响试卷夹主流程 */
+    }
+  }, [])
+
+  React.useEffect(() => {
+    if (open) void loadShares()
+  }, [open, loadShares])
 
   // 书本列表（props 未提供时自行拉取 /api/cards）
   React.useEffect(() => {
@@ -918,11 +979,13 @@ export function PapersView({
                       selected={selected.has(p.id)}
                       expanded={expandedId === p.id}
                       canPractice={!!onPractice}
+                      shareInfo={paperShares.get(p.id) ?? null}
                       onToggleSelect={() => toggleSelect(p.id)}
                       onToggleExpand={() => setExpandedId(expandedId === p.id ? null : p.id)}
                       onPractice={(items) => onPractice?.(items ?? p.items, p.title)}
                       onExport={(fmt) => exportOne(p, fmt)}
                       onRename={() => setRenaming({ id: p.id, title: p.title })}
+                      onShare={() => setSharePaperId(p.id)}
                       onDelete={() => setDeleteId(p.id)}
                     />
                   ))}
@@ -1066,6 +1129,28 @@ export function PapersView({
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
+
+        {/* 试卷分享面板（有效期设置 / 链接 + 二维码 / 取消共享） */}
+        <PaperShareSheet
+          open={!!sharePaperId}
+          onOpenChange={(o) => !o && setSharePaperId(null)}
+          paper={papers.find((p) => p.id === sharePaperId) ?? null}
+          existing={sharePaperId ? (paperShares.get(sharePaperId) ?? null) : null}
+          onCreated={(paperId, info) =>
+            setPaperShares((prev) => {
+              const next = new Map(prev)
+              next.set(paperId, info)
+              return next
+            })
+          }
+          onDeleted={(paperId) =>
+            setPaperShares((prev) => {
+              const next = new Map(prev)
+              next.delete(paperId)
+              return next
+            })
+          }
+        />
       </SheetContent>
     </Sheet>
   )
@@ -1079,11 +1164,13 @@ function PaperCard({
   selected,
   expanded,
   canPractice,
+  shareInfo,
   onToggleSelect,
   onToggleExpand,
   onPractice,
   onExport,
   onRename,
+  onShare,
   onDelete,
 }: {
   paper: PaperData
@@ -1092,12 +1179,16 @@ function PaperCard({
   selected: boolean
   expanded: boolean
   canPractice: boolean
+  /** 该试卷已有的分享（null = 未分享） */
+  shareInfo: PaperShareInfo | null
   onToggleSelect: () => void
   onToggleExpand: () => void
   /** 开始练习：不传 items = 全部题目；传入 = 只练勾选的题 */
   onPractice: (items?: PaperItem[]) => void
   onExport: (fmt: PaperExportFormat) => void
   onRename: () => void
+  /** 打开分享面板 */
+  onShare: () => void
   onDelete: () => void
 }) {
   // ---- 题目勾选（练习所选 / AI 智能勾选；随试卷卡片 key 重建自动清空） ----
@@ -1206,6 +1297,14 @@ function PaperCard({
             {showBook && paper.cardTitle && (
               <span className="max-w-32 truncate">《{paper.cardTitle}》</span>
             )}
+            {shareInfo && (
+              <Badge
+                variant="secondary"
+                className="border border-emerald-600/30 bg-emerald-600/10 px-1.5 text-[10px] text-emerald-700 dark:text-emerald-300"
+              >
+                已分享
+              </Badge>
+            )}
             <span>{formatDate(paper.createdAt)}</span>
           </div>
         </button>
@@ -1223,6 +1322,10 @@ function PaperCard({
             <DropdownMenuContent align="end">
               <DropdownMenuItem onClick={onToggleExpand}>
                 {expanded ? '收起详情' : '查看详情'}
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={onShare}>
+                <Share2 className="size-4" strokeWidth={1.75} />
+                {shareInfo ? '分享（已开启）' : '分享'}
               </DropdownMenuItem>
               <DropdownMenuItem onClick={onRename}>
                 <Pencil className="size-4" strokeWidth={1.75} /> 重命名
@@ -1351,8 +1454,16 @@ function PaperCard({
                 <Play className="size-4" strokeWidth={2} /> 练习所选（{sel.size}）
               </Button>
             )}
-            {/* 导出格式按钮排：MD / TXT / HTML / PDF（打印） */}
+            {/* 分享 + 导出格式按钮排：分享 / MD / TXT / HTML / PDF（打印） */}
             <div className="flex w-full flex-wrap gap-2">
+              <Button
+                variant="outline"
+                onClick={onShare}
+                className="h-11 min-w-0 flex-1 rounded-full border-emerald-600/40 px-2 text-xs text-emerald-700 hover:bg-emerald-600/10 hover:text-emerald-700 dark:text-emerald-300 dark:hover:text-emerald-300"
+              >
+                <Share2 className="size-4 shrink-0" strokeWidth={1.75} />
+                {shareInfo ? '已分享' : '分享'}
+              </Button>
               <Button
                 variant="outline"
                 onClick={() => onExport('md')}
@@ -1404,6 +1515,395 @@ function RoundCheckbox({ checked }: { checked: boolean }) {
         <path d="M20 6 9 17l-5-5" />
       </svg>
     </span>
+  )
+}
+
+// ---------- 试卷分享面板（有效期设置 → 链接 + 二维码 + 系统分享 / 更新 / 取消） ----------
+type PaperExpiryOption = 'inf' | '1' | '7' | '30' | 'custom'
+
+/** 有效期选项 → 天数（0 = 永久）；自定义非法时返回 null */
+function paperExpiryToDays(expiry: PaperExpiryOption, customDays: string): number | null {
+  if (expiry === 'inf') return 0
+  if (expiry === 'custom') {
+    const v = customDays.trim()
+    const n = Number(v)
+    if (!/^\d+$/.test(v) || !Number.isInteger(n) || n < 1 || n > 3650) return null
+    return n
+  }
+  return Number(expiry)
+}
+
+function formatShareExpiry(expiresAt: string | null): string {
+  if (!expiresAt) return '永久有效'
+  const d = new Date(expiresAt)
+  if (Number.isNaN(d.getTime())) return '永久有效'
+  return `有效期至 ${d.toLocaleDateString('zh-CN')}`
+}
+
+function PaperShareSheet({
+  open,
+  onOpenChange,
+  paper,
+  existing,
+  onCreated,
+  onDeleted,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  paper: PaperData | null
+  /** 该试卷已有的分享（null → 走「开启共享」流程；否则展示链接并可更新/取消） */
+  existing: PaperShareInfo | null
+  onCreated: (paperId: string, share: PaperShareInfo) => void
+  onDeleted: (paperId: string) => void
+}) {
+  const [expiry, setExpiry] = React.useState<PaperExpiryOption>('7')
+  const [customDays, setCustomDays] = React.useState('7')
+  const [creating, setCreating] = React.useState(false)
+  const [deleting, setDeleting] = React.useState(false)
+  const [origin, setOrigin] = React.useState('')
+  const [qrUrl, setQrUrl] = React.useState<string | null>(null)
+  const [showQr, setShowQr] = React.useState(false)
+
+  // 每次打开重置（默认 7 天，与卡片/对话分享默认一致）
+  React.useEffect(() => {
+    if (!open) return
+    setOrigin(window.location.origin)
+    setExpiry('7')
+    setCustomDays('7')
+    setShowQr(false)
+  }, [open])
+
+  // 试卷分享链接统一指向 /s/<token>（卡片/对话分享为 /share/<token>）
+  const link = existing && origin ? `${origin}/s/${existing.token}` : ''
+
+  // 生成二维码（链接存在且展开时）
+  React.useEffect(() => {
+    if (!open || !link || !showQr) {
+      setQrUrl(null)
+      return
+    }
+    let alive = true
+    QRCode.toDataURL(link, {
+      width: 480,
+      margin: 2,
+      color: { dark: '#111111', light: '#ffffff' },
+    })
+      .then((url) => {
+        if (alive) setQrUrl(url)
+      })
+      .catch(() => {
+        if (alive) toast.error('二维码生成失败')
+      })
+    return () => {
+      alive = false
+    }
+  }, [open, link, showQr])
+
+  /** 开启/更新共享：POST /api/shares kind='paper'（已分享则复用同一链接并刷新有效期与内容） */
+  const handleCreate = async () => {
+    if (!paper) return
+    const days = paperExpiryToDays(expiry, customDays)
+    if (days === null) {
+      toast.error('自定义有效期需为 1-3650 的整数（天）')
+      return
+    }
+    setCreating(true)
+    try {
+      const res = await fetch('/api/shares', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'create', kind: 'paper', paperId: paper.id, days }),
+      })
+      const data = (await res.json().catch(() => ({}))) as {
+        share?: { id?: string; token?: string; expiresAt?: string | null }
+        error?: string
+      }
+      if (!res.ok || !data.share?.token) throw new Error(data.error || '开启共享失败')
+      onCreated(paper.id, {
+        id: data.share.id ?? '',
+        token: data.share.token,
+        expiresAt: data.share.expiresAt ?? null,
+      })
+      setShowQr(false)
+      toast.success(existing ? '已更新共享' : '共享已开启')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '开启共享失败')
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  /** 取消共享：链接即刻失效（后端一并清理试卷快照） */
+  const handleCancelShare = async () => {
+    if (!paper || !existing) return
+    setDeleting(true)
+    try {
+      const res = await fetch(`/api/shares?ids=${encodeURIComponent(existing.id)}`, {
+        method: 'DELETE',
+      })
+      const data = (await res.json().catch(() => ({}))) as { error?: string }
+      if (!res.ok) throw new Error(data.error || '取消共享失败')
+      onDeleted(paper.id)
+      setShowQr(false)
+      toast.success('已取消共享，链接即刻失效')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '取消共享失败')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const handleCopyLink = async () => {
+    if (!link) return
+    try {
+      await navigator.clipboard.writeText(link)
+      toast.success('链接已复制')
+    } catch {
+      toast.error('复制失败，请长按链接手动复制')
+    }
+  }
+
+  const handleSystemShare = async () => {
+    if (!link || !paper) return
+    const text = `【背书吧】试卷：${paper.title}\n${link}`
+    if (typeof navigator !== 'undefined' && navigator.share) {
+      try {
+        await navigator.share({ title: paper.title, text, url: link })
+        return
+      } catch (err) {
+        // AbortError = 用户取消，静默忽略；其他错误走复制兜底
+        if (err instanceof DOMException && err.name === 'AbortError') return
+      }
+    }
+    try {
+      await navigator.clipboard.writeText(text)
+      toast.success('已复制链接与标题，可粘贴分享')
+    } catch {
+      toast.error('当前环境不支持系统分享')
+    }
+  }
+
+  return (
+    <BottomSheet open={open} onOpenChange={onOpenChange} title="分享试卷">
+      <div className="mt-4 flex-1 space-y-4 overflow-y-auto pb-6">
+        {/* 试卷预览 */}
+        {paper && (
+          <div className="rounded-2xl border border-border bg-card px-4 py-3.5">
+            <p className="truncate text-sm font-bold">{paper.title}</p>
+            <p className="mt-1.5 text-xs text-muted-foreground">
+              共 {paper.count || (paper.items ?? []).length} 题 · {sourceLabel(paper.source)}
+              {paper.cardTitle ? ` · 《${paper.cardTitle}》` : ''}
+            </p>
+          </div>
+        )}
+
+        {existing ? (
+          <>
+            {/* 已开启：链接 + 复制 + 二维码 + 系统分享 */}
+            <div className="rounded-2xl border border-emerald-600/30 bg-emerald-600/5 px-4 py-4">
+              <div className="flex items-center gap-2 text-sm font-bold text-emerald-700 dark:text-emerald-400">
+                <Link2 className="size-4" strokeWidth={1.75} />
+                共享已开启 · {formatShareExpiry(existing.expiresAt)}
+              </div>
+              <div className="mt-3 flex items-center gap-2">
+                <Input
+                  readOnly
+                  value={link}
+                  aria-label="共享链接"
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="h-10 min-w-0 flex-1 rounded-xl font-mono text-xs"
+                />
+                <Button
+                  size="sm"
+                  className="h-10 shrink-0 rounded-full bg-emerald-600 px-4 font-semibold text-white hover:bg-emerald-600/90"
+                  onClick={() => void handleCopyLink()}
+                >
+                  <Copy className="size-4" strokeWidth={1.75} />
+                  复制
+                </Button>
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowQr((v) => !v)}
+                  className={cn(
+                    'flex flex-col items-center gap-1.5 rounded-xl border py-3 text-xs font-medium transition-colors',
+                    showQr
+                      ? 'border-emerald-600/40 bg-emerald-600/10 text-emerald-700 dark:text-emerald-400'
+                      : 'border-border bg-background hover:bg-accent',
+                  )}
+                >
+                  <QrCode className="size-4.5" strokeWidth={1.75} />
+                  二维码
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleSystemShare()}
+                  className="flex flex-col items-center gap-1.5 rounded-xl border border-border bg-background py-3 text-xs font-medium transition-colors hover:bg-accent"
+                >
+                  <SquareArrowOutUpRight className="size-4.5" strokeWidth={1.75} />
+                  系统分享
+                </button>
+              </div>
+              {showQr && (
+                <div className="mt-3 flex flex-col items-center gap-2 rounded-xl bg-background px-4 py-4">
+                  {qrUrl ? (
+                    <img src={qrUrl} alt="共享链接二维码" className="size-48 rounded-xl" />
+                  ) : (
+                    <Skeleton className="size-48 rounded-xl" />
+                  )}
+                  <p className="text-[11px] text-muted-foreground">扫一扫，在手机上打开这份试卷</p>
+                </div>
+              )}
+              <p className="mt-2.5 text-[11px] leading-relaxed text-muted-foreground">
+                任何拥有此链接的人都可查看这份试卷的只读快照；取消共享后链接立即失效。
+              </p>
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    variant="outline"
+                    className="mt-3 h-10 w-full rounded-full border-destructive/40 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                    disabled={deleting}
+                  >
+                    {deleting && <Loader2 className="size-4 animate-spin" />}
+                    取消共享
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent className="rounded-2xl">
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>取消共享？</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      取消后原共享链接将立即失效，无法再访问这份试卷。
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>取消</AlertDialogCancel>
+                    <AlertDialogAction
+                      className="bg-destructive text-white hover:bg-destructive/90"
+                      onClick={() => void handleCancelShare()}
+                    >
+                      确认取消共享
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            </div>
+
+            {/* 调整有效期（更新共享 = 复用同一链接，刷新有效期与内容快照） */}
+            <div className="rounded-2xl border border-border bg-card px-4 py-4">
+              <div className="flex items-center gap-2 text-sm font-bold">
+                <Share2 className="size-4 text-muted-foreground" strokeWidth={1.75} />
+                调整有效期
+              </div>
+              <PaperExpiryPicker
+                expiry={expiry}
+                setExpiry={setExpiry}
+                customDays={customDays}
+                setCustomDays={setCustomDays}
+              />
+              <Button
+                className="mt-4 h-10 w-full rounded-full font-semibold"
+                onClick={() => void handleCreate()}
+                disabled={creating}
+              >
+                {creating && <Loader2 className="size-4 animate-spin" />}
+                更新共享
+              </Button>
+            </div>
+          </>
+        ) : (
+          /* 未开启：有效期选择 + 开启共享 */
+          <div className="rounded-2xl border border-border bg-card px-4 py-4">
+            <div className="flex items-center gap-2 text-sm font-bold">
+              <Share2 className="size-4 text-muted-foreground" strokeWidth={1.75} />
+              选择有效期
+            </div>
+            <PaperExpiryPicker
+              expiry={expiry}
+              setExpiry={setExpiry}
+              customDays={customDays}
+              setCustomDays={setCustomDays}
+            />
+            <Button
+              className="mt-4 h-10 w-full rounded-full font-semibold"
+              onClick={() => void handleCreate()}
+              disabled={creating}
+            >
+              {creating && <Loader2 className="size-4 animate-spin" />}
+              开启共享
+            </Button>
+            <p className="mt-2 text-center text-[11px] text-muted-foreground/70">
+              开启后将生成只读链接 + 二维码，可随时取消
+            </p>
+          </div>
+        )}
+      </div>
+    </BottomSheet>
+  )
+}
+
+// ---------- 有效期单选（无限 / 1 / 7 / 30 / 自定义天数，与卡片/对话分享一致） ----------
+function PaperExpiryPicker({
+  expiry,
+  setExpiry,
+  customDays,
+  setCustomDays,
+}: {
+  expiry: PaperExpiryOption
+  setExpiry: (v: PaperExpiryOption) => void
+  customDays: string
+  setCustomDays: (v: string) => void
+}) {
+  return (
+    <>
+      <RadioGroup
+        value={expiry}
+        onValueChange={(v) => setExpiry(v as PaperExpiryOption)}
+        className="mt-3 gap-2.5"
+      >
+        {(
+          [
+            { value: 'inf', label: '无限（不过期）' },
+            { value: '1', label: '1 天' },
+            { value: '7', label: '7 天' },
+            { value: '30', label: '30 天' },
+            { value: 'custom', label: '自定义' },
+          ] as const
+        ).map((opt) => (
+          <div
+            key={opt.value}
+            className={cn(
+              'flex items-center gap-2.5 rounded-xl border px-3 py-2.5 transition-colors',
+              expiry === opt.value ? 'border-emerald-600/40 bg-emerald-600/5' : 'border-border',
+            )}
+          >
+            <RadioGroupItem value={opt.value} id={`paper-share-expiry-${opt.value}`} />
+            <Label
+              htmlFor={`paper-share-expiry-${opt.value}`}
+              className="flex-1 cursor-pointer text-sm font-medium"
+            >
+              {opt.label}
+            </Label>
+          </div>
+        ))}
+      </RadioGroup>
+
+      {expiry === 'custom' && (
+        <div className="mt-3 flex items-center gap-2">
+          <Input
+            type="number"
+            min={1}
+            max={3650}
+            value={customDays}
+            onChange={(e) => setCustomDays(e.target.value)}
+            placeholder="1-3650"
+            aria-label="自定义天数"
+            className="h-10 w-28 rounded-xl"
+          />
+          <span className="text-sm text-muted-foreground">天（1-3650）</span>
+        </div>
+      )}
+    </>
   )
 }
 

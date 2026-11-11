@@ -14,6 +14,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { chatComplete, extractJSON, extractQuestionObjects } from '@/lib/ai'
 import { getAIConfig } from '@/lib/settings'
+import { stripRecitationMarks } from '@/lib/inline-style'
 import type { QuizQuestion } from '@/lib/types'
 
 /**
@@ -143,6 +144,44 @@ function friendlyUpstreamError(msg: string): string {
   return msg
 }
 
+/**
+ * 出题用课文清洗（纯函数，两步流出题链路）：
+ * - `![alt](url)` → `[图片: alt]`（URL 对模型无意义；图片已由客户端转 dataURI
+ *   走 /api/quiz-points 的 images 视觉链路，此处只留 alt 文字提示）
+ * - `[[audio:uuid|标题]]` / `[[video:uuid|标题]]` → `[音频: 标题]` / `[视频: 标题]`
+ * - 背诵标记剥离干净（出题不该受挖空/行内样式语法干扰，嵌套安全）：
+ *   `%%样式|文字%%` → 文字、`==高亮==` → 文字、`{{挖空}}` → 文字
+ * - 围栏代码块（mermaid/svg 等结构化富媒体）与 LaTeX/表格/加粗等 markdown 原样保留
+ *   （模型可理解其结构）。
+ */
+export function cleanContentForQuiz(raw: string): string {
+  const src = String(raw ?? '')
+  if (!src) return src
+  return src
+    .split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$))/g)
+    .map((part, idx) => {
+      if (idx % 2 === 1) return part // 围栏代码块整体保留
+      if (!part) return part
+      let s = part
+      // 图片引用 → [图片: alt] 文字提示
+      s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_m: string, alt: string) => {
+        const label = String(alt ?? '').trim()
+        return label ? `[图片: ${label}]` : '[图片]'
+      })
+      // 音视频引用 → 文字提示（URL 对模型无意义）
+      s = s.replace(
+        /\[\[(audio|video):[a-f0-9-]+(?:\|([^\]]*))?\]\]/g,
+        (_m: string, kind: string, title?: string) => {
+          const label = (title ?? '').trim() || (kind === 'audio' ? '音频' : '视频')
+          return kind === 'audio' ? `[音频: ${label}]` : `[视频: ${label}]`
+        },
+      )
+      // 背诵标记（嵌套安全，复用共享分词器）：%%…|…%% / ==…== / {{…}}
+      return stripRecitationMarks(s)
+    })
+    .join('')
+}
+
 export async function POST(req: NextRequest) {
   try {
     const account = await getSessionUser()
@@ -239,7 +278,9 @@ export async function POST(req: NextRequest) {
       const keywords: string[] = Array.isArray(body?.keywords)
         ? body.keywords.filter((k: unknown): k is string => typeof k === 'string')
         : []
-      const user = `知识点清单：\n${pointsText}\n\n课文：\n${content.slice(0, MAX_CONTENT)}${
+      // 课文先清洗（图片引用→文字提示、背诵标记剥离；围栏/公式/表格保留）
+      const cleaned = cleanContentForQuiz(content)
+      const user = `知识点清单：\n${pointsText}\n\n课文：\n${cleaned.slice(0, MAX_CONTENT)}${
         keywords.length > 0 ? `\n\n重点关注词语：${keywords.join('、')}` : ''
       }`
 

@@ -7,8 +7,10 @@ import { ChevronLeft, Eye, MoreHorizontal, Pencil, Plus, Trash2 } from 'lucide-r
 import { toast } from 'sonner'
 
 import type { ReviewPlanData } from '@/lib/types'
+import { useServerState } from '@/lib/use-server-state'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import {
   Dialog,
@@ -34,6 +36,12 @@ interface PlanManagerViewProps {
 }
 
 type Screen = { mode: 'list' } | { mode: 'edit'; plan: ReviewPlanData | null }
+
+// 默认复习计划（可多选）持久化 key。ReviewPlan 模型没有 isDefault 字段，
+// 新增字段需要数据库迁移；这里用服务端 KV（AppState，/api/state）存 id 列表，
+// localStorage 仅作离线镜像 —— 多端同步且无需改 schema。
+// 生效链路：这里勾选 → 「待复习」页读取同一 key → 按卡片创建日期生成今日复习项。
+const DEFAULT_PLANS_KEY = 'beishuba-default-plans'
 
 // Preset day options in the day-picker dialog (0 = 现在).
 const DAY_OPTIONS = [0, 1, 2, 3, 4, 5, 7, 10, 14, 21, 30]
@@ -69,6 +77,8 @@ export function PlanManagerView({ onBack }: PlanManagerViewProps) {
   const [plans, setPlans] = React.useState<ReviewPlanData[]>([])
   const [loading, setLoading] = React.useState(true)
   const [screen, setScreen] = React.useState<Screen>({ mode: 'list' })
+  // 默认计划（多选）：勾选后其「今日复习项」进入待复习队列
+  const [defaultIds, setDefaultIds] = useServerState<string[]>(DEFAULT_PLANS_KEY, [])
 
   const refresh = React.useCallback(async () => {
     try {
@@ -90,20 +100,55 @@ export function PlanManagerView({ onBack }: PlanManagerViewProps) {
     void refresh()
   }, [refresh])
 
-  const handleSaved = React.useCallback(() => {
-    setScreen({ mode: 'list' })
-    void refresh()
-  }, [refresh])
+  // 切换默认计划（可同时勾选多个）
+  const toggleDefault = React.useCallback(
+    (plan: ReviewPlanData) => {
+      const has = defaultIds.includes(plan.id)
+      setDefaultIds(
+        has ? defaultIds.filter((id) => id !== plan.id) : [...defaultIds, plan.id],
+      )
+      toast.success(
+        has
+          ? `已取消「${plan.name}」的默认`
+          : `已设为默认：「${plan.name}」的今日复习项将出现在待复习列表`,
+      )
+    },
+    [defaultIds, setDefaultIds],
+  )
+
+  const handleSaved = React.useCallback(
+    (createdId?: string, setDefault?: boolean) => {
+      // 新建计划时勾了「设为默认」→ 保存后直接加入默认列表
+      if (createdId && setDefault && !defaultIds.includes(createdId)) {
+        setDefaultIds([...defaultIds, createdId])
+        toast.success('已设为默认计划')
+      }
+      setScreen({ mode: 'list' })
+      void refresh()
+    },
+    [defaultIds, refresh, setDefaultIds],
+  )
+
+  // 删除计划后同步清理默认列表里的悬空 id
+  const handleDeleted = React.useCallback(
+    (id: string) => {
+      setDefaultIds((prev) => prev.filter((x) => x !== id))
+    },
+    [setDefaultIds],
+  )
 
   if (screen.mode === 'list') {
     return (
       <ListScreen
         plans={plans}
         loading={loading}
+        defaultIds={defaultIds}
+        onToggleDefault={toggleDefault}
         onBack={onBack}
         onNew={() => setScreen({ mode: 'edit', plan: null })}
         onEdit={(plan) => setScreen({ mode: 'edit', plan })}
         onChanged={refresh}
+        onDeleted={handleDeleted}
       />
     )
   }
@@ -123,17 +168,25 @@ export function PlanManagerView({ onBack }: PlanManagerViewProps) {
 function ListScreen({
   plans,
   loading,
+  defaultIds,
+  onToggleDefault,
   onBack,
   onNew,
   onEdit,
   onChanged,
+  onDeleted,
 }: {
   plans: ReviewPlanData[]
   loading: boolean
+  /** 默认计划 id 列表（可多选） */
+  defaultIds: string[]
+  onToggleDefault: (plan: ReviewPlanData) => void
   onBack: () => void
   onNew: () => void
   onEdit: (plan: ReviewPlanData) => void
   onChanged: () => Promise<void>
+  /** 删除成功后回调（清理默认列表悬空 id） */
+  onDeleted: (id: string) => void
 }) {
   const [deleteTarget, setDeleteTarget] = React.useState<ReviewPlanData | null>(null)
   // Optimistic tombstones for just-deleted plans (cleared after refresh).
@@ -157,6 +210,7 @@ function ListScreen({
         throw new Error(err.error || '删除失败')
       }
       setRemovedIds((prev) => new Set(prev).add(target.id))
+      onDeleted(target.id)
       toast.success('已删除', { id: tid })
     } catch (err) {
       toast.error('删除失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
@@ -165,13 +219,18 @@ function ListScreen({
       // Refresh from the server, then drop the tombstone once fresh data lands.
       void onChanged().then(() => setRemovedIds(new Set()))
     }
-  }, [deleteTarget, onChanged])
+  }, [deleteTarget, onChanged, onDeleted])
 
   return (
     <>
       <ViewHeader title="复习计划管理" onBack={onBack} />
 
-      <main className="mx-auto w-full max-w-2xl flex-1 px-4 pb-28 pt-8">
+      <main className="mx-auto w-full max-w-2xl flex-1 px-4 pb-28 pt-6">
+        {/* 默认计划说明 */}
+        <p className="mb-4 rounded-2xl bg-muted/60 px-4 py-3 text-xs leading-relaxed text-muted-foreground">
+          勾选「默认」可同时设多个计划：系统会按每张背书卡的创建日期，在计划安排的
+          第 0/1/2/4/7… 天自动生成今日复习项，出现在「待复习」列表中（带「计划」徽标）
+        </p>
         {loading ? (
           <div className="flex flex-col gap-4">
             <Skeleton className="h-32 rounded-2xl" />
@@ -188,6 +247,8 @@ function ListScreen({
               <PlanCard
                 key={plan.id}
                 plan={plan}
+                isDefault={defaultIds.includes(plan.id)}
+                onToggleDefault={() => onToggleDefault(plan)}
                 onEdit={() => onEdit(plan)}
                 onDelete={() => setDeleteTarget(plan)}
               />
@@ -239,17 +300,48 @@ function ListScreen({
 
 function PlanCard({
   plan,
+  isDefault,
+  onToggleDefault,
   onEdit,
   onDelete,
 }: {
   plan: ReviewPlanData
+  isDefault: boolean
+  onToggleDefault: () => void
   onEdit: () => void
   onDelete: () => void
 }) {
   const scheduleText = `复习 ${plan.days.length} 次 · ${plan.days.map(dayLabel).join(' / ')}`
 
   return (
-    <div className="relative rounded-2xl border-0 bg-card px-6 py-8 text-center shadow-sm">
+    <div
+      className={cn(
+        'relative rounded-2xl border-0 bg-card px-6 py-8 text-center shadow-sm',
+        isDefault && 'ring-1 ring-emerald-600/40',
+      )}
+    >
+      {/* 默认计划勾选（可多选）：勾选后按卡片创建日期生成今日复习项 */}
+      <button
+        type="button"
+        role="checkbox"
+        aria-checked={isDefault}
+        aria-label={isDefault ? `取消默认计划：${plan.name}` : `设为默认计划：${plan.name}`}
+        onClick={onToggleDefault}
+        className="absolute left-3 top-3 flex items-center gap-1.5 rounded-full px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Checkbox
+          checked={isDefault}
+          className="pointer-events-none size-4"
+          tabIndex={-1}
+          aria-hidden
+        />
+        默认
+      </button>
+      {isDefault && (
+        <span className="absolute right-12 top-4 rounded-full border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
+          已生效
+        </span>
+      )}
       <h3 className="text-2xl font-bold">{plan.name}</h3>
       {plan.builtIn ? (
         <div className="mt-3 px-2">
@@ -401,13 +493,16 @@ function EditScreen({
   plan: ReviewPlanData | null
   readOnly?: boolean
   onCancel: () => void
-  onSaved: () => void
+  /** 保存成功回调；新建计划时回传（新计划 id, 是否设为默认） */
+  onSaved: (createdId?: string, setDefault?: boolean) => void
 }) {
   const [name, setName] = React.useState(plan?.name ?? '')
   // 新计划从 0 行开始；查看/编辑现有计划时从已有天数开始。
   const [days, setDays] = React.useState<number[]>(plan ? [...plan.days] : [])
   const [saving, setSaving] = React.useState(false)
   const [dayDialogRow, setDayDialogRow] = React.useState<number | null>(null)
+  // 新建计划时可同时勾选「设为默认计划」（保存后立即生效）
+  const [defaultChecked, setDefaultChecked] = React.useState(false)
 
   const canSave = !readOnly && name.trim().length > 0 && days.length > 0 && !saving
 
@@ -445,13 +540,15 @@ function EditScreen({
         const err = await res.json().catch(() => ({}))
         throw new Error(err.error || '保存失败')
       }
+      // 新建时接口返回完整计划（含 id），用于回传「设为默认」
+      const created = (await res.json().catch(() => ({}))) as { id?: string }
       toast.success('已保存', { id: tid })
-      onSaved()
+      onSaved(plan ? undefined : created.id, defaultChecked)
     } catch (err) {
       toast.error('保存失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
       setSaving(false)
     }
-  }, [canSave, days, name, onSaved, plan])
+  }, [canSave, days, defaultChecked, name, onSaved, plan])
 
   return (
     <>
@@ -546,6 +643,22 @@ function EditScreen({
             </>
           )}
         </div>
+
+        {/* 新建时可同时设为默认计划 */}
+        {!readOnly && !plan && (
+          <label className="mb-4 mt-6 flex cursor-pointer items-center gap-2.5 rounded-2xl bg-card px-4 py-3.5 shadow-sm">
+            <Checkbox
+              checked={defaultChecked}
+              onCheckedChange={(v) => setDefaultChecked(v === true)}
+              aria-label="保存后设为默认计划"
+              className="size-5"
+            />
+            <span className="text-sm font-medium">保存后设为默认计划</span>
+            <span className="ml-auto text-xs text-muted-foreground">
+              今日复习项将进入待复习列表
+            </span>
+          </label>
+        )}
 
         {/* 取消 / 保存 */}
         <div className="mb-8 mt-10 flex gap-4">

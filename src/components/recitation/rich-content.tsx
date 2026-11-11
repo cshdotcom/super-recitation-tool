@@ -14,6 +14,9 @@
 //   • ```mermaid blocks rendered as SVG (mermaid lazy-loaded, re-rendered on
 //     theme change, error fallback falls back to a plain code block)
 //   • ```svg fenced blocks render natively (sanitized), like raw <svg> segments
+//   • ```html fenced blocks render inside a Shadow-DOM sandbox (sanitized, width-
+//     bounded, scroll-contained) with the unified floating action bar (detail /
+//     download); bare raw-HTML lines keep the same sandbox path as before
 //   • raw <svg>…</svg> segments in the content render natively (sanitized)
 //   • audio/video references — [[audio:<uuid>]] / [[video:<uuid>|标题]] — render
 //     as native players (rounded card with title + <audio> bar / <video max-h-72>),
@@ -409,9 +412,11 @@ const HTML_BLOCK_OPEN_RE = /^\s*<(?:\/[a-zA-Z]|[a-zA-Z][a-zA-Z0-9-]*[\s/>]|!)/
 /** Split a markdown segment into regular markdown and raw HTML blocks.
  *  An HTML block runs from its opening line to the first blank line
  *  (CommonMark type-6 rule); everything inside is treated as user HTML.
- *  Lines inside ``` / ~~~ fenced code are never captured — a fenced ```html
- *  block keeps rendering as a code block, only bare raw-HTML lines (and the
- *  bare html snippets ClozeText passes for ```html fences) are sandboxed. */
+ *  Lines inside ``` / ~~~ fenced code are never captured here — fenced blocks
+ *  stay intact for react-markdown, whose `pre` mapping then routes ```html
+ *  fences to HtmlFencedBlock (sandbox) and keeps other fences as code blocks.
+ *  Bare raw-HTML lines (and the bare html snippets ClozeText passes for
+ *  ```html fences) still take this sandbox path unchanged. */
 function splitHtmlSegments(content: string): Array<{ type: 'md' | 'html'; value: string }> {
   const out: Array<{ type: 'md' | 'html'; value: string }> = []
   const lines = content.split('\n')
@@ -600,6 +605,28 @@ function MermaidBlock({ code, ctx }: { code: string; ctx: MediaCtx }) {
 function SvgFencedBlock({ code, ctx }: { code: string; ctx: MediaCtx }) {
   const html = sanitizeEmbeddedHtml(code)
   return <SvgSegment html={html} ctx={ctx} />
+}
+
+/** ```html 围栏块 → Shadow DOM 沙盒渲染（与裸 HTML 块同一隔离内核：
+ *  sanitizeEmbeddedHtml 去 script/on* 事件 / js: + width-bounded + scroll-contained
+ *  防溢出），带悬浮操作条（详情 / 下载 .html）。 */
+function HtmlFencedBlock({ code, ctx }: { code: string; ctx: MediaCtx }) {
+  const html = sanitizeEmbeddedHtml(code)
+  const body = (
+    <div className="my-3 max-w-full overflow-hidden rounded-xl border border-border bg-background p-3">
+      <HtmlSandbox html={html} />
+    </div>
+  )
+  if (!ctx.interactive) return body
+  return (
+    <div className="group relative my-3">
+      {body}
+      <MediaActionBar
+        onDetail={() => ctx.onDetail({ kind: 'html', src: code })}
+        onDownload={() => downloadMediaSrc('html', code, 'html')}
+      />
+    </div>
+  )
 }
 
 // ---------- code blocks ----------
@@ -960,6 +987,10 @@ function buildMarkdownComponents(ctx: MediaCtx): Components {
       if (classNames.includes('language-svg')) {
         return <SvgFencedBlock code={raw} ctx={ctx} />
       }
+      // ```html 围栏 → 沙盒渲染（不再作为纯代码块展示）
+      if (classNames.includes('language-html')) {
+        return <HtmlFencedBlock code={raw} ctx={ctx} />
+      }
       const lang = /language-([A-Za-z0-9_-]+)/.exec(classNames)?.[1] ?? ''
       return (
         <CodeBlock raw={raw} ctx={ctx} lang={lang}>
@@ -1128,6 +1159,16 @@ function MediaDetailOverlay({
       content = (
         <div ref={stageRef} className="max-h-[76dvh] max-w-[92vw] overflow-auto rounded-xl bg-white p-4">
           <RichContent content={'```svg\n' + detail.src + '\n```'} mediaInteractive={false} />
+        </div>
+      )
+      break
+    case 'html':
+      content = (
+        <div
+          ref={stageRef}
+          className="max-h-[76dvh] max-w-[94vw] overflow-auto rounded-xl bg-background p-4 text-foreground"
+        >
+          <RichContent content={'```html\n' + detail.src + '\n```'} mediaInteractive={false} />
         </div>
       )
       break
