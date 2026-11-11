@@ -1,0 +1,75 @@
+name: Parse API production test
+
+# 真实生产环境解析测试：构建 standalone → 启动 server.js → 对 /api/parse
+# 逐格式（txt/docx/epub/xlsx/pptx/srt/md）真实上传解析断言。
+# 用于定位「生产环境文件无法解析」问题（dev 可用 ≠ 生产可用）。
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  parse-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: bun run db:generate
+        env:
+          DATABASE_URL: file:/tmp/parse-test/test.db
+
+      - name: Build standalone
+        run: bun run build
+        env:
+          DATABASE_URL: file:/tmp/parse-test/test.db
+          NEXT_TELEMETRY_DISABLED: 1
+
+      - name: Copy static assets into standalone
+        run: |
+          cp -r .next/static .next/standalone/.next/ 2>/dev/null || true
+          cp -r public .next/standalone/ 2>/dev/null || true
+
+      - name: Push DB schema
+        run: ./node_modules/.bin/prisma db push --skip-generate --accept-data-loss
+        env:
+          DATABASE_URL: file:/tmp/parse-test/test.db
+
+      - name: Start production server
+        working-directory: .next/standalone
+        run: |
+          mkdir -p /tmp/parse-test
+          DATABASE_URL=file:/tmp/parse-test/test.db PORT=3128 HOSTNAME=127.0.0.1 NODE_ENV=production \
+            node server.js > /tmp/parse-test/server.log 2>&1 &
+          echo $! > /tmp/parse-test/server.pid
+          for i in $(seq 1 60); do
+            if curl -s -o /dev/null http://127.0.0.1:3128/ ; then
+              echo "server ready after ${i}s"; break
+            fi
+            sleep 1
+          done
+          curl -s -o /dev/null -w "root status: %{http_code}\n" http://127.0.0.1:3128/ || true
+
+      - name: Run parse tests
+        run: node scripts/parse-prod-test.mjs
+
+      - name: Print server log on failure
+        if: failure()
+        run: |
+          echo "===== SERVER LOG (last 200 lines) ====="
+          tail -200 /tmp/parse-test/server.log || true
+          echo "===== STANDALONE node_modules check ====="
+          ls .next/standalone/node_modules 2>/dev/null | head -20 || echo "no node_modules in standalone"
+
+      - name: Stop server
+        if: always()
+        run: |
+          kill $(cat /tmp/parse-test/server.pid) 2>/dev/null || true
