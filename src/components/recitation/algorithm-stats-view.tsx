@@ -202,7 +202,7 @@ export function AlgorithmStatsView({ onBack, onOpenCard }: AlgorithmStatsViewPro
     data && data.today.total > 0 ? data.today.right / data.today.total : null
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="fixed inset-0 z-[70] flex flex-col bg-muted/40">
       {/* Sticky header */}
       <header className="sticky top-0 z-20 flex h-14 shrink-0 items-center gap-2 border-b bg-background/95 px-3 backdrop-blur supports-[backdrop-filter]:bg-background/80">
         <Button

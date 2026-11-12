@@ -107,6 +107,20 @@ const ACTION_META: Record<string, { label: string; dot: string }> = {
 
 const REMIND_DAYS = [1, 3, 7]
 
+/** 复习间隔人性化格式化：<1天显示分钟/小时，<30天显示天，<365显示月，否则年 */
+export function fmtReviewInterval(days: number | null | undefined): string {
+  if (days == null || !Number.isFinite(days) || days <= 0) return '不久'
+  if (days < 1 / 1440) return '立即'
+  if (days < 1) {
+    const mins = Math.round(days * 1440)
+    if (mins < 60) return `${mins} 分钟`
+    return `${Math.round(mins / 60)} 小时`
+  }
+  if (days < 30) return `${days.toFixed(days < 10 ? 1 : 0)} 天`
+  if (days < 365) return `${Math.round(days / 30)} 个月`
+  return `${(days / 365).toFixed(1)} 年`
+}
+
 // localStorage（个人偏好，按任务约定不加服务端设置项）
 const ALG_KEY = 'beishuba-review-algorithm'
 const IMMERSIVE_KEY = 'beishuba-review-immersive'
@@ -406,10 +420,12 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
   }
 
   // ---------- 复习会话 ----------
-  const startSession = () => {
+  const startSession = (onlySelected = false) => {
     if (!cards || cards.length === 0 || session) return
+    const pool = onlySelected && selected.size > 0 ? cards.filter((c) => selected.has(c.id)) : cards
+    if (pool.length === 0) return
     setSession({
-      queue: cards.map((c) => ({ ...c })),
+      queue: pool.map((c) => ({ ...c })),
       index: 0,
       results: { again: 0, hard: 0, good: 0, easy: 0 },
       skipped: 0,
@@ -482,7 +498,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
       void bumpTodayProgress(item.id)
       cardStartAtRef.current = Date.now()
       const label = GRADES.find((g) => g.value === grade)?.label ?? grade
-      toast.success(`已评「${label}」· ${data.interval ?? 1} 天后再次复习`, { duration: 1600 })
+      toast.success(`已评「${label}」· 下次 ${fmtReviewInterval(data.interval)} 后复习`, { duration: 1600 })
     } catch (err: unknown) {
       toast.error('评分失败：' + (err instanceof Error ? err.message : '未知错误'))
     } finally {
@@ -673,11 +689,21 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
           <Button
             className="mt-3 h-12 w-full rounded-xl bg-primary text-base font-semibold"
             disabled={!cards || cards.length === 0 || !!session}
-            onClick={startSession}
+            onClick={() => startSession(false)}
           >
             <Play className="size-4" strokeWidth={2} aria-hidden />
             开始复习{cards && cards.length > 0 ? `（${cards.length} 张）` : ''}
           </Button>
+          {selected.size > 0 && (
+            <Button
+              className="mt-2 h-11 w-full rounded-xl border border-emerald-600/50 bg-emerald-500/10 text-base font-semibold text-emerald-700 dark:text-emerald-400"
+              disabled={!cards || cards.length === 0 || !!session}
+              onClick={() => startSession(true)}
+            >
+              <Play className="size-4" strokeWidth={2} aria-hidden />
+              仅复习选中（{selected.size} 张）
+            </Button>
+          )}
         </section>
 
         {cards === null ? (

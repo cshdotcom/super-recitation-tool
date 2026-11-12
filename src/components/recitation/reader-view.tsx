@@ -20,6 +20,7 @@ import {
   MoreHorizontal,
   Network,
   Pencil,
+  Brain,
   Redo2,
   Repeat2,
   Settings2,
@@ -62,6 +63,7 @@ import { MoreSheet, type ClozeTemplate } from '@/components/recitation/more-shee
 import { PlanDialog } from '@/components/recitation/plan-dialog'
 import { ProgressSheet } from '@/components/recitation/progress-sheet'
 import { ReviewScoreBar } from '@/components/recitation/review-score-bar'
+import { AlgorithmConfigDialog } from '@/components/recitation/algorithm-config-dialog'
 import { ShareDialog } from '@/components/recitation/share-dialog'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import NextDynamic from 'next/dynamic'
