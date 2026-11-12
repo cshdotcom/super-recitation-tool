@@ -13,15 +13,18 @@ interface ProgressSheetProps {
   dueChapters: number
   onOverview: () => void
   onPlan: () => void
+  /** 打开复习计划管理（艾宾浩斯模板）；不传则隐藏入口 */
+  onOpenReviewPlans?: () => void
 }
 
-// 本书进度底部弹窗：待复习 N 章 + 复习总览 / 计划管理 两个入口。
+// 本书进度底部弹窗：待复习 N 章 + 复习总览 / 今日目标 / 复习计划 入口。
 export function ProgressSheet({
   open,
   onOpenChange,
   dueChapters,
   onOverview,
   onPlan,
+  onOpenReviewPlans,
 }: ProgressSheetProps) {
   return (
     <BottomSheet open={open} onOpenChange={onOpenChange} className="h-auto">
@@ -63,8 +66,24 @@ export function ProgressSheet({
               'outline-none focus-visible:ring-2 focus-visible:ring-ring',
             )}
           >
-            计划管理
+            今日目标
           </button>
+          {onOpenReviewPlans && (
+            <button
+              type="button"
+              onClick={() => {
+                onOpenChange(false)
+                onOpenReviewPlans()
+              }}
+              className={cn(
+                'col-span-2 flex h-14 items-center justify-center rounded-xl border border-emerald-600/40 bg-emerald-500/5',
+                'text-base font-semibold text-emerald-700 shadow-sm transition-colors hover:bg-emerald-500/10 dark:text-emerald-400',
+                'outline-none focus-visible:ring-2 focus-visible:ring-ring',
+              )}
+            >
+              复习计划管理（艾宾浩斯模板）
+            </button>
+          )}
         </div>
       </div>
     </BottomSheet>

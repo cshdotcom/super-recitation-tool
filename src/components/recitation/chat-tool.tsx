@@ -602,8 +602,8 @@ const SEL_BAR_GAP = 10
 const MSG_MENU_W = 176
 const MSG_ROW_H = 42
 const MSG_MENU_PAD = 14
-/** 长按延时：略晚于系统选词（~500ms），长按文字时优先出现选择菜单。 */
-const LONG_PRESS_MS = 600
+/** 长按延时：晚于系统选词（~500-700ms），避免长按文字时选区菜单与消息菜单同时弹出。 */
+const LONG_PRESS_MS = 800
 const MOVE_TOLERANCE = 10
 const VIEWPORT_INSET = 8
 
@@ -892,15 +892,17 @@ function SelectionToolbar({
       e.preventDefault()
       openMessageMenu(info, e.clientX, e.clientY)
     }
-    // ---- 消息菜单打开时：点菜单外任意处收起 ----
+    // ---- 消息菜单打开时：点菜单外任意处收起（选区条 barRef 也豁免，避免两者短暂并存时误关） ----
     const onDocPointerDown = (e: PointerEvent) => {
       if (!msgMenuRef.current) return
       const menu = menuRef.current
       if (menu && e.target instanceof Node && menu.contains(e.target)) return
+      if (barRef.current && e.target instanceof Node && barRef.current.contains(e.target)) return
       setMsgMenu(null)
     }
-    // ---- 吞掉长按开菜单后紧跟的 click（防误触消息/按钮） ----
+    // ---- 吞掉长按开消息菜单后紧跟的 click（仅当消息菜单仍打开时才吞，避免误吞选区条按钮） ----
     const onClickCapture = (e: MouseEvent) => {
+      if (!msgMenuRef.current) return
       if (Date.now() > suppressClickUntilRef.current) return
       const t = e.target
       if (!(t instanceof Node)) return
@@ -2462,8 +2464,8 @@ export function ChatTool({
           >
             <Plus className="size-4" strokeWidth={1.75} />
           </button>
-          {inConvMode && (
-            <DropdownMenu>
+          {/* ⋮ 更多操作：导出/清空 对所有模式可用；分享/重命名 仅非主对话可用 */}
+          <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button
                   type="button"
@@ -2506,7 +2508,6 @@ export function ChatTool({
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-          )}
         </div>
 
       {/* 对话内搜索条（命中后点击滚动定位） */}
@@ -2880,7 +2881,7 @@ export function ChatTool({
                 {m.role === 'user' ? (
                   <div
                     className={cn(
-                      'max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm bg-primary px-3 py-2 text-sm leading-relaxed text-primary-foreground',
+                      'max-w-[85%] whitespace-pre-wrap break-words rounded-2xl rounded-br-sm bg-primary px-3 py-2 text-sm leading-relaxed text-primary-foreground [-webkit-touch-callout:none] [user-select:text] select-text',
                       selectMode && 'pointer-events-none',
                     )}
                   >
@@ -2908,7 +2909,7 @@ export function ChatTool({
                 ) : (
                   <div
                     className={cn(
-                      'flex w-full flex-col items-start gap-1',
+                      'flex w-full flex-col items-start gap-1 [-webkit-touch-callout:none] [user-select:text] select-text',
                       selectMode && 'pointer-events-none',
                     )}
                   >
@@ -3208,14 +3209,16 @@ export function ChatTool({
   // 底部输入区，Safe Area 与软键盘适配；三种挂载点（根级 Sheet / tools-sheet
   // /其它）自包含可用，Esc 或按钮退出）。
   if (fullscreen) {
-    return createPortal(
+    // 不走 createPortal(document.body)——那会使全屏层脱离宿主 Sheet 子树，
+    // 点击侧边栏按钮时 Radix DismissableLayer 判定 outside-click → 误关 Sheet。
+    // 改为返回 fixed 层（仍在 Sheet 内容子树内，视觉全屏，outside-click 不触发）。
+    return (
       <div
         className="fixed inset-0 z-[70] flex flex-col bg-background px-3 pb-[env(safe-area-inset-bottom)] pt-[max(0.5rem,env(safe-area-inset-top))]"
         style={kbOffset > 0 ? { height: `calc(100dvh - ${kbOffset}px)` } : undefined}
       >
         {chatSurface}
-      </div>,
-      document.body,
+      </div>
     )
   }
   return chatSurface

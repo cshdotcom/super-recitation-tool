@@ -69,6 +69,10 @@ const ReviewStatsView = NextDynamic(
   () => import('@/components/recitation/review-stats-view').then((m) => m.ReviewStatsView),
   { ssr: false, loading: () => <PageSkeleton /> },
 )
+const AlgorithmStatsView = NextDynamic(
+  () => import('@/components/recitation/algorithm-stats-view').then((m) => m.AlgorithmStatsView),
+  { ssr: false, loading: () => <PageSkeleton /> },
+)
 const PlanEditorView = NextDynamic(
   () => import('@/components/recitation/plan-editor-view').then((m) => m.PlanEditorView),
   { ssr: false, loading: () => <PageSkeleton /> },
@@ -225,6 +229,8 @@ export default function Page() {
   // AI 对话侧边栏 + 当前活动对话（对话模式 ChatTool 绑定）
   const [chatSidebarOpen, setChatSidebarOpen] = React.useState(false)
   const [activeConvId, setActiveConvId] = React.useState<string | null>(null)
+  // FSRS 算法统计仪表盘全屏覆盖（从复习统计页 / 待复习页进入）
+  const [algStatsOpen, setAlgStatsOpen] = React.useState(false)
 
   // 主对话「AI问问」：登录后 ensure-main（不存在则创建，isMain/pinned/ord=-1000000），
   // activeConvId 为空时默认绑定主对话 —— 用户未选其他对话时，主页 AI问问 发出的
@@ -526,14 +532,14 @@ export default function Page() {
           error?: string
           truncated?: boolean
         }
-        if (!res.ok || !data.content) throw new Error(data.error || 'AI 标记失败')
+        if (!res.ok || (!data.content && !(data.blocks && data.blocks.length > 0))) throw new Error(data.error || 'AI 标记失败')
         setAiMarkOpen(false)
         setImportOpen(false)
         setEditorMode('create')
         setEditorTitle(payload.title || '')
         setEditorDraft({
           title: payload.title || '',
-          content: data.content,
+          content: data.content || (data.blocks ?? []).map((b) => b.back).join('\n\n'),
           blocks: (data.blocks ?? []).map((b) => ({
             front: b.front ?? '',
             back: b.back ?? '',
@@ -597,7 +603,7 @@ export default function Page() {
           blocks?: { front: string; back: string }[]
           error?: string
         }
-        if (!res.ok || !data.content) throw new Error(data.error || 'AI 标记失败')
+        if (!res.ok || (!data.content && !(data.blocks && data.blocks.length > 0))) throw new Error(data.error || 'AI 标记失败')
         const { content, keywords } = extractClozeMarks(data.content)
         const blocks: MaterialBlock[] =
           data.blocks && data.blocks.length > 0
@@ -1177,6 +1183,7 @@ export default function Page() {
           onOpenMaterialEditor={handleEditContent}
           onOpenOverview={() => setView('review-overview')}
           onOpenPlanEditor={handleOpenPlanEditor}
+          onOpenReviewPlans={() => setView('plan-manager')}
           onStartTts={(c) => {
             // 换书播放冲突：播放中点另一本 → 迷你播放器弹窗（替换/加入待播放列表/取消）
             const res = playbackStart(c)
@@ -1196,6 +1203,7 @@ export default function Page() {
         <ReviewStatsView
           onBack={() => setView('home')}
           onOpenPlanManager={() => setView('plan-manager')}
+          onOpenAlgorithmStats={() => setAlgStatsOpen(true)}
         />
       ) : view === 'review-due' ? (
         <ReviewDueView
@@ -1255,6 +1263,20 @@ export default function Page() {
           onNew={handleNewCard}
         />
       ) : null}
+
+      {/* FSRS 算法统计仪表盘全屏覆盖（从复习统计页头部 / 待复习页进入） */}
+      {algStatsOpen && (
+        <AlgorithmStatsView
+          onBack={() => setAlgStatsOpen(false)}
+          onOpenCard={(id) => {
+            const c = cards.find((x) => x.id === id)
+            if (c) {
+              setAlgStatsOpen(false)
+              handleOpenCard(c)
+            }
+          }}
+        />
+      )}
 
       {importOpen && (
         <ImportSheet

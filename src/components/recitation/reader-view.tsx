@@ -114,6 +114,8 @@ interface ReaderViewProps {
   onOpenOverview?: () => void
   /** 打开制作背书计划（本书进度弹窗 → 计划管理） */
   onOpenPlanEditor?: () => void
+  /** 打开复习计划管理（艾宾浩斯模板） */
+  onOpenReviewPlans?: () => void
   /** 全局朗读：由父级（page.tsx）挂载 TtsPlayer，跨视图持续播放。
    *  提供时本组件不再渲染本地播放器 Sheet，朗读按钮改为调用此回调。 */
   onStartTts?: (card: CardData) => void
@@ -211,6 +213,7 @@ export function ReaderView({
   onOpenMaterialEditor,
   onOpenOverview,
   onOpenPlanEditor,
+  onOpenReviewPlans,
   onStartTts,
 }: ReaderViewProps) {
   // reading state
@@ -1395,6 +1398,7 @@ export function ReaderView({
         dueChapters={1}
         onOverview={() => onOpenOverview?.()}
         onPlan={() => onOpenPlanEditor?.()}
+        onOpenReviewPlans={onOpenReviewPlans ? () => onOpenReviewPlans?.() : undefined}
       />
 
       {/* 规则挖空（编辑模式底部工具） */}

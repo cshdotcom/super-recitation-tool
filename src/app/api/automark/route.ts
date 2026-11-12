@@ -305,8 +305,12 @@ export async function POST(req: NextRequest) {
       front: b.front,
       back: sanitizeMarks(b.back),
     }))
-    if (!markedContent.trim() && parseFailed && /\{\{|==|%%|\*\*/.test(rawText)) {
-      // 兜底：原文即标记结果
+    // 兜底1：content 空但 blocks 非空 → 用 blocks 的 back 拼接还原 content
+    if (!markedContent.trim() && markedBlocks.length > 0) {
+      markedContent = markedBlocks.map((b) => b.back).join('\n\n')
+    }
+    // 兜底2：content 与 blocks 均空，但原文含标记符号或 parseFailed → 用原文
+    if (!markedContent.trim() && (parseFailed || /\{\{|==|%%|\*\*/.test(rawText)) && rawText.trim()) {
       markedContent = sanitizeMarks(rawText.trim().slice(0, MAX_CHARS))
       markedBlocks = [{ front: '', back: markedContent }]
     }

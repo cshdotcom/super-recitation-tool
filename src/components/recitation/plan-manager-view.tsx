@@ -343,24 +343,22 @@ function PlanCard({
         </span>
       )}
       <h3 className="text-2xl font-bold">{plan.name}</h3>
+      <p className="mt-1 text-xs text-muted-foreground/80">复习 {plan.days.length} 次</p>
       {plan.builtIn ? (
-        <div className="mt-3 px-2">
-          <p className="text-muted-foreground">基于记忆曲线，在最佳时间提醒复习</p>
-          <p
-            className="mt-1 truncate text-xs text-muted-foreground/70"
-            title={scheduleText}
-          >
-            {scheduleText}
-          </p>
+        <div className="mt-2 px-2">
+          <p className="text-sm text-muted-foreground">基于记忆曲线，在最佳时间提醒复习</p>
         </div>
-      ) : (
-        <p
-          className="mt-3 truncate text-muted-foreground"
-          title={scheduleText}
-        >
-          {scheduleText}
-        </p>
-      )}
+      ) : null}
+      <div className="mt-3 flex flex-wrap justify-center gap-1.5 px-2">
+        {plan.days.map((d) => (
+          <span
+            key={d}
+            className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
+          >
+            {dayLabel(d)}
+          </span>
+        ))}
+      </div>
       {plan.builtIn ? (
         <button
           type="button"
@@ -575,7 +573,7 @@ function EditScreen({
         {/* 复习时间安排 标签行 */}
         <div className="mt-6 flex items-baseline gap-1.5">
           <h2 className="text-xl font-bold">复习时间安排</h2>
-          <span className="text-base font-normal text-muted-foreground">（{days.length}天）</span>
+          <span className="text-base font-normal text-muted-foreground">（{days.length}次）</span>
         </div>
 
         {/* 时间线卡片 */}
@@ -661,7 +659,7 @@ function EditScreen({
         )}
 
         {/* 取消 / 保存 */}
-        <div className="mb-8 mt-10 flex gap-4">
+        <div className="mb-8 mt-6 flex gap-4">
           <button
             type="button"
             onClick={onCancel}

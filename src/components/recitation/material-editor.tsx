@@ -47,6 +47,7 @@ import {
   ImagePlus,
   Italic,
   Keyboard,
+  PenTool,
   Link as LinkIcon,
   ListChecks,
   Loader2,
@@ -1643,6 +1644,13 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     }
   }
 
+  // ---- 新建空白 SVG 并立即打开可视化编辑器（画矩形/圆/线/文字等）----
+  const handleCreateSvg = React.useCallback(() => {
+    const empty = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 400"></svg>'
+    insertMarkdown('\n```svg\n', '\n```\n', empty, true)
+    toast.success('已新建空白 SVG，点击块顶「可视化编辑」开始绘图')
+  }, [insertMarkdown])
+
   // ---- 插入音频 / 视频（上传云端 → 短引用 [[audio:uuid]] / [[video:uuid]]）----
   const handleAvFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? [])
@@ -2341,6 +2349,14 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
                   onOpenAutoFocus={(e) => e.preventDefault()}
                   className="w-48 rounded-2xl p-1.5"
                 >
+                  <button
+                    type="button"
+                    onClick={handleCreateSvg}
+                    className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <PenTool className="size-4 text-emerald-600" strokeWidth={1.75} aria-hidden />
+                    新建 SVG（可视化绘图）
+                  </button>
                   <button
                     type="button"
                     onClick={() => svgInputRef.current?.click()}

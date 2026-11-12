@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { ChevronLeft, ChevronRight, Loader2, Settings2, X } from 'lucide-react'
+import { BarChart3, ChevronLeft, ChevronRight, Loader2, Settings2, X } from 'lucide-react'
 import { toast } from 'sonner'
 
 import type { Mastery, ReviewStats } from '@/lib/types'
@@ -19,6 +19,8 @@ interface ReviewStatsViewProps {
   onBack: () => void
   /** 打开复习计划管理（页面拥有者接线）；不传则隐藏入口 */
   onOpenPlanManager?: () => void
+  /** 打开 FSRS 算法统计仪表盘（v2.8.0+）；不传则隐藏入口 */
+  onOpenAlgorithmStats?: () => void
 }
 
 const MASTERY_COLORS: Record<Mastery, string> = {
@@ -102,7 +104,7 @@ function MasteryDonut({ mastery }: { mastery: Record<Mastery, number> }) {
 }
 
 // 复习统计页：今日/连续/用时 + 掌握情况饼图 + 复习日历。
-export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewProps) {
+export function ReviewStatsView({ onBack, onOpenPlanManager, onOpenAlgorithmStats }: ReviewStatsViewProps) {
   const now = new Date()
   const [stats, setStats] = React.useState<ReviewStats | null>(null)
   const [loading, setLoading] = React.useState(true)
@@ -220,6 +222,17 @@ export function ReviewStatsView({ onBack, onOpenPlanManager }: ReviewStatsViewPr
               className="z-10 ml-1 flex size-10 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
             >
               <Settings2 className="size-5" strokeWidth={1.9} />
+            </button>
+          )}
+          {onOpenAlgorithmStats && (
+            <button
+              type="button"
+              onClick={onOpenAlgorithmStats}
+              aria-label="算法仪表盘"
+              title="算法统计仪表盘（FSRS 记忆模型 / 间隔分布 / 热力图）"
+              className="z-10 ml-auto flex size-10 items-center justify-center rounded-full text-emerald-600 transition-colors hover:bg-emerald-500/10"
+            >
+              <BarChart3 className="size-5" strokeWidth={1.9} />
             </button>
           )}
           <h1 className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-lg font-bold">
