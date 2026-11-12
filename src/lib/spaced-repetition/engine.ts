@@ -351,11 +351,13 @@ function finalize(
   intervalDays: number,
   ease: number,
 ): ComputeResult {
+  // 防御：间隔下限 1 分钟（1/1440 天），避免 S=0 等边界产生 0.00000046 天这类异常值
+  const safeInterval = Math.max(intervalDays, 1 / 1440)
   // 亚天间隔（学习/重学步骤，分钟级）：nextReviewAt = now + intervalDays 天，不走当日零点锚定
-  const floored = Math.max(intervalDays, c.minInterval)
+  const floored = Math.max(safeInterval, c.minInterval)
   const nextReviewAt =
-    intervalDays < 1
-      ? new Date(now.getTime() + intervalDays * DAY_MS)
+    safeInterval < 1
+      ? new Date(now.getTime() + safeInterval * DAY_MS)
       : nextReviewDate(now, floored, tzOffsetMin)
   const memory: CardMemory = {
     ...m0,
@@ -369,8 +371,8 @@ function finalize(
     step,
     history: appendHistory(m0, grade, sNew, dNew, prevR, elapsedDays(m0, now), now, durationSec),
   }
-  log.push({ step: '完成', detail: `间隔=${intervalDays.toFixed(2)}天 下次=${nextReviewAt.toISOString().slice(0, 16)}`, value: intervalDays })
-  return { memory, nextReviewAt, interval: intervalDays < 1 ? intervalDays : floored, prevR, log, ease, reviewCount: reps }
+  log.push({ step: '完成', detail: `间隔=${safeInterval.toFixed(4)}天 下次=${nextReviewAt.toISOString().slice(0, 16)}`, value: safeInterval })
+  return { memory, nextReviewAt, interval: safeInterval < 1 ? safeInterval : floored, prevR, log, ease, reviewCount: reps }
 }
 
 /** SM-2/固定/简单 共用收尾（直接传 nextReviewAt） */

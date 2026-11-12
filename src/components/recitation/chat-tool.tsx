@@ -607,7 +607,8 @@ const LONG_PRESS_MS = 800
 const MOVE_TOLERANCE = 10
 const VIEWPORT_INSET = 8
 
-/** 选择条按钮（≥36px 触控高度，图标 + 文字）。 */
+/** 选择条按钮（≥36px 触控高度，图标 + 文字）。
+ *  onMouseDown preventDefault 防止点按钮时选区被清空（按钮级，不影响外层）。 */
 function SelectionToolbarButton({
   label,
   active,
@@ -623,6 +624,7 @@ function SelectionToolbarButton({
     <button
       type="button"
       onClick={onClick}
+      onMouseDown={(e) => e.preventDefault()}
       className={cn(
         'flex h-9 shrink-0 items-center gap-1 rounded-xl px-2.5 text-xs font-medium transition-colors',
         active
@@ -751,13 +753,16 @@ function SelectionToolbar({
       const left = Math.max(VIEWPORT_INSET, Math.min(rect.left, vw - estW - VIEWPORT_INSET))
       const topAbove = rect.top - SEL_BAR_H - SEL_BAR_GAP
       const topBelow = rect.bottom + SEL_BAR_GAP
+      // 兜底位置：钳制到视口可见区（避免选区跨整屏时浮条出现在视口外）
+      const clampTop = (t: number) =>
+        Math.max(VIEWPORT_INSET, Math.min(t, vh - SEL_BAR_H - VIEWPORT_INSET))
       const fitsAbove = topAbove >= VIEWPORT_INSET
       const fitsBelow = topBelow + SEL_BAR_H <= vh - VIEWPORT_INSET
       let top: number
       if (coarseRef.current) {
-        top = fitsBelow ? topBelow : fitsAbove ? topAbove : Math.max(VIEWPORT_INSET, topBelow)
+        top = fitsBelow ? topBelow : fitsAbove ? topAbove : clampTop(topBelow)
       } else {
-        top = fitsAbove ? topAbove : fitsBelow ? topBelow : Math.max(VIEWPORT_INSET, topAbove)
+        top = fitsAbove ? topAbove : fitsBelow ? topBelow : clampTop(topAbove)
       }
       return { top, left }
     }
@@ -787,7 +792,7 @@ function SelectionToolbar({
         VIEWPORT_INSET,
         Math.min(y, window.innerHeight - menuH - VIEWPORT_INSET),
       )
-      suppressClickUntilRef.current = Date.now() + 400 // 吞掉长按后紧跟的 click
+      suppressClickUntilRef.current = Date.now() + 350 // 吞掉长按后紧跟的 click
       setSel(null)
       setMsgMenu({ msg: info, top, left })
     }
@@ -895,9 +900,9 @@ function SelectionToolbar({
     // ---- 消息菜单打开时：点菜单外任意处收起（选区条 barRef 也豁免，避免两者短暂并存时误关） ----
     const onDocPointerDown = (e: PointerEvent) => {
       if (!msgMenuRef.current) return
-      const menu = menuRef.current
-      if (menu && e.target instanceof Node && menu.contains(e.target)) return
-      if (barRef.current && e.target instanceof Node && barRef.current.contains(e.target)) return
+      const t = e.target
+      // 命中浮层（bar / menu）→ 不关闭（用 closest 兼容 ref 时序与子元素）
+      if (t instanceof Element && t.closest('[data-toolbar-root]')) return
       setMsgMenu(null)
     }
     // ---- 吞掉长按开消息菜单后紧跟的 click（仅当消息菜单仍打开时才吞，避免误吞选区条按钮） ----
@@ -906,7 +911,8 @@ function SelectionToolbar({
       if (Date.now() > suppressClickUntilRef.current) return
       const t = e.target
       if (!(t instanceof Node)) return
-      if (barRef.current?.contains(t) || menuRef.current?.contains(t)) return
+      // 命中浮层（bar / menu）→ 放行
+      if (t instanceof Element && t.closest('[data-toolbar-root]')) return
       const container = containerRef.current
       if (!container || !container.contains(t)) return
       e.preventDefault()
@@ -1023,11 +1029,11 @@ function SelectionToolbar({
       {sel && (
         <div
           ref={barRef}
+          data-toolbar-root="bar"
           role="toolbar"
           aria-label="选中文字操作"
           className="fixed z-[92] max-w-[calc(100vw-1rem)] animate-in fade-in slide-in-from-bottom-1 duration-150"
           style={{ top: sel.top, left: sel.left }}
-          onMouseDown={(e) => e.preventDefault()} // 防止点菜单按钮时选区被清空
         >
           <div className="flex items-center gap-0.5 overflow-x-auto rounded-2xl border border-border/70 bg-popover/95 p-1 shadow-xl backdrop-blur [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             <SelectionToolbarButton
@@ -1079,6 +1085,7 @@ function SelectionToolbar({
       {msgMenu && (
         <div
           ref={menuRef}
+          data-toolbar-root="menu"
           role="menu"
           aria-label="消息操作"
           className="fixed z-[92] w-44 animate-in fade-in zoom-in-95 duration-150 rounded-2xl border border-white/10 bg-zinc-900/95 p-1.5 text-white shadow-2xl backdrop-blur"
@@ -1089,6 +1096,7 @@ function SelectionToolbar({
               key={a.key}
               type="button"
               role="menuitem"
+              onMouseDown={(e) => e.preventDefault()}
               onClick={() => {
                 setMsgMenu(null)
                 onMessageAction(a.key, msgMenu.msg)
@@ -1571,6 +1579,66 @@ export function ChatTool({
     },
     [cardId],
   )
+
+  /**
+   * 从当前 AI 讲解创建新对话：取最近一条 AI 回复作为首条用户消息写入新对话，
+   * 切换到新对话后由历史加载流程自动补 AI 回复（承接讲解继续讨论）。
+   * 用于「从此讲解创建对话 / 移到新对话」一键入口。
+   */
+  const createFromExplanation = React.useCallback(async () => {
+    // 取最近一条 AI 回复（讲解）；没有则提示
+    const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant')
+    if (!lastAssistant) {
+      toast.info('还没有 AI 讲解可以承接，先发一条消息吧')
+      return
+    }
+    const explanation = lastAssistant.content.trim()
+    if (!explanation) {
+      toast.info('AI 讲解为空，无法承接')
+      return
+    }
+    // 用 「承接讲解」前缀让 AI 知道这是要继续讨论之前的讲解内容
+    const seedText = `（以下是之前的 AI 讲解，请基于此继续深入讨论）\n\n${explanation}`
+    try {
+      const convRes = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'analysis',
+          cardId: cardId ?? '',
+          title: explanation.slice(0, 12),
+        }),
+      })
+      if (!convRes.ok) {
+        const e = (await convRes.json().catch(() => ({}))) as { error?: string }
+        throw new Error(e.error || '新建对话失败')
+      }
+      const convData = (await convRes.json()) as { conversation?: ConversationSummary }
+      const conv = convData.conversation
+      if (!conv?.id) throw new Error('新建对话失败')
+      // 写入首条用户消息（讲解内容作为种子）
+      const msgRes = await fetch(`/api/conversations/${encodeURIComponent(conv.id)}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: seedText }],
+        }),
+      })
+      if (!msgRes.ok) throw new Error('写入讲解失败')
+      // 切换到新对话（历史加载会检测末尾新鲜用户消息 → 自动补 AI 回复）
+      setMessages([])
+      setAskAnswered({})
+      setConvSearchOpen(false)
+      setConvSearchQ('')
+      setConvSearchHits([])
+      setLocalConvId(conv.id)
+      setConvMeta(conv)
+      convMetaRef.current = conv
+      toast.success('已创建新对话并承接讲解')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '创建对话失败')
+    }
+  }, [cardId, messages])
 
   // ---------- 服务端历史加载 ----------
   React.useEffect(() => {
@@ -2480,6 +2548,11 @@ export function ChatTool({
                 </button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="z-[80] w-44">
+                {/* 从当前 AI 讲解一键创建新对话（承接讲解继续讨论） */}
+                <DropdownMenuItem onClick={() => void createFromExplanation()}>
+                  <MessageCircleQuestion className="size-4" />
+                  从此讲解创建对话
+                </DropdownMenuItem>
                 {!isMainConv && (
                   <DropdownMenuItem onClick={() => setShareConvOpen(true)}>
                     <Share2 className="size-4" />

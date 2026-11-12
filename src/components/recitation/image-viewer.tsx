@@ -12,12 +12,16 @@ import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
 
-const MIN_SCALE = 0.25
+const MIN_SCALE = 1
 const MAX_SCALE = 5
 
 function clampScale(v: number): number {
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, v))
 }
+
+/** Touch double-tap window (ms) + movement tolerance (px). */
+const DOUBLE_TAP_MS = 280
+const DOUBLE_TAP_MOVE = 30
 
 /** 从 dataURL 猜测扩展名（默认 png）。 */
 function extFromDataUrl(src: string): string {
@@ -58,6 +62,8 @@ export function ImageViewer({
   } | null>(null)
   /** 单指拖拽起点。 */
   const panStartRef = React.useRef<{ x: number; y: number; ox: number; oy: number } | null>(null)
+  /** 上一次单指点抬手的时间/坐标（用于判定双击）。 */
+  const lastTapRef = React.useRef<{ x: number; y: number; t: number } | null>(null)
 
   // 打开 / 换图时复位
   React.useEffect(() => {
@@ -68,6 +74,7 @@ export function ImageViewer({
       pointersRef.current.clear()
       pinchStartRef.current = null
       panStartRef.current = null
+      lastTapRef.current = null
     }
   }, [open, src])
 
@@ -156,11 +163,32 @@ export function ImageViewer({
   }
 
   const handlePointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    const had = pointersRef.current.has(e.pointerId)
     pointersRef.current.delete(e.pointerId)
     if (pointersRef.current.size < 2) pinchStartRef.current = null
     if (pointersRef.current.size === 0) {
       panStartRef.current = null
       setPanActive(false)
+      // 单指快速抬手 → 判定双击缩放（仅触摸/笔，桌面走 onDoubleClick）
+      if (had && (e.pointerType === 'touch' || e.pointerType === 'pen')) {
+        const now = Date.now()
+        const last = lastTapRef.current
+        lastTapRef.current = { x: e.clientX, y: e.clientY, t: now }
+        if (
+          last &&
+          now - last.t <= DOUBLE_TAP_MS &&
+          Math.hypot(e.clientX - last.x, e.clientY - last.y) <= DOUBLE_TAP_MOVE
+        ) {
+          // 双击：≥1.95x 复位，否则放大到 2x
+          lastTapRef.current = null
+          if (scale >= 1.95) {
+            setScale(1)
+            setOffset({ x: 0, y: 0 })
+          } else {
+            setScale(2)
+          }
+        }
+      }
     }
   }
 
@@ -226,6 +254,8 @@ export function ImageViewer({
           <button
             type="button"
             onClick={resetView}
+            title="重置缩放"
+            aria-label="重置缩放"
             className="h-10 min-w-14 rounded-full px-2 text-xs font-medium tabular-nums text-white/90 transition-colors hover:bg-white/10"
           >
             {Math.round(scale * 100)}%

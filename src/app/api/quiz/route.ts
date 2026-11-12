@@ -1,15 +1,22 @@
-// Quiz generation.
-// POST /api/quiz — three request shapes, one response shape:
+// Quiz generation + AI grading.
+// POST /api/quiz — four request shapes:
 //
-// 1. Legacy (compat):  { content, keywords?, count? }
+// 0. Grade (AI 批改):  { action:'grade', question, userAnswer, correctAnswer, type, options? }
+//    -> { correct:'right'|'partial'|'wrong', score:number, comment:string, keyPoints:string[] }
+// 1. Legacy (compat):  { content, keywords?, count?, requirements? }
 //    -> mixed fill/short/choice quiz (old behaviour, kept for compatibility).
-// 2. Two-step flow:    { content, points: [{ text, importance } | string], types: { choice, multi, judge, fill, short } }
+// 2. Two-step flow:    { content, points: [{ text, importance } | string], types: { choice, multi, judge, fill, short }, requirements? }
 //    -> questions constrained to the selected knowledge points, per-type counts.
-// 3. Similar (举一反三): { mode: 'similar', questions: [{ question, answer, type?, options? }] }
+// 3. Similar (举一反三): { mode: 'similar', questions: [{ question, answer, type?, options? }], requirements? }
 //    -> 3-5 new questions drilling the same knowledge points as the wrong answers.
 //
-// Response: { questions: QuizQuestion[] } — QuizQuestion extended with the
-// 'multi' (多选) and 'judge' (判断) types, keeping the original fields intact.
+// `requirements` is an optional user-supplied string of custom instructions
+// (e.g. "侧重第二章"、"题目要难"、"每题附解析"、"只用填空和简答") appended to the
+// system prompt so the generated questions follow them.
+//
+// Response (generation modes): { questions: QuizQuestion[] } — QuizQuestion
+// extended with the 'multi' (多选) and 'judge' (判断) types, keeping the
+// original fields intact.
 import { NextRequest, NextResponse } from 'next/server'
 import { getSessionUser } from '@/lib/auth'
 import { chatComplete, extractJSON, extractQuestionObjects } from '@/lib/ai'
@@ -145,6 +152,46 @@ function friendlyUpstreamError(msg: string): string {
 }
 
 /**
+ * 用户自定义出题要求的提示词后缀（附加到系统提示末尾）。
+ * 仅在 requirements 非空时返回非空串；长度上限 1000 字符。
+ */
+function requirementsSuffix(req?: string): string {
+  const r = (req || '').trim()
+  if (!r) return ''
+  return `\n\n【用户自定义出题要求】${r.slice(0, 1000)}\n请在出题时严格遵守上述自定义要求（在不与题型/JSON 格式规则冲突的前提下优先满足；如要求"每题附解析"，则把解析合并进 answer 字段，不要新增字段）。`
+}
+
+// ---------- AI 批改（action:'grade'） ----------
+type GradeCorrect = 'right' | 'partial' | 'wrong'
+
+interface GradeResult {
+  correct: GradeCorrect
+  score: number
+  comment: string
+  keyPoints: string[]
+}
+
+/** 校验 + 规范化 AI 批改返回：correct 三值、score 0–100、comment 字符串、keyPoints 字符串数组。 */
+function normalizeGrade(raw: unknown): GradeResult {
+  const o = (raw ?? {}) as Record<string, unknown>
+  const c = String(o.correct)
+  const correct: GradeCorrect =
+    c === 'right' || c === 'partial' || c === 'wrong' ? c : 'wrong'
+  let score = Math.round(Number(o.score))
+  if (!Number.isFinite(score)) score = correct === 'right' ? 100 : correct === 'partial' ? 50 : 0
+  score = Math.max(0, Math.min(100, score))
+  const comment =
+    typeof o.comment === 'string' ? o.comment.trim().slice(0, 800) : ''
+  const keyPoints = Array.isArray(o.keyPoints)
+    ? o.keyPoints
+        .map((x) => (typeof x === 'string' ? x.trim() : ''))
+        .filter((s) => s.length > 0)
+        .slice(0, 12)
+    : []
+  return { correct, score, comment, keyPoints }
+}
+
+/**
  * 出题用课文清洗（纯函数，两步流出题链路）：
  * - `![alt](url)` → `[图片: alt]`（URL 对模型无意义；图片已由客户端转 dataURI
  *   走 /api/quiz-points 的 images 视觉链路，此处只留 alt 文字提示）
@@ -190,6 +237,75 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => ({}))
     const config = await getAIConfig()
 
+    // ---------- Action 0: AI 批改（action:'grade'） ----------
+    // 输入 { action:'grade', question, userAnswer, correctAnswer, type, options? }
+    // 输出 { correct:'right'|'partial'|'wrong', score:number, comment:string, keyPoints:string[] }
+    // 适用于所有题型：填空/简答/选择/判断/多选统一走这条批改路径。
+    if (body?.action === 'grade') {
+      const question: string = typeof body?.question === 'string' ? body.question.trim().slice(0, 1200) : ''
+      const userAnswer: string = typeof body?.userAnswer === 'string' ? body.userAnswer.trim().slice(0, 4000) : ''
+      const correctAnswer: string =
+        typeof body?.correctAnswer === 'string' ? body.correctAnswer.trim().slice(0, 2000) : ''
+      const type: string = typeof body?.type === 'string' ? body.type : ''
+      if (!question || !correctAnswer) {
+        return NextResponse.json({ error: '题目与正确答案不能为空' }, { status: 400 })
+      }
+
+      const optionsPart =
+        Array.isArray(body?.options) && body.options.length > 0
+          ? `\n选项：${(body.options as string[])
+              .map((o, i) => `${String.fromCharCode(65 + i)}. ${o}`)
+              .join('  ')}`
+          : ''
+
+      const gradeSystem = `你是严谨且善于讲解的语文判题老师。请判定学生的回答相对于标准答案的对错程度，并给出得分、评语与正确答案要点。
+
+判定与得分规则：
+- 选择题/判断题/多选题：答案与标准答案一致判 "right"（score=100）；不一致判 "wrong"（score=0）。这类客观题不存在 "partial"。
+- 填空题：核心含义与标准答案一致判 "right"（score=95–100，允许标点/同义词差异）；多空答对一部分判 "partial"（score 按答对比例 30–70）；完全不符或空白判 "wrong"（score=0–20）。
+- 简答题：要点全覆盖判 "right"（score=90–100）；覆盖大部分要点判 "partial"（score=50–85）；要点缺失严重或答非所问判 "wrong"（score=0–40）。
+- score 为 0–100 的整数；comment 为中文一句话评语，可含 LaTeX 行内公式 $...$，但不要使用表格、mermaid、代码块等多行格式，确保返回的是合法 JSON。
+- keyPoints 为正确答案要点的字符串数组（每条一个简洁要点，2–8 条；客观题也可给出"正确选项是 X，因为…"这类要点）。
+- 完全无关/答非所问/空白 → "wrong"，score=0。
+
+只返回严格 JSON：{"correct":"right"|"partial"|"wrong","score":number,"comment":"...","keyPoints":["...","..."]}，不要任何额外解释或代码围栏。`
+
+      const userMsg = `题型：${type || '未标注'}${optionsPart}
+题目：${question}
+标准答案：${correctAnswer}
+学生答案：${userAnswer || '（未作答）'}
+请按规则判定并给出得分、评语与要点。`
+
+      const reply = await chatComplete(
+        [
+          { role: 'system', content: gradeSystem },
+          { role: 'user', content: userMsg },
+        ],
+        config,
+      )
+
+      let parsed: unknown = null
+      try {
+        parsed = extractJSON<unknown>(reply)
+      } catch {
+        // 兜底：从原始回复里抓第一个 {...} 块
+        const m = (reply || '').match(/\{[\s\S]*\}/)
+        if (m) {
+          try {
+            parsed = JSON.parse(m[0])
+          } catch {
+            parsed = null
+          }
+        }
+      }
+      const result = normalizeGrade(parsed)
+      return NextResponse.json(result)
+    }
+
+    // 自定义出题要求（所有出题模式共用，留空则不影响）
+    const requirements: string =
+      typeof body?.requirements === 'string' ? body.requirements.slice(0, 1000) : ''
+
     // ---------- Mode 3: similar questions from wrong answers (举一反三) ----------
     if (body?.mode === 'similar') {
       const sources: QuizQuestionX[] = normalizeQuestions(
@@ -199,7 +315,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: '缺少错题数据' }, { status: 400 })
       }
 
-      const system = `你是语文老师。下面这些是学生做错的题目。请围绕这些错题所考察的知识点，出 3 到 5 道相似的新题，帮助学生举一反三：考点相同，但换一种提问角度或表述，难度相当。题型规则：选择题(type="choice")必须提供 options（恰好 4 个）且 answer 为正确选项的完整文本（与 options 中某一项完全一致）；多选题(type="multi")的 answer 为所有正确选项的完整文本、用「、」连接；判断题(type="judge")的 answer 只能是「正确」或「错误」；填空题(type="fill")题干用____表示空缺，answer 为应填内容；简答题(type="short")的 answer 为参考答案要点。${RICH_FORMAT_HINT} 只返回严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
+      const system = `你是语文老师。下面这些是学生做错的题目。请围绕这些错题所考察的知识点，出 3 到 5 道相似的新题，帮助学生举一反三：考点相同，但换一种提问角度或表述，难度相当。题型规则：选择题(type="choice")必须提供 options（恰好 4 个）且 answer 为正确选项的完整文本（与 options 中某一项完全一致）；多选题(type="multi")的 answer 为所有正确选项的完整文本、用「、」连接；判断题(type="judge")的 answer 只能是「正确」或「错误」；填空题(type="fill")题干用____表示空缺，answer 为应填内容；简答题(type="short")的 answer 为参考答案要点。${RICH_FORMAT_HINT} 只返回严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要任何解释。${requirementsSuffix(requirements)}`
       const listText = sources
         .map(
           (q, i) =>
@@ -270,7 +386,7 @@ export async function POST(req: NextRequest) {
         .filter(Boolean)
         .join('；')
 
-      const system = `你是语文出题老师。请严格依据给定的"知识点清单"范围出题，结合课文原文，优先覆盖标注为[核心]的知识点，题型分布与数量必须满足：${typeReq}。${RICH_FORMAT_HINT} 只返回严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
+      const system = `你是语文出题老师。请严格依据给定的"知识点清单"范围出题，结合课文原文，优先覆盖标注为[核心]的知识点，题型分布与数量必须满足：${typeReq}。${RICH_FORMAT_HINT} 只返回严格 JSON：{"questions":[{"type":"fill"|"short"|"choice"|"multi"|"judge","question":"...","answer":"...","options":["..."]}]}，不要任何解释。${requirementsSuffix(requirements)}`
 
       const pointsText = points
         .map((p, i) => `${i + 1}. [${p.importance === 'core' ? '核心' : '次要'}] ${p.text}`)
@@ -313,7 +429,7 @@ export async function POST(req: NextRequest) {
     if (count < 1) count = 1
     if (count > MAX_TOTAL) count = MAX_TOTAL
 
-    const system = `你是语文出题老师。根据下面这段文字生成背书练习题，题型混合：填空题(type="fill")、简答题(type="short")、选择题(type="choice")。要求：填空题用____表示空缺，answer为应填内容；选择题必须提供options(恰好4个选项的字符串数组)和answer(正确选项的完整文本，须与options中某一项完全一致)；简答题answer为参考答案。共生成${count}道题。${RICH_FORMAT_HINT} 只返回JSON：{"questions":[{"type":"fill"|"short"|"choice","question":"...","answer":"...","options":["..."]}]}，不要任何解释。`
+    const system = `你是语文出题老师。根据下面这段文字生成背书练习题，题型混合：填空题(type="fill")、简答题(type="short")、选择题(type="choice")。要求：填空题用____表示空缺，answer为应填内容；选择题必须提供options(恰好4个选项的字符串数组)和answer(正确选项的完整文本，须与options中某一项完全一致)；简答题answer为参考答案。共生成${count}道题。${RICH_FORMAT_HINT} 只返回JSON：{"questions":[{"type":"fill"|"short"|"choice","question":"...","answer":"...","options":["..."]}]}，不要任何解释。${requirementsSuffix(requirements)}`
     const user = `课文：\n${content.slice(0, MAX_CONTENT)}\n\n重点关注词语：${
       keywords.length > 0 ? keywords.join('、') : '（无）'
     }`

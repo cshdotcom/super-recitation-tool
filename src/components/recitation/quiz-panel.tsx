@@ -85,6 +85,38 @@ const TYPE_LABEL: Record<QuizTypeX, string> = {
 
 const VALID_TYPES: readonly string[] = ['fill', 'short', 'choice', 'multi', 'judge']
 
+// ---------- AI 批改结果（/api/quiz action:'grade'） ----------
+type GradeCorrect = 'right' | 'partial' | 'wrong'
+
+interface GradeResult {
+  correct: GradeCorrect
+  score: number
+  comment: string
+  keyPoints: string[]
+}
+
+/** 判定等级 → 中文标签 */
+function gradeLabel(c: GradeCorrect): string {
+  return c === 'right' ? '对' : c === 'partial' ? '部分对' : '错'
+}
+
+/** 判定等级 → 徽标配色 */
+function gradeBadgeTone(c: GradeCorrect): string {
+  return c === 'right'
+    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+    : c === 'partial'
+      ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
+      : 'bg-destructive/15 text-destructive'
+}
+
+/** 由判定等级 + 得分推导布尔对错（用于错题统计与得分计算）：
+ *  right → true；wrong → false；partial → 得分≥60 视为对。 */
+function gradeToRight(g: GradeResult): boolean {
+  if (g.correct === 'right') return true
+  if (g.correct === 'wrong') return false
+  return g.score >= 60
+}
+
 /** 多选题多个选项在同一字符串中的内部分隔符 */
 const MULTI_SEP = '\u0001'
 
@@ -545,6 +577,10 @@ export function QuizPanel({
     [typeCounts],
   )
 
+  // ---- 自定义出题要求（可选）：随 types + count 一起提交给 /api/quiz 的 requirements 字段 ----
+  // 例：侧重第二章、题目要难、每题附解析、只用填空和简答。留空则按默认规则出题。
+  const [requirements, setRequirements] = React.useState('')
+
   // ---- 自定义出题类型与个数：生成时随 types + count 一起提交给 /api/quiz ----
   /** 题型多选开关：勾选 → 恢复默认数量（不超总题数上限）；取消 → 清零 */
   const toggleTypeSelected = (key: QuestionTypeKey) => {
@@ -651,8 +687,8 @@ export function QuizPanel({
   // 改判覆盖（手动或 AI 改题后翻转判定，覆盖规则匹配结果）
   const [override, setOverride] = React.useState<Record<number, boolean>>({})
   const [aiJudging, setAiJudging] = React.useState<Set<number>>(new Set())
-  /** AI 改题（grade）返回的判定理由 — 题目卡片内富媒体展示（可含 LaTeX/表格）。 */
-  const [aiReasons, setAiReasons] = React.useState<Record<number, string>>({})
+  /** AI 批改（grade）返回的完整结果 — 题目卡片内富媒体展示得分/评语/要点 */
+  const [aiGrades, setAiGrades] = React.useState<Record<number, GradeResult>>({})
   /** 「我不会」标记的题号 — 立即按答错上报并强制计错。 */
   const [dontKnow, setDontKnow] = React.useState<Set<number>>(new Set())
   const [quizStart, setQuizStart] = React.useState<number>(Date.now())
@@ -745,7 +781,7 @@ export function QuizPanel({
       setReported(new Set())
       setDontKnow(new Set())
       setOverride({})
-      setAiReasons({})
+      setAiGrades({})
       setAiJudging(new Set())
       setQuizStart(Date.now())
       setStep('answering')
@@ -969,7 +1005,7 @@ export function QuizPanel({
     setSelfJudge({})
     setReported(new Set())
     setDontKnow(new Set())
-    setAiReasons({})
+    setAiGrades({})
     setQuizStart(Date.now())
     setStep('answering')
     toast.success('已恢复上次作答')
@@ -1019,6 +1055,8 @@ export function QuizPanel({
           types: typeCounts,
           // 题目个数（总题数，兼容字段：两步模式按 types 各项之和出题）
           count: totalCount,
+          // 自定义出题要求（可选）：追加到 AI 系统提示，影响生成题目的侧重点/难度/格式
+          requirements: requirements.trim(),
         }),
       })
       if (!res.ok) {
@@ -1039,7 +1077,7 @@ export function QuizPanel({
       setSelfJudge({})
       setReported(new Set())
       setDontKnow(new Set())
-      setAiReasons({})
+      setAiGrades({})
       setQuizStart(Date.now())
       clearDraftStorage()
       setStep('answering')
@@ -1113,8 +1151,12 @@ export function QuizPanel({
   // ---- 改判：规则批改过严时手动翻转对/错（覆盖原判定，静默重报） ----
   const manualOverride = (idx: number, right: boolean) => {
     setOverride((prev) => ({ ...prev, [idx]: right }))
-    // 手动改判后清掉旧 AI 理由，避免展示与当前判定矛盾的说明
-    setAiReasons((prev) => ({ ...prev, [idx]: '' }))
+    // 手动改判后清掉旧 AI 批改结果，避免展示与当前判定矛盾的说明
+    setAiGrades((prev) => {
+      const next = { ...prev }
+      delete next[idx]
+      return next
+    })
     if (!reported.has(idx)) {
       setReported((prev) => new Set(prev).add(idx))
     }
@@ -1123,20 +1165,24 @@ export function QuizPanel({
     toast.success(right ? '已改判为「答对」' : '已改判为「答错」')
   }
 
-  // ---- AI 改题：把题目/学生答案/标准答案交给 AI 判定（填空简答规则匹配过严时用） ----
+  // ---- AI 批改：把题目/学生答案/标准答案交给 AI 判定并给分 + 评语 + 要点 ----
+  // 适用于所有题型：填空/简答/选择/判断/多选统一走 /api/quiz action:'grade'。
+  // 客观题（选择/判断/多选）由 AI 解释为什么对/错；主观题（填空/简答）由 AI
+  // 判定对错程度（right/partial/wrong）并给分，替代/补充规则匹配的过严判定。
   const aiRejudge = async (idx: number) => {
     const q = questions[idx]
     if (!q) return
+    const userAns = answers[idx] || ''
     setAiJudging((prev) => new Set(prev).add(idx))
-    const tid = toast.loading('AI 正在重新判题…')
+    const tid = toast.loading('AI 正在批改…')
     try {
-      const res = await fetch('/api/chat', {
+      const res = await fetch('/api/quiz', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          mode: 'grade',
+          action: 'grade',
           question: q.question,
-          userAnswer: answers[idx] || '',
+          userAnswer: userAns,
           correctAnswer: q.type === 'judge' ? normJudge(q.answer) : q.answer,
           type: q.type,
           options: q.type === 'judge' ? ['正确', '错误'] : q.options ?? [],
@@ -1144,22 +1190,21 @@ export function QuizPanel({
       })
       if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        throw new Error(err.error || 'AI 判题失败')
+        throw new Error(err.error || 'AI 批改失败')
       }
-      const data = (await res.json()) as { right: boolean; reason: string }
-      setOverride((prev) => ({ ...prev, [idx]: data.right }))
-      // AI 判定理由落状态 → 答案卡片内富媒体展示
-      setAiReasons((prev) => ({ ...prev, [idx]: data.reason || '' }))
+      const data = (await res.json()) as GradeResult
+      const right = gradeToRight(data)
+      setOverride((prev) => ({ ...prev, [idx]: right }))
+      // AI 批改完整结果落状态 → 答案卡片内展示得分徽标 + 评语 + 要点
+      setAiGrades((prev) => ({ ...prev, [idx]: data }))
       if (!reported.has(idx)) {
         setReported((prev) => new Set(prev).add(idx))
       }
-      reportItem(q, data.right, answers[idx] || '', true)
-      toast.success(
-        `${data.right ? '答对' : '答错'}：${data.reason || 'AI 已判定'}`,
-        { id: tid },
-      )
+      reportItem(q, right, userAns, true)
+      const label = gradeLabel(data.correct)
+      toast.success(`${label} · ${data.score}分：${data.comment || 'AI 已批改'}`, { id: tid })
     } catch (err) {
-      toast.error('AI 改题失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
+      toast.error('AI 批改失败：' + (err instanceof Error ? err.message : '未知错误'), { id: tid })
     } finally {
       setAiJudging((prev) => {
         const n = new Set(prev)
@@ -1245,7 +1290,7 @@ export function QuizPanel({
     setReported(new Set())
     setDontKnow(new Set())
     setOverride({})
-    setAiReasons({})
+    setAiGrades({})
     setAiJudging(new Set())
     setQuizStart(Date.now())
   }
@@ -1606,6 +1651,35 @@ export function QuizPanel({
                 </div>
               )
             })}
+          </div>
+
+          {/* 自定义出题要求（可选）：追加到 AI 系统提示，影响侧重点/难度/格式 */}
+          <div className="mt-2.5 rounded-2xl border border-border bg-card px-4 py-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-sm font-bold">自定义要求（可选）</p>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  例如：侧重第二章、题目要难、每题附解析、只用填空和简答
+                </p>
+              </div>
+            </div>
+            <Textarea
+              value={requirements}
+              onChange={(e) => setRequirements(e.target.value.slice(0, 1000))}
+              rows={2}
+              placeholder="输入对出题的自定义要求，留空则按默认规则出题…（可语音输入）"
+              aria-label="自定义出题要求"
+              className="mt-2 text-sm"
+            />
+            <div className="mt-1.5 flex items-center justify-end">
+              <VoiceInput
+                size="sm"
+                context="quiz"
+                onText={(t) =>
+                  setRequirements((p) => (p + t).slice(0, 1000))
+                }
+              />
+            </div>
           </div>
 
           <div className="sticky bottom-0 mt-6 rounded-2xl border border-border bg-card/95 p-3 shadow-lg shadow-black/5 backdrop-blur">
@@ -1989,38 +2063,48 @@ export function QuizPanel({
                             简答题请对照参考答案，自评对错
                           </p>
                         )}
-                        {/* AI 改题（grade）判定理由 — 富媒体展示（可含 LaTeX 公式/表格） */}
-                        {aiReasons[idx] ? (
-                          <div className="mt-2 min-w-0 rounded-md border border-emerald-300/60 bg-emerald-500/5 px-2.5 py-2 dark:border-emerald-800/60">
-                            <p className="mb-1 flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
-                              <Sparkles className="size-3" /> AI 改题理由
-                            </p>
-                            <RichAI content={aiReasons[idx]} className="text-xs" />
-                          </div>
+                        {/* AI 批改结果 — 得分徽标 + 评语 + 正确答案要点（富媒体渲染） */}
+                        {aiGrades[idx] ? (
+                          <AIGradeBlock grade={aiGrades[idx]} />
                         ) : null}
                       </div>
                     )}
 
-                    {/* 简答题自评 */}
+                    {/* 简答题自评 + AI 批改（自评前即可调用 AI 判定给分） */}
                     {isRevealed && isShort && !isReported && (
-                      <div className="flex gap-2">
-                        <Button
-                          variant="outline"
-                          className="h-10 flex-1 rounded-full border-destructive/40 text-sm text-destructive hover:bg-destructive/10"
-                          onClick={() => judgeSelf(idx, false)}
+                      <div className="flex flex-col gap-2">
+                        <div className="flex gap-2">
+                          <Button
+                            variant="outline"
+                            className="h-10 flex-1 rounded-full border-destructive/40 text-sm text-destructive hover:bg-destructive/10"
+                            onClick={() => judgeSelf(idx, false)}
+                          >
+                            <XCircle className="size-4" /> 答错了
+                          </Button>
+                          <Button
+                            className="h-10 flex-1 rounded-full bg-emerald-600 text-sm text-white hover:bg-emerald-700"
+                            onClick={() => judgeSelf(idx, true)}
+                          >
+                            <CheckCircle2 className="size-4" /> 答对了
+                          </Button>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={aiJudging.has(idx) || !userAnswer.trim()}
+                          onClick={() => void aiRejudge(idx)}
+                          className="flex items-center justify-center gap-1 rounded-full border border-emerald-300 px-3 py-1.5 text-xs font-medium text-emerald-700 transition-colors hover:bg-emerald-50 disabled:opacity-40 dark:border-emerald-700 dark:text-emerald-300 dark:hover:bg-emerald-900/30"
                         >
-                          <XCircle className="size-4" /> 答错了
-                        </Button>
-                        <Button
-                          className="h-10 flex-1 rounded-full bg-emerald-600 text-sm text-white hover:bg-emerald-700"
-                          onClick={() => judgeSelf(idx, true)}
-                        >
-                          <CheckCircle2 className="size-4" /> 答对了
-                        </Button>
+                          {aiJudging.has(idx) ? (
+                            <Loader2 className="size-3 animate-spin" />
+                          ) : (
+                            <Sparkles className="size-3" />
+                          )}
+                          AI 批改（自动判定 + 得分 + 评语）
+                        </button>
                       </div>
                     )}
 
-                    {/* 判定结果 + 改判/AI改题（规则批改过严时可纠正） */}
+                    {/* 判定结果 + 改判/AI批改（规则批改过严时可纠正；多题型统一支持） */}
                     {isReported && (
                       <div className="flex flex-wrap items-center justify-end gap-1.5 text-xs font-medium">
                         {isRight ? (
@@ -2046,7 +2130,7 @@ export function QuizPanel({
                         >
                           改判为{isRight ? '错' : '对'}
                         </button>
-                        {/* AI 改题：交给 AI 判定（填空/简答规则匹配过严时用） */}
+                        {/* AI 批改：交给 AI 判定给分 + 评语 + 要点（所有题型统一） */}
                         <button
                           type="button"
                           disabled={aiJudging.has(idx)}
@@ -2058,7 +2142,7 @@ export function QuizPanel({
                           ) : (
                             <Sparkles className="size-3" />
                           )}
-                          AI 改题
+                          AI 批改
                         </button>
                       </div>
                     )}
@@ -2676,6 +2760,45 @@ function badgeTone(t: QuizTypeX): string {
     default:
       return 'bg-secondary'
   }
+}
+
+// AI 批改结果展示：判定等级徽标 + 得分徽标 + 评语 + 正确答案要点（富媒体渲染）
+// 由 /api/quiz action:'grade' 返回的 GradeResult 渲染。简答/填空给出对错程度与得分；
+// 选择/判断/多选则由 AI 解释为什么对/错（keyPoints 给出"正确选项是 X，因为…"）。
+function AIGradeBlock({ grade }: { grade: GradeResult }) {
+  const kpText =
+    grade.keyPoints && grade.keyPoints.length > 0
+      ? grade.keyPoints.map((p, i) => `${i + 1}. ${p}`).join('\n')
+      : ''
+  return (
+    <div className="mt-2 min-w-0 rounded-md border border-emerald-300/60 bg-emerald-500/5 px-2.5 py-2 dark:border-emerald-800/60">
+      <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+        <span className="flex items-center gap-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">
+          <Sparkles className="size-3" /> AI 批改
+        </span>
+        <span
+          className={cn(
+            'rounded-full px-1.5 py-0.5 text-[10px] font-bold',
+            gradeBadgeTone(grade.correct),
+          )}
+        >
+          {gradeLabel(grade.correct)}
+        </span>
+        <span className="rounded-full bg-emerald-600 px-1.5 py-0.5 text-[10px] font-bold text-white dark:bg-emerald-700">
+          {grade.score}分
+        </span>
+      </div>
+      {grade.comment ? (
+        <RichAI content={grade.comment} className="text-xs" />
+      ) : null}
+      {kpText ? (
+        <div className="mt-1.5">
+          <p className="mb-0.5 text-[11px] font-medium text-muted-foreground">正确答案要点：</p>
+          <RichAI content={kpText} className="text-xs" />
+        </div>
+      ) : null}
+    </div>
+  )
 }
 
 /** 题干传入 RichContent 前的预处理：

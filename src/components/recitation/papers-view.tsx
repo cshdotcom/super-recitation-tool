@@ -1491,18 +1491,23 @@ function PaperCard({
                   {Array.isArray(it.options) && it.options.length > 0 && (
                     <div className="mt-1.5 space-y-1 text-sm">
                       {it.options.map((o, j) => (
-                        <p key={j} className="min-w-0 break-words text-muted-foreground">
-                          {String.fromCharCode(65 + j)}. {o}
-                        </p>
+                        <div
+                          key={j}
+                          className="flex min-w-0 items-start gap-1.5 break-words text-muted-foreground"
+                        >
+                          <span className="shrink-0">{String.fromCharCode(65 + j)}.</span>
+                          <RichContent content={o ?? ''} className="min-w-0 flex-1" />
+                        </div>
                       ))}
                     </div>
                   )}
                   {(it.answer ?? '').trim() && (
-                    <div className="mt-2 min-w-0 max-w-full overflow-hidden break-words rounded-lg bg-emerald-500/5 px-2.5 py-1.5 text-sm">
-                      <span className="mr-1 text-xs text-muted-foreground">答案：</span>
-                      <span className="font-medium text-emerald-700 dark:text-emerald-300">
-                        {it.answer}
-                      </span>
+                    <div className="mt-2 flex min-w-0 max-w-full items-start overflow-hidden break-words rounded-lg bg-emerald-500/5 px-2.5 py-1.5 text-sm">
+                      <span className="mt-0.5 shrink-0 text-xs text-muted-foreground">答案：</span>
+                      <RichContent
+                        content={it.answer ?? ''}
+                        className="min-w-0 flex-1 font-medium text-emerald-700 dark:text-emerald-300"
+                      />
                     </div>
                   )}
                 </div>

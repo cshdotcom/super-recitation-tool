@@ -1,8 +1,11 @@
 // Review plan template endpoints (require login).
-// GET    /api/plans        -> list all plans (built-in first, then oldest custom); seeds the built-in 标准艾宾浩斯 when the table is empty
-// POST   /api/plans        -> create a custom plan { name, days }
-// PATCH  /api/plans        -> update a custom plan { id, name?, days? } (built-in plans are rejected)
-// DELETE /api/plans?id=    -> delete a custom plan (built-in plans are rejected)
+// GET    /api/plans              -> list all plans (built-in first, then oldest custom); seeds the built-in 标准艾宾浩斯 when the table is empty
+// GET    /api/plans?assignments=1 -> { assignments: Record<cardId, planId> } 仅返回绑定了 activePlanId 的卡片
+// POST   /api/plans              -> create a custom plan { name, days }
+// PATCH  /api/plans              -> update a custom plan { id, name?, days? } (built-in plans are rejected)
+// PATCH  /api/plans { action: 'assign', id, cardIds } -> 把计划应用到所选卡片（设置 activePlanId）
+// PATCH  /api/plans { action: 'clear', cardIds }      -> 清除所选卡片的 activePlanId（回到 FSRS 调度）
+// DELETE /api/plans?id=          -> delete a custom plan (built-in plans are rejected)
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { getSessionUser } from '@/lib/auth'
@@ -83,11 +86,35 @@ function validateDays(raw: unknown): Valid<number[]> | Invalid {
 
 // ---------- handlers ----------
 
-export async function GET() {
+/** 校验 cardIds 入参：string[]，去重，最多 2000 个。 */
+function validateCardIds(raw: unknown): Valid<string[]> | Invalid {
+  if (!Array.isArray(raw)) return { ok: false, error: 'cardIds 必须为数组' }
+  const ids = raw
+    .map((id) => (typeof id === 'string' ? id : ''))
+    .filter(Boolean)
+  if (ids.length === 0) return { ok: false, error: '请至少选择一张卡片' }
+  const unique = Array.from(new Set(ids)).slice(0, 2000)
+  return { ok: true, value: unique }
+}
+
+export async function GET(req: NextRequest) {
   try {
     const user = await getSessionUser()
     if (!user) {
       return NextResponse.json({ error: '未登录' }, { status: 401 })
+    }
+
+    // 分支：?assignments=1 返回卡片→计划绑定映射（仅含已绑定 activePlanId 的卡片）。
+    if (req.nextUrl.searchParams.get('assignments') === '1') {
+      const rows = await db.card.findMany({
+        where: { activePlanId: { not: null } },
+        select: { id: true, activePlanId: true },
+      })
+      const assignments: Record<string, string> = {}
+      for (const c of rows) {
+        if (c.activePlanId) assignments[c.id] = c.activePlanId
+      }
+      return NextResponse.json({ assignments })
     }
 
     // Seed the built-in Ebbinghaus plan when the table is empty.
@@ -144,6 +171,42 @@ export async function PATCH(req: NextRequest) {
       return NextResponse.json({ error: '未登录' }, { status: 401 })
     }
     const body = await req.json().catch(() => ({}))
+
+    // ---- 动作分支：assign / clear（应用到卡片 / 从卡片移除）----
+    // assign：把计划绑定到所选卡片（activePlanId = planId），下次评分时由计划驱动调度。
+    // clear ：清除所选卡片的 activePlanId（回到 FSRS 调度）。
+    if (body?.action === 'assign' || body?.action === 'clear') {
+      const cardIdsRes = validateCardIds(body?.cardIds)
+      if (!cardIdsRes.ok) {
+        return NextResponse.json({ error: cardIdsRes.error }, { status: 400 })
+      }
+      const cardIds = cardIdsRes.value
+
+      if (body.action === 'assign') {
+        const planId = typeof body?.id === 'string' ? body.id : ''
+        if (!planId) {
+          return NextResponse.json({ error: '缺少计划ID' }, { status: 400 })
+        }
+        const plan = await db.reviewPlan.findUnique({ where: { id: planId } })
+        if (!plan) {
+          return NextResponse.json({ error: '计划不存在' }, { status: 404 })
+        }
+        await db.card.updateMany({
+          where: { id: { in: cardIds } },
+          data: { activePlanId: planId },
+        })
+        return NextResponse.json({ ok: true, assigned: cardIds.length, planId })
+      }
+
+      // clear
+      await db.card.updateMany({
+        where: { id: { in: cardIds } },
+        data: { activePlanId: null },
+      })
+      return NextResponse.json({ ok: true, cleared: cardIds.length })
+    }
+
+    // ---- 常规更新：name / days ----
     const id: string = typeof body?.id === 'string' ? body.id : ''
     if (!id) {
       return NextResponse.json({ error: '缺少计划ID' }, { status: 400 })

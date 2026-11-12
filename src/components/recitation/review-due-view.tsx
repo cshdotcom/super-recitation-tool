@@ -1,15 +1,15 @@
 'use client'
 
-// 待复习：SM-2 间隔复习到期卡片 + 默认复习计划的今日项（「计划」徽标）。
-// - 顶部方案选择器：SM-2 艾宾浩斯 / 固定间隔 / 简单模式（localStorage 持久化，
-//   评分提交时作为 scheme 参数传给 POST /api/review，决定下次复习时间的算法）
+// 待复习：服务端 nextReviewAt 驱动的到期卡片（含计划覆盖后的到期卡）。
+// - 顶部算法选择器：FSRS / SM-2 / 固定 / 简单 / 自定义（localStorage 持久化，
+//   评分提交时作为 algorithm 参数传给 POST /api/review）
 // - 「开始复习」进入逐张背书复习会话（自动打开每张卡片的复习模式）：
 //     · 沉浸复习模式（默认开）：全屏挖空正文（点空显示答案 / 一键显示全部答案，
 //       挖空样式与字号跟随全局设置），底部评分条档位随方案变化，
 //       评分后自动下一张，全部完成显示总结
 //     · 关闭时逐张只显示标题，快速过卡评分
-// - 列表行：标题 + 最近动作色点 + 「计划」徽标（默认计划按卡片创建日期生成的
-//   今日项，今天已学过或已免打扰的自动隐藏），点击打开背书页
+// - 列表行：标题 + 最近动作色点 + 「计划」徽标（卡片绑定了 activePlanId 时显示，
+//   服务端在评分时按计划天数覆盖 nextReviewAt，到期即进入本队列），点击打开背书页
 // - 批量：顶栏全选 + 行复选框，底部操作条「忽略（30 天）」「过几天提醒（1/3/7 天）」
 // - 空态：「太棒了，暂无待复习内容」
 // Rendered inside a parent `flex min-h-screen flex-col` wrapper:
@@ -50,7 +50,6 @@ import {
 } from '@/lib/spaced-repetition'
 import { getState, putState } from '@/lib/server-state'
 import { todayKey } from '@/lib/use-local-storage'
-import { useServerState } from '@/lib/use-server-state'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -82,12 +81,12 @@ interface DueCardRow {
   isNew: boolean
 }
 
-/** 待复习队列项 = SM-2 到期卡 / 默认计划今日项 */
+/** 待复习队列项 = 服务端 nextReviewAt 到期卡（含计划覆盖后的到期卡） */
 interface QueueItem extends DueCardRow {
   source: 'due' | 'plan'
-  /** 命中的默认计划名（显示「计划」徽标） */
+  /** 卡片绑定的复习计划名（显示「计划」徽标） */
   planNames: string[]
-  /** 计划第几天（0 = 创建当天） */
+  /** 计划第几天（保留字段，计划驱动调度后由服务端 nextReviewAt 决定到期，客户端不再计算） */
   planDay: number | null
 }
 
@@ -124,10 +123,6 @@ export function fmtReviewInterval(days: number | null | undefined): string {
 // localStorage（个人偏好，按任务约定不加服务端设置项）
 const ALG_KEY = 'beishuba-review-algorithm'
 const IMMERSIVE_KEY = 'beishuba-review-immersive'
-// 默认复习计划 id 列表（多选）— 服务端 KV（AppState）持久化，多端同步，
-// localStorage 仅作离线镜像（ReviewPlan 模型没有 isDefault 字段，
-// 改 schema 需迁移数据库，这里用通用 KV 存储实现同等效果）
-const DEFAULT_PLANS_KEY = 'beishuba-default-plans'
 
 function readStoredAlgorithm(): AlgorithmType {
   try {
@@ -145,16 +140,6 @@ function readStoredImmersive(): boolean {
   } catch {
     return true
   }
-}
-
-/** 本地日历日序号（按年月日取整，避免时区/夏令时漂移） */
-function localDayIndex(d: Date): number {
-  return Math.floor(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) / 86_400_000)
-}
-
-/** 本地日历日差：from → to 相隔几天（创建日 → 今天） */
-function localDaysBetween(from: Date, to: Date): number {
-  return localDayIndex(to) - localDayIndex(from)
 }
 
 function dueMeta(item: QueueItem) {
@@ -187,9 +172,6 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
   // 会话中当前卡的 4 档预览
   const [cardPreview, setCardPreview] = React.useState<CardPreview | null>(null)
 
-  // 默认复习计划（服务端 KV，与「复习计划管理」页共用同一份状态）
-  const [defaultPlanIds] = useServerState<string[]>(DEFAULT_PLANS_KEY, [])
-
   // 复习会话
   const [session, setSession] = React.useState<SessionState | null>(null)
   const [scoring, setScoring] = React.useState(false)
@@ -205,12 +187,16 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
   })
 
   // ---------- data ----------
+  // 计划驱动调度：服务端在 POST /api/review 时按 card.activePlanId 覆盖 nextReviewAt，
+  // /api/review/due 已据 nextReviewAt <= now 判定到期 —— 这里无需客户端再叠加计划项。
+  // 仅拉取卡片→计划绑定映射，给到期卡显示「计划」徽标与计划名。
   const load = React.useCallback(async () => {
     try {
-      const [dueRes, cardsRes, plansRes] = await Promise.all([
+      const [dueRes, cardsRes, plansRes, assignRes] = await Promise.all([
         fetch('/api/review/due'),
         fetch('/api/cards'),
         fetch('/api/plans'),
+        fetch('/api/plans?assignments=1'),
       ])
       const dueData = (await dueRes.json()) as { cards?: DueCardRow[]; error?: string }
       if (!dueRes.ok) throw new Error(dueData.error || '加载失败')
@@ -222,83 +208,32 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
 
       const plansData = (await plansRes.json().catch(() => ({}))) as { plans?: ReviewPlanData[] }
       const plans: ReviewPlanData[] = Array.isArray(plansData.plans) ? plansData.plans : []
+      const planMap = new Map<string, ReviewPlanData>(plans.map((p) => [p.id, p]))
 
-      // ---- 默认计划的今日项：offset = 卡片创建日 → 今天的本地日历日差 ----
-      // 例：标准艾宾浩斯 [0,1,2,4,7,15]，卡片创建后第 0/1/2/4/7/15 天各产生
-      // 一条「计划」复习项；今天已学过（今日计划进度 > 0）或已设置免打扰的隐藏。
-      const defaultPlans = plans.filter(
-        (p) => defaultPlanIds.includes(p.id) && p.days.length > 0,
-      )
-      const planItems = new Map<string, { planNames: string[]; planDay: number }>()
-      if (defaultPlans.length > 0) {
-        const today = new Date()
-        for (const plan of defaultPlans) {
-          for (const c of allCards) {
-            const offset = localDaysBetween(new Date(c.createdAt), today)
-            if (plan.days.includes(offset)) {
-              const hit = planItems.get(c.id)
-              if (hit) {
-                if (!hit.planNames.includes(plan.name)) hit.planNames.push(plan.name)
-              } else {
-                planItems.set(c.id, { planNames: [plan.name], planDay: offset })
-              }
-            }
-          }
-        }
-        // 完成态 + 免打扰过滤（批量查服务端 KV，与背书页共用 plan-<id>-<日期> 进度；
-        // 分批请求避免 key 过多导致 URL 超长）
-        const ids = Array.from(planItems.keys()).slice(0, 200)
-        if (ids.length > 0) {
-          const stateKeys = ids.flatMap((id) => [todayKey(id), `review:snooze:${id}`])
-          const values: Record<string, string | null> = {}
-          const CHUNK = 40
-          for (let i = 0; i < stateKeys.length; i += CHUNK) {
-            Object.assign(values, await getState(stateKeys.slice(i, i + CHUNK)))
-          }
-          const nowMs = Date.now()
-          for (const id of ids) {
-            const progress = Number(values[todayKey(id)])
-            const snoozeUntil = Date.parse(String(values[`review:snooze:${id}`] ?? ''))
-            if (Number.isFinite(progress) && progress > 0) planItems.delete(id)
-            else if (Number.isFinite(snoozeUntil) && snoozeUntil > nowMs) planItems.delete(id)
-          }
-        }
+      // 卡片 → activePlanId 绑定映射（仅含已绑定卡）
+      const assignData = (await assignRes.json().catch(() => ({}))) as {
+        assignments?: Record<string, string>
       }
+      const assignments: Record<string, string> = assignData.assignments ?? {}
 
-      // ---- 合并队列：SM-2 到期卡在前（保留接口顺序：新卡 → 最该复习的），纯计划项在后 ----
+      // ---- 合并队列：完全由服务端 nextReviewAt 驱动（含计划覆盖后的到期卡）----
+      // 给每张到期卡附上「计划」徽标信息：activePlanId 解析到计划名 → planNames。
       const queue: QueueItem[] = dueCards.map((c) => {
-        const plan = planItems.get(c.id)
+        const planId = assignments[c.id]
+        const plan = planId ? planMap.get(planId) : undefined
         return {
           ...c,
-          source: 'due' as const,
-          planNames: plan?.planNames ?? [],
-          planDay: plan?.planDay ?? null,
+          source: plan ? ('plan' as const) : ('due' as const),
+          planNames: plan ? [plan.name] : [],
+          planDay: null,
         }
       })
-      const dueIds = new Set(dueCards.map((c) => c.id))
-      for (const [id, plan] of planItems) {
-        if (dueIds.has(id)) continue
-        const card = allCards.find((c) => c.id === id)
-        if (!card) continue
-        queue.push({
-          id,
-          title: card.title,
-          lastAction: 'none',
-          lastActionAt: card.createdAt,
-          daysSince: plan.planDay,
-          nextReviewAt: null,
-          isNew: false,
-          source: 'plan',
-          planNames: plan.planNames,
-          planDay: plan.planDay,
-        })
-      }
       setCards(queue)
     } catch (err: unknown) {
       setCards([])
       toast.error('待复习加载失败：' + (err instanceof Error ? err.message : '未知错误'))
     }
-  }, [defaultPlanIds])
+  }, [])
 
   React.useEffect(() => {
     void load()
@@ -441,8 +376,8 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
     void load()
   }
 
-  // 与背书页评分保持一致：每次评分给「今日计划」进度 +1（服务端 KV plan-<id>-<日期>）。
-  // 这同时也是默认计划今日项的「已完成」标记。
+  // 与背书页评分保持一致：每次评分给「今日计划」进度 +1（服务端 KV plan-<id>-<日期>），
+  // 背书页据此显示今日背诵次数。
   const bumpTodayProgress = React.useCallback(async (cardId: string) => {
     const key = todayKey(cardId)
     const values = await getState([key])
@@ -684,7 +619,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
           </div>
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground" aria-live="polite">
             {ALGORITHM_TYPES.find((a) => a.value === algorithm)?.desc}
-            {planCount > 0 ? ` · 含默认计划今日项 ${planCount} 张` : ''}
+            {planCount > 0 ? ` · 含计划驱动复习 ${planCount} 张` : ''}
           </p>
           <Button
             className="mt-3 h-12 w-full rounded-xl bg-primary text-base font-semibold"
@@ -722,7 +657,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
               完成复习后，卡片会按复习周期再次出现在这里
             </p>
             <p className="mt-1 text-sm text-muted-foreground/70">
-              在「复习计划管理」勾选默认计划，可按记忆曲线安排每日复习
+              在「复习计划管理」把计划应用到书籍，即可按计划天数自动安排复习
             </p>
           </div>
         ) : (
@@ -775,7 +710,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
                       {item.planNames.length > 0 && (
                         <span
                           className="shrink-0 rounded-full border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600"
-                          title={`默认计划：${item.planNames.join('、')}`}
+                          title={`复习计划：${item.planNames.join('、')}`}
                         >
                           计划
                         </span>
@@ -788,7 +723,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
                           aria-hidden
                         />
                         <span className="min-w-0 truncate">
-                          计划第 {item.planDay} 天 · {item.planNames.join('、')}
+                          {item.planNames.join('、')} · 计划驱动复习
                         </span>
                       </p>
                     ) : (
@@ -1002,7 +937,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
                 <p className="text-xl font-bold">{currentItem?.title}</p>
                 <p className="mt-2 text-sm text-muted-foreground">
                   {currentItem?.source === 'plan'
-                    ? `计划第 ${currentItem.planDay} 天`
+                    ? currentItem.planNames.join('、')
                     : currentItem
                       ? dueMeta(currentItem).days
                       : ''}

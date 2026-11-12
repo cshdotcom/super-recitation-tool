@@ -8,7 +8,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAccount } from '@/lib/auth'
-import { isReviewScheme, scheduleReview } from '@/lib/card'
+import { isReviewScheme, nextReviewDate, scheduleReview } from '@/lib/card'
 import {
   type AlgorithmType,
   type CardMemory,
@@ -26,6 +26,7 @@ import {
 import type { Mastery, ReviewAction, ReviewStats } from '@/lib/types'
 
 const SCORE_ACTIONS = ['familiar', 'fuzzy', 'forget'] as const
+const DAY_MS = 86_400_000
 
 /** Day key 'YYYY-MM-DD' in the client's local calendar.
  *  tzOffsetMin = Date#getTimezoneOffset()（UTC+8 为 -480），
@@ -34,6 +35,60 @@ const SCORE_ACTIONS = ['familiar', 'fuzzy', 'forget'] as const
  *  0:00-8:00 的复习会被记到前一天；`- tzOffsetMin` 才是正确的本地日。 */
 function dayKey(d: Date, tzOffsetMin: number): string {
   return new Date(d.getTime() - tzOffsetMin * 60000).toISOString().slice(0, 10)
+}
+
+/** 本地日历日序号（按 tzOffset 锚定当地零点取整，避免时区漂移）。 */
+function localDayIndex(d: Date, tzOffsetMin: number): number {
+  const localMs = d.getTime() - tzOffsetMin * 60_000
+  return Math.floor(localMs / DAY_MS)
+}
+
+/** 解析 ReviewPlan.days（JSON number[]），过滤非有限数并升序排序。 */
+function parsePlanDays(raw: string): number[] {
+  try {
+    const parsed: unknown = JSON.parse(raw || '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((d): d is number => typeof d === 'number' && Number.isFinite(d))
+      .sort((a, b) => a - b)
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 计划驱动调度：根据卡片的 activePlanId 计划，推算「下一次该复习的日期」。
+ *
+ * 锚点 anchor = 卡片创建时间（card.createdAt）—— 计划天数是「自创建日起的第 N 天」
+ * 的绝对偏移（标准艾宾浩斯语义：[0,1,2,4,7,15] 表示创建当天/第1/2/4/7/15 天各复习一次）。
+ * 若改用 lastReviewedAt 作锚点，连续按期复习时 elapsed 恒为 0/1，会卡在第 1/2 天
+ * 无法推进到 4/7/15 —— 故此处固定用 createdAt，保证计划按里程碑顺序正确推进。
+ *
+ * elapsed = anchor → now 的本地日历日差（整数天）。
+ * nextDay = plan.days 中第一个 > elapsed 的偏移（严格大于，避免当天重复到期）。
+ *   - 命中 → nextReviewAt = anchor 当地零点 + nextDay 天（复用 nextReviewDate 锚定逻辑）。
+ *   - 未命中（所有 plan.days ≤ elapsed，计划已走完）→ 返回 null，回退 FSRS nextReviewAt。
+ *
+ * 返回 { nextReviewAt, scheduledDay, planId } 或 null（无计划 / 计划不存在 / 计划已耗尽）。
+ */
+async function computePlanSchedule(
+  activePlanId: string,
+  anchor: Date,
+  now: Date,
+  tzOffsetMin: number,
+): Promise<{ nextReviewAt: Date; scheduledDay: number; planId: string } | null> {
+  const plan = await db.reviewPlan.findUnique({ where: { id: activePlanId } })
+  if (!plan) return null
+  const days = parsePlanDays(plan.days)
+  if (days.length === 0) return null
+  const elapsed = localDayIndex(now, tzOffsetMin) - localDayIndex(anchor, tzOffsetMin)
+  const nextDay = days.find((d) => d > elapsed)
+  if (nextDay === undefined) return null
+  return {
+    nextReviewAt: nextReviewDate(anchor, nextDay, tzOffsetMin),
+    scheduledDay: nextDay,
+    planId: plan.id,
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -65,7 +120,16 @@ export async function POST(req: NextRequest) {
     // 解析生效算法与配置：全局默认 → 单卡覆盖
     const card = await db.card.findUnique({
       where: { id: cardId },
-      select: { ease: true, interval: true, reviewCount: true, srsState: true, algoType: true, algoConfig: true },
+      select: {
+        ease: true,
+        interval: true,
+        reviewCount: true,
+        srsState: true,
+        algoType: true,
+        algoConfig: true,
+        activePlanId: true,
+        createdAt: true,
+      },
     })
     if (!card) return NextResponse.json({ error: '卡片不存在' }, { status: 404 })
 
@@ -112,6 +176,17 @@ export async function POST(req: NextRequest) {
       ease: card.ease ?? undefined,
     })
 
+    // ---- 计划驱动调度覆盖 ----
+    // 若卡片绑定了 activePlanId，则用计划 days 中下一个到期日覆盖 FSRS nextReviewAt。
+    // FSRS srsState / ease / interval / reviewCount 仍然更新（用于记忆追踪与统计），
+    // 仅 nextReviewAt 改由计划决定。计划不存在或已走完时回退 FSRS nextReviewAt。
+    // 锚点固定为卡片创建时间（createdAt）—— 见 computePlanSchedule 注释。
+    const anchor = card.createdAt
+    const planSchedule = card.activePlanId
+      ? await computePlanSchedule(card.activePlanId, anchor, now, tzOffset)
+      : null
+    const finalNextReviewAt = planSchedule ? planSchedule.nextReviewAt : result.nextReviewAt
+
     // ReviewLog 落库动作（向后兼容旧统计查询：grade→action）
     const logAction: ReviewAction =
       grade === 'again' ? 'forget' : grade === 'hard' ? 'fuzzy' : 'familiar'
@@ -133,13 +208,35 @@ export async function POST(req: NextRequest) {
           interval: Math.max(0, Math.round(result.interval)),
           reviewCount: result.reviewCount,
           lastReviewedAt: now,
-          nextReviewAt: result.nextReviewAt,
+          nextReviewAt: finalNextReviewAt,
         },
       }),
     ])
+
+    // 计划项持久化：回填上一条未完成项（本次复习完成了它）+ 落库本次新安排的计划项。
+    // 失败不影响评分主流程（best-effort，仅记日志）。
+    if (planSchedule) {
+      try {
+        await db.reviewPlanItem.updateMany({
+          where: { cardId, completedAt: null },
+          data: { completedAt: now },
+        })
+        await db.reviewPlanItem.create({
+          data: {
+            cardId,
+            planId: planSchedule.planId,
+            scheduledDay: planSchedule.scheduledDay,
+            scheduledAt: planSchedule.nextReviewAt,
+          },
+        })
+      } catch (err) {
+        console.error('[POST /api/review] plan item persist failed:', err)
+      }
+    }
+
     return NextResponse.json({
       id: log.id,
-      nextReviewAt: result.nextReviewAt,
+      nextReviewAt: finalNextReviewAt,
       interval: result.interval,
       algorithm,
       grade,
@@ -148,6 +245,8 @@ export async function POST(req: NextRequest) {
       newD: result.memory.d,
       newState: result.memory.state,
       log: result.log,
+      planScheduled: !!planSchedule,
+      planDay: planSchedule?.scheduledDay ?? null,
     })
   } catch (err) {
     console.error('[POST /api/review] failed:', err)

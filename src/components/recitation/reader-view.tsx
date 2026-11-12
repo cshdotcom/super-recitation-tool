@@ -230,6 +230,8 @@ export function ReaderView({
   const [aiTitleLoading, setAiTitleLoading] = React.useState(false)
   const [titleEditOpen, setTitleEditOpen] = React.useState(false)
   const [titleDraft, setTitleDraft] = React.useState('')
+  // 单书复习算法配置面板（本书覆盖全局默认）
+  const [bookAlgOpen, setBookAlgOpen] = React.useState(false)
   const [ruleOpen, setRuleOpen] = React.useState(false)
   const [ruleStep, setRuleStep] = React.useState('2')
 
@@ -841,6 +843,17 @@ export function ReaderView({
                 >
                   <Pencil className="size-5" strokeWidth={1.75} />
                 </Button>
+                {/* 本书复习算法配置（覆盖全局默认） */}
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="本书复习算法"
+                  title="本书复习算法配置"
+                  className="text-foreground/80"
+                  onClick={() => setBookAlgOpen(true)}
+                >
+                  <Brain className="size-5" strokeWidth={1.75} />
+                </Button>
                 {/* AI 朗读（全屏音乐播放器，可收起为迷你悬浮条）—
                     点击先提示播放引擎；播放器打开时按钮呈绿色高亮 + 按压缩放反馈 */}
                 <Button
@@ -1364,6 +1377,15 @@ export function ReaderView({
       />
 
       <ShareDialog card={card} open={shareOpen} onOpenChange={setShareOpen} />
+
+      {/* 本书复习算法配置（单卡覆盖全局默认） */}
+      <AlgorithmConfigDialog
+        open={bookAlgOpen}
+        onOpenChange={setBookAlgOpen}
+        scope="card"
+        cardId={card.id}
+        cardTitle={card.title}
+      />
 
       {/* 目录/搜本书（顶部栏目录按钮） */}
       <TocSheet

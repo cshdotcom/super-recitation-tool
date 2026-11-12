@@ -261,6 +261,14 @@ export function FollowupPopover({ getActiveConversationId }: FollowupPopoverProp
    * 提交追问：@param overrideQuestion 模板按钮直接传入固定问题（不经过输入框）。
    * 消息内容统一包裹引用上下文「关于「选中文本」：问题」，对话模式下 AI
    * 携带最近对话历史，天然具备上下文。
+   *
+   * 创建对话策略（用户反馈：不要每次追问都自动新建对话）：
+   *   1) source==='chat' 且有活动对话 → dispatch `app:chatSend` 在当前对话接续
+   *      （ChatTool 实例仍在挂载，内存追加，不重载）。
+   *   2) 其余来源（analysis/favorite/reader/quiz）且有活动对话 → 直接把消息
+   *      写入活动对话（POST messages），再 dispatch `app:openConversation`
+   *      打开该对话；ChatTool 加载时检测到末尾新鲜用户消息会自动补 AI 回复。
+   *   3) 没有活动对话 → 才新建 type='followup' 对话（兜底）。
    */
   const submit = async (overrideQuestion?: string) => {
     if (!detail || submitting) return
@@ -270,7 +278,7 @@ export function FollowupPopover({ getActiveConversationId }: FollowupPopoverProp
     setSubmitting(true)
     const imgs = images.map((p) => p.dataUrl)
     try {
-      // ---- 分支一：AI 对话内追问 → 当前对话接续 ----
+      // ---- 分支一：AI 对话内追问 → 当前对话接续（内存追加，最佳体验） ----
       if (detail.source === 'chat') {
         const convId =
           detail.conversationId ||
@@ -298,7 +306,47 @@ export function FollowupPopover({ getActiveConversationId }: FollowupPopoverProp
         }
       }
 
-      // ---- 分支二：解析/阅读场景 → 新建 followup 对话 ----
+      // ---- 解析/收藏/阅读/答题场景：优先复用活动对话，避免每次追问都新建 ----
+      const activeId =
+        (typeof getActiveConversationId === 'function'
+          ? getActiveConversationId()
+          : undefined) || activeIdRef.current || undefined
+
+      if (activeId) {
+        const content = `【选中文本】\n${selected}\n\n【来源】${
+          detail.cardTitle || SOURCE_LABELS[detail.source] || '阅读内容'
+        }\n\n【追问】\n${q}`
+        const msgRes = await fetch(`/api/conversations/${encodeURIComponent(activeId)}/messages`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [
+              {
+                role: 'user',
+                content,
+                ...(imgs.length > 0 ? { images: imgs } : {}),
+              },
+            ],
+          }),
+        })
+        if (!msgRes.ok) throw new Error('保存追问失败')
+        // 一次性「自我思考」偏好（ChatTool 自动回复时读取并清除）
+        try {
+          window.sessionStorage.setItem(FOLLOWUP_THINKING_KEY, selfThinking ? '1' : '0')
+        } catch {
+          /* 隐私模式下忽略 */
+        }
+        window.dispatchEvent(
+          new CustomEvent('app:openConversation', { detail: { id: activeId } }),
+        )
+        setDetail(null)
+        setQuestion('')
+        setImages([])
+        toast.success('已在当前对话追问')
+        return
+      }
+
+      // ---- 分支三：没有活动对话 → 新建 followup 对话（兜底） ----
       const convRes = await fetch('/api/conversations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

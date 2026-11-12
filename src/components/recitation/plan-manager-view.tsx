@@ -3,10 +3,19 @@
 import * as React from 'react'
 import { createPortal } from 'react-dom'
 import { motion } from 'framer-motion'
-import { ChevronLeft, Eye, MoreHorizontal, Pencil, Plus, Trash2 } from 'lucide-react'
+import {
+  BookMarked,
+  ChevronLeft,
+  Copy,
+  Eye,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  Trash2,
+} from 'lucide-react'
 import { toast } from 'sonner'
 
-import type { ReviewPlanData } from '@/lib/types'
+import type { CardData, ProjectData, ReviewPlanData } from '@/lib/types'
 import { useServerState } from '@/lib/use-server-state'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -16,6 +25,7 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
@@ -79,6 +89,8 @@ export function PlanManagerView({ onBack }: PlanManagerViewProps) {
   const [screen, setScreen] = React.useState<Screen>({ mode: 'list' })
   // 默认计划（多选）：勾选后其「今日复习项」进入待复习队列
   const [defaultIds, setDefaultIds] = useServerState<string[]>(DEFAULT_PLANS_KEY, [])
+  // 「应用到书籍」目标计划：设值后弹出选卡对话框
+  const [assignTarget, setAssignTarget] = React.useState<ReviewPlanData | null>(null)
 
   const refresh = React.useCallback(async () => {
     try {
@@ -116,6 +128,34 @@ export function PlanManagerView({ onBack }: PlanManagerViewProps) {
     [defaultIds, setDefaultIds],
   )
 
+  // 克隆计划：复制名称（+ 副本）与 days，新建一份自定义计划
+  const handleClone = React.useCallback(
+    async (plan: ReviewPlanData) => {
+      const tid = toast.loading('正在克隆…')
+      try {
+        const res = await fetch('/api/plans', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: `${plan.name} 副本`.slice(0, 30),
+            days: plan.days,
+          }),
+        })
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}))
+          throw new Error(err.error || '克隆失败')
+        }
+        toast.success(`已克隆「${plan.name}」`, { id: tid })
+        void refresh()
+      } catch (err) {
+        toast.error('克隆失败：' + (err instanceof Error ? err.message : '未知错误'), {
+          id: tid,
+        })
+      }
+    },
+    [refresh],
+  )
+
   const handleSaved = React.useCallback(
     (createdId?: string, setDefault?: boolean) => {
       // 新建计划时勾了「设为默认」→ 保存后直接加入默认列表
@@ -139,23 +179,41 @@ export function PlanManagerView({ onBack }: PlanManagerViewProps) {
 
   if (screen.mode === 'list') {
     return (
-      <ListScreen
-        plans={plans}
-        loading={loading}
-        defaultIds={defaultIds}
-        onToggleDefault={toggleDefault}
-        onBack={onBack}
-        onNew={() => setScreen({ mode: 'edit', plan: null })}
-        onEdit={(plan) => setScreen({ mode: 'edit', plan })}
-        onChanged={refresh}
-        onDeleted={handleDeleted}
-      />
+      <>
+        <ListScreen
+          plans={plans}
+          loading={loading}
+          defaultIds={defaultIds}
+          onToggleDefault={toggleDefault}
+          onBack={onBack}
+          onNew={() => setScreen({ mode: 'edit', plan: null })}
+          onEdit={(plan) => setScreen({ mode: 'edit', plan })}
+          onChanged={refresh}
+          onDeleted={handleDeleted}
+          onAssign={(plan) => setAssignTarget(plan)}
+          onClone={handleClone}
+        />
+        {assignTarget && (
+          <AssignDialog
+            plan={assignTarget}
+            onOpenChange={(open) => {
+              if (!open) setAssignTarget(null)
+            }}
+            onAssigned={() => {
+              setAssignTarget(null)
+              void refresh()
+            }}
+          />
+        )}
+      </>
     )
   }
   return (
     <EditScreen
       key={screen.plan?.id ?? 'new'}
       plan={screen.plan}
+      isDefault={screen.plan ? defaultIds.includes(screen.plan.id) : false}
+      onToggleDefault={toggleDefault}
       readOnly={screen.plan?.builtIn ?? false}
       onCancel={() => setScreen({ mode: 'list' })}
       onSaved={handleSaved}
@@ -175,6 +233,8 @@ function ListScreen({
   onEdit,
   onChanged,
   onDeleted,
+  onAssign,
+  onClone,
 }: {
   plans: ReviewPlanData[]
   loading: boolean
@@ -187,6 +247,10 @@ function ListScreen({
   onChanged: () => Promise<void>
   /** 删除成功后回调（清理默认列表悬空 id） */
   onDeleted: (id: string) => void
+  /** 应用计划到书籍（打开选卡对话框） */
+  onAssign: (plan: ReviewPlanData) => void
+  /** 克隆计划 */
+  onClone: (plan: ReviewPlanData) => void
 }) {
   const [deleteTarget, setDeleteTarget] = React.useState<ReviewPlanData | null>(null)
   // Optimistic tombstones for just-deleted plans (cleared after refresh).
@@ -226,10 +290,11 @@ function ListScreen({
       <ViewHeader title="复习计划管理" onBack={onBack} />
 
       <main className="mx-auto w-full max-w-2xl flex-1 px-4 pb-28 pt-6">
-        {/* 默认计划说明 */}
+        {/* 计划驱动调度说明 */}
         <p className="mb-4 rounded-2xl bg-muted/60 px-4 py-3 text-xs leading-relaxed text-muted-foreground">
-          勾选「默认」可同时设多个计划：系统会按每张背书卡的创建日期，在计划安排的
-          第 0/1/2/4/7… 天自动生成今日复习项，出现在「待复习」列表中（带「计划」徽标）
+          点击「应用到书籍」把计划绑定到选定的卡片：评分后服务端会按计划天数
+          （0/1/2/4/7… 天）覆盖下次复习时间，真实驱动「待复习」队列；未绑定的卡片
+          继续走 FSRS 算法。勾选「默认」可标记常用计划。
         </p>
         {loading ? (
           <div className="flex flex-col gap-4">
@@ -251,6 +316,8 @@ function ListScreen({
                 onToggleDefault={() => onToggleDefault(plan)}
                 onEdit={() => onEdit(plan)}
                 onDelete={() => setDeleteTarget(plan)}
+                onAssign={() => onAssign(plan)}
+                onClone={() => onClone(plan)}
               />
             ))}
           </div>
@@ -304,15 +371,17 @@ function PlanCard({
   onToggleDefault,
   onEdit,
   onDelete,
+  onAssign,
+  onClone,
 }: {
   plan: ReviewPlanData
   isDefault: boolean
   onToggleDefault: () => void
   onEdit: () => void
   onDelete: () => void
+  onAssign: () => void
+  onClone: () => void
 }) {
-  const scheduleText = `复习 ${plan.days.length} 次 · ${plan.days.map(dayLabel).join(' / ')}`
-
   return (
     <div
       className={cn(
@@ -320,7 +389,7 @@ function PlanCard({
         isDefault && 'ring-1 ring-emerald-600/40',
       )}
     >
-      {/* 默认计划勾选（可多选）：勾选后按卡片创建日期生成今日复习项 */}
+      {/* 默认计划勾选（可多选）：勾选后标记为常用默认计划 */}
       <button
         type="button"
         role="checkbox"
@@ -339,7 +408,7 @@ function PlanCard({
       </button>
       {isDefault && (
         <span className="absolute right-12 top-4 rounded-full border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
-          已生效
+          已标记
         </span>
       )}
       <h3 className="text-2xl font-bold">{plan.name}</h3>
@@ -359,6 +428,29 @@ function PlanCard({
           </span>
         ))}
       </div>
+      {/* 操作按钮：应用到书籍 / 克隆（所有计划均可） */}
+      <div className="mt-5 flex justify-center gap-2 px-2">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={onAssign}
+          className="h-9 rounded-full border-border text-xs font-medium text-foreground hover:bg-muted"
+        >
+          <BookMarked className="size-3.5" strokeWidth={1.75} aria-hidden />
+          应用到书籍
+        </Button>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          onClick={onClone}
+          className="h-9 rounded-full border-border text-xs font-medium text-foreground hover:bg-muted"
+        >
+          <Copy className="size-3.5" strokeWidth={1.75} aria-hidden />
+          克隆
+        </Button>
+      </div>
       {plan.builtIn ? (
         <button
           type="button"
@@ -369,7 +461,7 @@ function PlanCard({
           <Eye className="size-5" strokeWidth={1.75} />
         </button>
       ) : (
-        <PlanMenuButton plan={plan} onEdit={onEdit} onDelete={onDelete} />
+        <PlanMenuButton plan={plan} onEdit={onEdit} onDelete={onDelete} onAssign={onAssign} onClone={onClone} />
       )}
     </div>
   )
@@ -380,10 +472,14 @@ function PlanMenuButton({
   plan,
   onEdit,
   onDelete,
+  onAssign,
+  onClone,
 }: {
   plan: ReviewPlanData
   onEdit: () => void
   onDelete: () => void
+  onAssign: () => void
+  onClone: () => void
 }) {
   const [mounted, setMounted] = React.useState(false)
   const [open, setOpen] = React.useState<{ x: number; y: number } | null>(null)
@@ -393,7 +489,7 @@ function PlanMenuButton({
     e.stopPropagation()
     const rect = e.currentTarget.getBoundingClientRect()
     const x = Math.max(8, Math.min(rect.right - MENU_WIDTH, window.innerWidth - MENU_WIDTH - 8))
-    const y = Math.min(rect.bottom + 6, window.innerHeight - 140)
+    const y = Math.min(rect.bottom + 6, window.innerHeight - 220)
     setOpen({ x, y })
   }
 
@@ -450,6 +546,34 @@ function PlanMenuButton({
           role="menuitem"
           onClick={() => {
             setOpen(null)
+            onAssign()
+          }}
+          className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13px] text-zinc-100 transition-colors hover:bg-white/10"
+        >
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <BookMarked className="size-4" strokeWidth={1.75} />
+          </span>
+          <span>应用到书籍</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            setOpen(null)
+            onClone()
+          }}
+          className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13px] text-zinc-100 transition-colors hover:bg-white/10"
+        >
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <Copy className="size-4" strokeWidth={1.75} />
+          </span>
+          <span>克隆</span>
+        </button>
+        <button
+          type="button"
+          role="menuitem"
+          onClick={() => {
+            setOpen(null)
             onDelete()
           }}
           className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-[13px] text-red-400 transition-colors hover:bg-red-500/15"
@@ -484,11 +608,17 @@ function PlanMenuButton({
 
 function EditScreen({
   plan,
+  isDefault = false,
+  onToggleDefault,
   readOnly = false,
   onCancel,
   onSaved,
 }: {
   plan: ReviewPlanData | null
+  /** 现有计划是否已是默认（用于回显复选框；新建计划恒为 false） */
+  isDefault?: boolean
+  /** 切换默认计划（现有计划即时生效；新建计划不调用此回调） */
+  onToggleDefault: (plan: ReviewPlanData) => void
   readOnly?: boolean
   onCancel: () => void
   /** 保存成功回调；新建计划时回传（新计划 id, 是否设为默认） */
@@ -499,10 +629,25 @@ function EditScreen({
   const [days, setDays] = React.useState<number[]>(plan ? [...plan.days] : [])
   const [saving, setSaving] = React.useState(false)
   const [dayDialogRow, setDayDialogRow] = React.useState<number | null>(null)
-  // 新建计划时可同时勾选「设为默认计划」（保存后立即生效）
+  // 新建计划时可同时勾选「设为默认计划」（保存后立即生效）；
+  // 现有计划则用 isDefault 回显，勾选即时通过 onToggleDefault 生效。
   const [defaultChecked, setDefaultChecked] = React.useState(false)
 
   const canSave = !readOnly && name.trim().length > 0 && days.length > 0 && !saving
+
+  // 复选框统一处理：现有计划即时切换默认；新建计划暂存到 defaultChecked，保存时回传。
+  const handleDefaultToggle = React.useCallback(
+    (checked: boolean) => {
+      if (plan) {
+        if (checked !== isDefault) onToggleDefault(plan)
+      } else {
+        setDefaultChecked(checked)
+      }
+    },
+    [plan, isDefault, onToggleDefault],
+  )
+
+  const defaultCheckedValue = plan ? isDefault : defaultChecked
 
   const appendRow = React.useCallback(() => {
     setDays((prev) => {
@@ -642,18 +787,20 @@ function EditScreen({
           )}
         </div>
 
-        {/* 新建时可同时设为默认计划 */}
-        {!readOnly && !plan && (
+        {/* 设为默认计划（新建=保存后生效；现有=即时切换）—— 复选框对所有可编辑计划可见 */}
+        {!readOnly && (
           <label className="mb-4 mt-6 flex cursor-pointer items-center gap-2.5 rounded-2xl bg-card px-4 py-3.5 shadow-sm">
             <Checkbox
-              checked={defaultChecked}
-              onCheckedChange={(v) => setDefaultChecked(v === true)}
-              aria-label="保存后设为默认计划"
+              checked={defaultCheckedValue}
+              onCheckedChange={(v) => handleDefaultToggle(v === true)}
+              aria-label={plan ? '设为默认计划' : '保存后设为默认计划'}
               className="size-5"
             />
-            <span className="text-sm font-medium">保存后设为默认计划</span>
+            <span className="text-sm font-medium">
+              {plan ? '设为默认计划' : '保存后设为默认计划'}
+            </span>
             <span className="ml-auto text-xs text-muted-foreground">
-              今日复习项将进入待复习列表
+              {plan ? (isDefault ? '已设为默认' : '标记为常用计划') : '保存后立即生效'}
             </span>
           </label>
         )}
@@ -771,6 +918,301 @@ function DayPickerDialog({
             确定
           </Button>
         </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ==================== 应用到书籍（选卡对话框） ====================
+
+interface AssignDialogProps {
+  plan: ReviewPlanData
+  onOpenChange: (open: boolean) => void
+  onAssigned: () => void
+}
+
+/**
+ * 把计划绑定到选定的卡片（设置 Card.activePlanId）。
+ * - 拉取全量卡片 + 项目 + 当前 activePlanId 绑定映射；
+ * - 已绑定本计划的卡片默认勾选；
+ * - 支持按项目分组、全选、搜索过滤；
+ * - 「应用」= 给选中卡片设 activePlanId；「移除计划」= 清除选中卡片的 activePlanId。
+ */
+function AssignDialog({ plan, onOpenChange, onAssigned }: AssignDialogProps) {
+  const [loading, setLoading] = React.useState(true)
+  const [cards, setCards] = React.useState<CardData[]>([])
+  const [projects, setProjects] = React.useState<ProjectData[]>([])
+  const [assignments, setAssignments] = React.useState<Record<string, string>>({})
+  const [selected, setSelected] = React.useState<Set<string>>(new Set())
+  const [busy, setBusy] = React.useState(false)
+  const [filter, setFilter] = React.useState('')
+
+  React.useEffect(() => {
+    let alive = true
+    Promise.all([
+      fetch('/api/cards').then((r) => r.json()),
+      fetch('/api/projects').then((r) => r.json()),
+      fetch('/api/plans?assignments=1').then((r) => r.json()),
+    ])
+      .then(([c, p, a]) => {
+        if (!alive) return
+        const allCards: CardData[] = Array.isArray(c?.cards) ? c.cards : []
+        const allProjects: ProjectData[] = Array.isArray(p?.projects) ? p.projects : []
+        const map: Record<string, string> = a?.assignments ?? {}
+        setCards(allCards)
+        setProjects(allProjects)
+        setAssignments(map)
+        // 默认勾选已绑定本计划的卡片
+        const pre = new Set<string>()
+        for (const [cid, pid] of Object.entries(map)) {
+          if (pid === plan.id) pre.add(cid)
+        }
+        setSelected(pre)
+      })
+      .catch(() => {
+        /* ignore — load empty */
+      })
+      .finally(() => {
+        if (alive) setLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [plan.id])
+
+  const filtered = React.useMemo(() => {
+    const kw = filter.trim().toLowerCase()
+    if (!kw) return cards
+    return cards.filter((c) => c.title.toLowerCase().includes(kw))
+  }, [cards, filter])
+
+  // 按项目分组（保留项目 ord 顺序，未分类最后）
+  const groups = React.useMemo(() => {
+    const map = new Map<string, CardData[]>()
+    for (const c of filtered) {
+      const key = c.categoryId || ''
+      const arr = map.get(key) ?? []
+      arr.push(c)
+      map.set(key, arr)
+    }
+    const ordered: { id: string; name: string; items: CardData[] }[] = []
+    for (const p of projects) {
+      const arr = map.get(p.id)
+      if (arr && arr.length > 0) ordered.push({ id: p.id, name: p.name, items: arr })
+    }
+    const uncat = map.get('')
+    if (uncat && uncat.length > 0) ordered.push({ id: '', name: '未分类', items: uncat })
+    return ordered
+  }, [filtered, projects])
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const n = new Set(prev)
+      if (n.has(id)) n.delete(id)
+      else n.add(id)
+      return n
+    })
+  }
+
+  const toggleProject = (catId: string) => {
+    const ids = groups.find((g) => g.id === catId)?.items.map((c) => c.id) ?? []
+    if (ids.length === 0) return
+    setSelected((prev) => {
+      const n = new Set(prev)
+      const allIn = ids.every((id) => n.has(id))
+      if (allIn) ids.forEach((id) => n.delete(id))
+      else ids.forEach((id) => n.add(id))
+      return n
+    })
+  }
+
+  const selectAll = () => setSelected(new Set(filtered.map((c) => c.id)))
+  const clearAll = () => setSelected(new Set())
+
+  const apply = async (mode: 'assign' | 'clear') => {
+    if (selected.size === 0 || busy) return
+    setBusy(true)
+    const tid = toast.loading(mode === 'assign' ? '正在应用…' : '正在移除…')
+    try {
+      const res = await fetch('/api/plans', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(
+          mode === 'assign'
+            ? { action: 'assign', id: plan.id, cardIds: Array.from(selected) }
+            : { action: 'clear', cardIds: Array.from(selected) },
+        ),
+      })
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean
+        error?: string
+        assigned?: number
+        cleared?: number
+      }
+      if (!res.ok || !data.ok) throw new Error(data.error || '操作失败')
+      const count = mode === 'assign' ? data.assigned ?? selected.size : data.cleared ?? selected.size
+      toast.success(
+        mode === 'assign' ? `已应用到 ${count} 张卡片` : `已从 ${count} 张卡片移除计划`,
+        { id: tid },
+      )
+      onAssigned()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '操作失败', { id: tid })
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg gap-0 rounded-2xl p-0">
+        <DialogHeader className="px-5 pt-5">
+          <DialogTitle>应用到书籍 · {plan.name}</DialogTitle>
+          <DialogDescription>
+            勾选要绑定的卡片：评分后服务端按计划天数（{plan.days.map(dayLabel).join('、')}）覆盖下次复习时间。未勾选的卡片继续走 FSRS 算法。
+          </DialogDescription>
+        </DialogHeader>
+
+        {/* 工具条：搜索 + 全选/清空 */}
+        <div className="flex items-center gap-2 px-5 py-3">
+          <Input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="搜索卡片标题…"
+            aria-label="搜索卡片"
+            className="h-9 flex-1 rounded-lg"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={selectAll}
+            disabled={loading || filtered.length === 0}
+            className="h-9 rounded-lg"
+          >
+            全选
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={clearAll}
+            disabled={selected.size === 0}
+            className="h-9 rounded-lg"
+          >
+            清空
+          </Button>
+        </div>
+
+        {/* 卡片列表（按项目分组，长列表滚动） */}
+        <div className="max-h-96 overflow-y-auto px-2 pb-2">
+          {loading ? (
+            <div className="flex flex-col gap-2 px-3 py-2">
+              <Skeleton className="h-10 rounded-lg" />
+              <Skeleton className="h-10 rounded-lg" />
+              <Skeleton className="h-10 rounded-lg" />
+            </div>
+          ) : groups.length === 0 ? (
+            <p className="px-3 py-8 text-center text-sm text-muted-foreground">
+              {filter ? '没有匹配的卡片' : '暂无卡片，先导入背书内容'}
+            </p>
+          ) : (
+            groups.map((g) => {
+              const ids = g.items.map((c) => c.id)
+              const allIn = ids.length > 0 && ids.every((id) => selected.has(id))
+              const someIn = ids.some((id) => selected.has(id))
+              return (
+                <section key={g.id || '__uncat'} className="mb-2">
+                  <div className="flex items-center gap-2 px-3 py-1.5">
+                    <Checkbox
+                      checked={allIn ? true : someIn ? 'indeterminate' : false}
+                      onCheckedChange={() => toggleProject(g.id)}
+                      aria-label={`全选项目：${g.name}`}
+                      className="size-4"
+                    />
+                    <span className="text-xs font-semibold text-muted-foreground">
+                      {g.name}（{g.items.length}）
+                    </span>
+                  </div>
+                  <div className="flex flex-col gap-0.5">
+                    {g.items.map((c) => {
+                      const checked = selected.has(c.id)
+                      const assignedPlanId = assignments[c.id]
+                      const hasThis = assignedPlanId === plan.id
+                      const hasOther = !!assignedPlanId && !hasThis
+                      return (
+                        <button
+                          key={c.id}
+                          type="button"
+                          onClick={() => toggle(c.id)}
+                          aria-pressed={checked}
+                          className={cn(
+                            'flex items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm transition-colors',
+                            checked ? 'bg-emerald-500/10' : 'hover:bg-muted',
+                          )}
+                        >
+                          <Checkbox
+                            checked={checked}
+                            className="pointer-events-none size-4"
+                            tabIndex={-1}
+                            aria-hidden
+                          />
+                          <span className="min-w-0 flex-1 truncate text-foreground">
+                            {c.title || '未命名卡片'}
+                          </span>
+                          {hasThis && (
+                            <span className="shrink-0 rounded-full border border-emerald-600/40 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
+                              已绑定
+                            </span>
+                          )}
+                          {hasOther && (
+                            <span className="shrink-0 rounded-full border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
+                              其他计划
+                            </span>
+                          )}
+                        </button>
+                      )
+                    })}
+                  </div>
+                </section>
+              )
+            })
+          )}
+        </div>
+
+        <DialogFooter className="flex-row items-center justify-between gap-2 border-t border-border px-5 py-3">
+          <span className="text-xs text-muted-foreground">已选 {selected.size} 张</span>
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => onOpenChange(false)}
+              disabled={busy}
+              className="h-9 rounded-lg"
+            >
+              取消
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void apply('clear')}
+              disabled={busy || selected.size === 0}
+              className="h-9 rounded-lg"
+            >
+              移除计划
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => void apply('assign')}
+              disabled={busy || selected.size === 0}
+              className="h-9 rounded-lg bg-zinc-900 text-white hover:bg-zinc-800"
+            >
+              应用（{selected.size}）
+            </Button>
+          </div>
+        </DialogFooter>
       </DialogContent>
     </Dialog>
   )

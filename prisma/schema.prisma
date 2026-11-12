@@ -50,6 +50,26 @@ model Card {
   //   { s, d, reps, lapses, state(new|learning|review|relearn|suspended),
   //     lastGrade, lastReviewAt, history:[{at,grade,s,d,r,elapsedDays}] }
   srsState      String   @default("{}")
+  // ---- 复习计划关联（v2.9.0+）----
+  // activePlanId: 该卡绑定的复习计划 id（null = 跟随 FSRS 算法调度，不读计划）。
+  //   在 POST /api/review 评分时：若有 activePlanId，则以计划 days 中下一个
+  //   到期日覆盖 FSRS nextReviewAt（FSRS srsState 仍更新用于记忆追踪）。
+  activePlanId  String?
+}
+
+// 复习计划执行明细 — 每张卡按其 activePlanId 计划推进时，每次评分落一条记录，
+// 持久化「计划第 N 天 → 实际安排时间」的对应关系（计划驱动调度的审计轨迹）。
+// scheduledDay: 命中的计划 days 偏移（0 = 创建/上次复习当天）。
+// scheduledAt : 服务端据此覆盖的 nextReviewAt（计划锚定日 + scheduledDay 天）。
+// completedAt : 该计划项实际被复习时填入（评分 POST 时回填上一条未完成项）。
+model ReviewPlanItem {
+  id           String    @id @default(uuid())
+  cardId       String
+  planId       String
+  scheduledDay Int
+  scheduledAt  DateTime
+  completedAt  DateTime?
+  createdAt    DateTime  @default(now())
 }
 
 // 项目（分类文件夹）— 侧边栏「项目」区。删除项目时卡片移入未分类("")。

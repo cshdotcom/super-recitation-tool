@@ -1,3 +1,8 @@
+/* KaTeX styles must load globally (before Tailwind) so that lazily-loaded
+   RichContent chunks (chat / quiz / papers / wrong-questions / media detail)
+   render math correctly the moment they mount — otherwise KaTeX's HTML shows
+   "exploded" (∑ i=1 n i 2) until the lazy CSS chunk arrives. */
+@import "katex/dist/katex.min.css";
 @import "tailwindcss";
 @import "tw-animate-css";
 

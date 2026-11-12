@@ -1631,14 +1631,13 @@ export function WrongQuestionsView({
                               </span>
                             )}
                           </div>
-                          <p
+                          <RichContent
+                            content={item.question ?? ''}
                             className={cn(
                               'mt-1.5 text-sm leading-relaxed',
                               !isExpanded && 'line-clamp-2',
                             )}
-                          >
-                            <Highlight text={item.question} query={hlQuery} />
-                          </p>
+                          />
                         </div>
                         <ChevronDown
                           className={cn(
@@ -1658,12 +1657,13 @@ export function WrongQuestionsView({
                                   ?.userAnswer || '（未记录）'}
                               </span>
                             </p>
-                            <p className="text-sm leading-relaxed">
-                              <span className="mr-1 text-xs text-muted-foreground">正确答案：</span>
-                              <span className="break-all font-medium text-emerald-700 dark:text-emerald-300">
-                                <Highlight text={item.answer || '（无标准答案）'} query={hlQuery} />
-                              </span>
-                            </p>
+                            <div className="flex items-start gap-1 text-sm leading-relaxed">
+                              <span className="mt-0.5 shrink-0 text-xs text-muted-foreground">正确答案：</span>
+                              <RichContent
+                                content={item.answer || '（无标准答案）'}
+                                className="min-w-0 flex-1 break-words font-medium text-emerald-700 dark:text-emerald-300"
+                              />
+                            </div>
                           </div>
                           <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
                             <span>
@@ -2372,26 +2372,37 @@ export function PracticeBoard({
             )}
           </button>
         </div>
-        <p className="mt-3 whitespace-pre-wrap text-[15px] font-medium leading-relaxed">
-          {item.question}
-        </p>
+        <RichContent
+          content={item.question ?? ''}
+          className="mt-3 text-[15px] font-medium leading-relaxed"
+        />
 
         {item.type === 'choice' && item.options.length > 0 ? (
           <div className="mt-4 flex flex-col gap-2">
             {item.options.map((opt, i) => (
-              <button
+              <div
                 key={i}
-                type="button"
+                role="button"
+                tabIndex={0}
+                aria-pressed={picked === opt}
                 onClick={() => setPicked(opt)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault()
+                    setPicked(opt)
+                  }
+                }}
                 className={cn(
-                  'min-h-11 rounded-xl border border-border px-4 py-2.5 text-left text-sm leading-relaxed transition-colors',
+                  'min-h-11 cursor-pointer rounded-xl border border-border px-4 py-2.5 text-left text-sm leading-relaxed transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
                   picked === opt
                     ? 'border-zinc-900 bg-zinc-900/5 font-medium dark:border-zinc-100/60 dark:bg-zinc-100/10'
                     : 'hover:bg-muted/60',
                 )}
               >
-                {String.fromCharCode(65 + i)}. {opt}
-              </button>
+                <RichContent
+                  content={`${String.fromCharCode(65 + i)}. ${opt ?? ''}`}
+                />
+              </div>
             ))}
           </div>
         ) : (
@@ -2425,9 +2436,10 @@ export function PracticeBoard({
           {/* 答案 */}
           <div className="rounded-2xl bg-card p-4">
             <p className="text-xs text-muted-foreground">正确答案</p>
-            <p className="mt-1.5 whitespace-pre-wrap text-[15px] font-bold leading-relaxed">
-              {item.answer || '（无标准答案）'}
-            </p>
+            <RichContent
+              content={item.answer || '（无标准答案）'}
+              className="mt-1.5 text-[15px] font-bold leading-relaxed"
+            />
             {picked && (
               <p className="mt-2 text-xs text-muted-foreground">
                 你的选择：{picked}

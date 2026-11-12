@@ -647,7 +647,11 @@ function hastNodeText(node?: HastNode | null): string {
 }
 
 function firstElementChild(node?: HastNode | null): HastNode | undefined {
-  return node?.children?.find((c) => c.type === 'element' || c.type === 'text')
+  // Only a real element child counts as the <code> inside <pre>. A leading
+  // text node (e.g. raw HTML `<pre>\n<code>…</code></pre>` with whitespace)
+  // must NOT be returned — it has no properties, so it would wipe the language
+  // class and yield raw='\n', wrapping multi-block content in a fake code block.
+  return node?.children?.find((c) => c.type === 'element')
 }
 
 function CodeBlock({
@@ -1002,7 +1006,10 @@ function buildMarkdownComponents(ctx: MediaCtx): Components {
       const classNames = Array.isArray(codeChild?.properties?.className)
         ? ((codeChild?.properties?.className as unknown[]) || []).join(' ')
         : ''
-      const raw = hastNodeText(codeChild)
+      // No <code> child (e.g. raw <pre>text</pre>): fall back to the whole
+      // <pre>'s text so the copy button still grabs the real content instead
+      // of an empty string.
+      const raw = codeChild ? hastNodeText(codeChild) : hastNodeText(el)
       if (classNames.includes('language-mermaid')) {
         return <MermaidBlock code={raw} ctx={ctx} />
       }
@@ -1023,8 +1030,12 @@ function buildMarkdownComponents(ctx: MediaCtx): Components {
     code: ({ className, children }) => {
       const cls = typeof className === 'string' ? className : ''
       // Block-level code (inside our pre wrapper): keep it plain, pre styles it.
-      if (cls.includes('language-') || reactNodeText(children).includes('\n')) {
-        return <code className="font-mono">{children}</code>
+      // Preserve the original className (hljs + language-X) so highlight.js
+      // token CSS and the dark-mode overrides in globals.css actually apply —
+      // dropping it made every fenced block render with default color and
+      // looked like a flat mono blob ("显示成代码块").
+      if (cls.includes('language-') || cls.includes('hljs') || reactNodeText(children).includes('\n')) {
+        return <code className={cn('font-mono', cls)}>{children}</code>
       }
       // Inline code pill.
       return (
