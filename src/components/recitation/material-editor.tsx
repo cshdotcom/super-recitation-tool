@@ -85,7 +85,7 @@ import { FreeCropBox, type CropBox, type CropOffset } from '@/components/recitat
 
 import type { CardData, MaterialBlock } from '@/lib/types'
 import { extractClozeMarks, wrapClozeMark } from '@/lib/editor-cloze'
-import { expandSpanDirectives } from '@/lib/inline-style'
+import { toggleQuoteLines, toggleWrap } from '@/lib/format-toggle'
 import { transformImage } from '@/lib/image-transform'
 import { cn } from '@/lib/utils'
 import { VoiceInput } from '@/components/recitation/voice-input'
@@ -425,17 +425,18 @@ function FontSizePicker({ onPick }: { onPick: (px: number) => void }) {
   )
 }
 
-/** 预览用：{{挖空}} 显示为加粗；==高亮==/%%样式|文字%%/嵌套组合统一走共享展开器
- *（src/lib/inline-style.ts，与阅读页 rich-content 同一链路，嵌套样式叠加） */
+/** 预览用：{{挖空}} 显示为加粗。
+ * 注意：不要在这里预展开 ==高亮==/%%样式%% —— RichContent 内部会调用
+ * expandSpanDirectives（幂等），且必须在 splitHtmlSegments「按行识别
+ * HTML 块」之后进行；预先展开会让以 <mark>/<span> 开头的整行被误判为
+ * 用户 HTML 块而进入 Shadow DOM 沙盒（丢失行内排版上下文），
+ * 嵌套格式应走 react-markdown + rehype-raw 的行内路径。 */
 function toPreviewMarkdown(text: string): string {
   // {{挖空}} → **加粗**（关键词提取用 extractClozeMarks）
-  const withCloze = String(text ?? '').replace(/\{\{([^{}]*)\}\}/g, (_m, inner: string) => {
+  return String(text ?? '').replace(/\{\{([^{}]*)\}\}/g, (_m, inner: string) => {
     const kw = inner.trim()
     return kw ? `**${kw}**` : inner
   })
-  // ==高亮== → <mark>；字色/字号/下划线 %%dir|文字%% → <span style>；
-  // 容器内嵌套的 **/* /~~ → <strong>/<em>/<del>（对 react-markdown + rehype-raw 友好）
-  return expandSpanDirectives(withCloze)
 }
 
 // ---------- 块内富媒体引用条：见 media-ref-strip.tsx（图片/表格/导图/公式统一引用机制） ----------
@@ -1379,9 +1380,47 @@ export function MaterialEditor(props: MaterialEditorProps): React.JSX.Element {
     })
   }
 
+  /**
+   * 格式开关（toggle）：对最近聚焦文本框的选区套用/解除一种行内格式。
+   * 共享逻辑在 src/lib/format-toggle.ts（与表格编辑器一致）：
+   * 包含标记对/紧邻标记对 → 解除；光标在同名对内 → 延续格式插占位文字；
+   * 其余 → 包裹，与其他格式（高亮/下划线/字色…）任意嵌套层层叠加。
+   */
   const applyFormat = (kind: FormatKind) => {
     const op = FORMAT_MAP[kind]
-    insertMarkdown(op.before, op.after, op.ph)
+    const target = lastFocusRef.current
+    const el = target ? taRefs.current.get(`${target.index}-${target.field}`) : undefined
+    if (!target || !el || target.index >= blocksRef.current.length) {
+      toast.info('请先点击要编辑的文本框')
+      return
+    }
+    const value = el.value
+    const start = el.selectionStart ?? value.length
+    const end = el.selectionEnd ?? start
+    const idx = target.index
+    const field = target.field
+
+    const setBlockValue = (nextValue: string, selStart: number, selEnd: number) => {
+      commit(
+        (prev) =>
+          prev.map((b, bi) =>
+            bi === idx ? (field === 'front' ? { ...b, front: nextValue } : { ...b, back: nextValue }) : b,
+          ),
+        `fmt-${idx}-${field}`,
+      )
+      requestAnimationFrame(() => {
+        el.focus()
+        el.setSelectionRange(selStart, selEnd)
+      })
+    }
+
+    if (kind === 'quote') {
+      const r = toggleQuoteLines(value, start, end)
+      setBlockValue(r.value, r.start, r.end)
+      return
+    }
+    const r = toggleWrap(value, start, end, op.before, op.after, op.ph)
+    setBlockValue(r.value, r.start, r.end)
   }
 
   /** 挖空：把最近聚焦文本框的选区文字包上 {{ }}（src/lib/editor-cloze.ts） */

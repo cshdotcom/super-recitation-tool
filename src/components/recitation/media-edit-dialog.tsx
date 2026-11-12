@@ -70,6 +70,8 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 
+import { toggleWrap } from '@/lib/format-toggle'
+
 import { cn } from '@/lib/utils'
 import {
   Dialog,
@@ -751,7 +753,8 @@ function TableGridEditor({
     update({ ...grid, spans: nextSpans })
   }
 
-  /** 单元格富文本工具条：包裹选区 */
+  /** 单元格富文本工具条：包裹/解除选区（与正文编辑器同一 toggle 语义，
+   * src/lib/format-toggle.ts —— 已包裹再点一次即解除，多种格式任意嵌套） */
   const wrapSelection = (left: string, right: string = left) => {
     if (!editing) return
     const [r, c] = editing
@@ -761,20 +764,11 @@ function TableGridEditor({
       setCellText(r, c, left + val + right)
       return
     }
-    const start = el.selectionStart ?? val.length
-    const end = el.selectionEnd ?? start
-    const selText = val.slice(start, end)
-    const next =
-      val.slice(0, start) +
-      left +
-      (selText || '文字') +
-      right +
-      val.slice(end)
-    setCellText(r, c, next)
+    const res = toggleWrap(val, el.selectionStart ?? val.length, el.selectionEnd ?? val.length, left, right, '文字')
+    setCellText(r, c, res.value)
     requestAnimationFrame(() => {
       el.focus()
-      const s = start + left.length
-      el.setSelectionRange(s, s + (selText || '文字').length)
+      el.setSelectionRange(res.start, res.end)
     })
   }
 

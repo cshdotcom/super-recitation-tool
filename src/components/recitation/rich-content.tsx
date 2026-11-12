@@ -860,6 +860,23 @@ function TableBlock({
   )
 }
 
+/** 行内样式透传：react-markdown v10（hast-util-to-jsx-runtime）已把 hast 的
+ * style 字符串转成对象 —— 对象直接透传；字符串（其他来源/旧链路）就地转换。 */
+function inlineStyleProp(s: unknown): React.CSSProperties | undefined {
+  if (typeof s === 'object' && s !== null) return s as React.CSSProperties
+  if (typeof s !== 'string' || !s.trim()) return undefined
+  const out: Record<string, string> = {}
+  for (const part of s.split(';')) {
+    const i = part.indexOf(':')
+    if (i <= 0) continue
+    const k = part.slice(0, i).trim()
+    const v = part.slice(i + 1).trim()
+    if (!k || !v) continue
+    out[k.startsWith('--') ? k : k.replace(/-([a-z])/g, (_m, c: string) => c.toUpperCase())] = v
+  }
+  return Object.keys(out).length ? (out as React.CSSProperties) : undefined
+}
+
 function buildMarkdownComponents(ctx: MediaCtx): Components {
   return {
     h1: ({ children }) => (
@@ -967,12 +984,17 @@ function buildMarkdownComponents(ctx: MediaCtx): Components {
         </span>
       )
     },
-    span: ({ className, children }) => {
+    span: ({ className, style, children }) => {
       // KaTeX display 公式块（rehype-katex 输出 span.katex-display）→ 加详情/下载
       if (typeof className === 'string' && className.includes('katex-display')) {
         return <FormulaDisplayBlock ctx={ctx}>{children}</FormulaDisplayBlock>
       }
-      return <span className={className}>{children}</span>
+      // 行内样式透传（%%下划线/字色/字号%% 展开出的 <span style=…>）
+      return (
+        <span className={className} style={inlineStyleProp(style)}>
+          {children}
+        </span>
+      )
     },
     pre: ({ node, children }) => {
       const el = node as unknown as HastNode | undefined

@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { VersionBadge } from '@/components/recitation/version-badge'
 
 interface LoginViewProps {
   /** 系统是否已初始化账号（true = 仅可登录，false = 可注册唯一账号）。 */
@@ -260,6 +261,8 @@ export function LoginView({ registered, onAuthed }: LoginViewProps) {
           )}
         </div>
 
+        {/* 部署版本：发布后可在此确认站点已更新到新版本 */}
+        <VersionBadge />
       </div>
     </main>
   )

@@ -203,6 +203,38 @@ function findCloseOnSameLine(s: string, delim: string, from: number): number {
   return -1
 }
 
+/**
+ * 单星斜体的配对闭合：扫描时跳过内部成对的 `**…**`（加粗），
+ * 使 `*前**明月**后*` 正确解析为「斜体包加粗」而不是在第一个 `*` 截断。
+ * 奇数长度的星号串（如 `**a***xyz***b**` 中紧跟其后的 `***`）：串首的
+ * 单星即本斜体的闭合（与 CommonMark 的部分 run 消耗一致），余下星号
+ * 留给外层继续配对 —— 因此「加粗a 斜体xyz 加粗b」的相邻结构可正确渲染。
+ */
+function findItalicClose(s: string, from: number): number {
+  let k = from
+  while (k < s.length) {
+    if (s[k] === '\n') return -1
+    if (s[k] === '*') {
+      let n = 0
+      while (s[k + n] === '*') n += 1
+      if (n % 2 === 1) return k // 奇数 run：首个 * 是本斜体的闭合
+      // 偶数 run：尝试跳过完整的 `**…**` 加粗对
+      const boldClose = findCloseOnSameLine(s, '**', k + 2)
+      if (boldClose > k + 2) {
+        const inner = s.slice(k + 2, boldClose)
+        if (inner && !inner.includes('*')) {
+          k = boldClose + 2
+          continue
+        }
+      }
+      k += n // 未配对的偶数 run：整串跳过（防死循环/误配单星）
+      continue
+    }
+    k += 1
+  }
+  return -1
+}
+
 function parseLevel(s: string, opts: ParseOpts): InlineNode[] {
   const out: InlineNode[] = []
   const full = opts.mode === 'full'
@@ -301,6 +333,20 @@ function parseLevel(s: string, opts: ParseOpts): InlineNode[] {
 
     // ---- 容器：==高亮==（top/full 都识别）----
     if (ch === '=' && s[i + 1] === '=') {
+      // `====x====`（重复套高亮，编辑器/AI 可能产生）→ 折叠为单层高亮
+      if (s.startsWith('====', i)) {
+        const close4 = findCloseOnSameLine(s, '====', i + 4)
+        if (close4 > i + 4) {
+          const content = s.slice(i + 4, close4)
+          if (content && !content.includes('\n')) {
+            pushToken(
+              { kind: 'highlight', children: parseLevel(content, { mode: 'full', mlDollar: opts.mlDollar }) },
+              close4 + 4,
+            )
+            continue
+          }
+        }
+      }
       const close = findCloseOnSameLine(s, '==', i + 2)
       if (close >= 0) {
         const content = s.slice(i + 2, close)
@@ -319,6 +365,20 @@ function parseLevel(s: string, opts: ParseOpts): InlineNode[] {
     if (full) {
       // ---- 容器：~~删除线~~ ----
       if (ch === '~' && s[i + 1] === '~') {
+        // `~~~~x~~~~`（重复套删除线）→ 折叠为单层
+        if (s.startsWith('~~~~', i)) {
+          const close4 = findCloseOnSameLine(s, '~~~~', i + 4)
+          if (close4 > i + 4) {
+            const content = s.slice(i + 4, close4)
+            if (content && !content.includes('\n')) {
+              pushToken(
+                { kind: 'strike', children: parseLevel(content, { mode: 'full', mlDollar: opts.mlDollar }) },
+                close4 + 4,
+              )
+              continue
+            }
+          }
+        }
         const close = findCloseOnSameLine(s, '~~', i + 2)
         if (close >= 0) {
           const content = s.slice(i + 2, close)
@@ -335,6 +395,48 @@ function parseLevel(s: string, opts: ParseOpts): InlineNode[] {
       }
 
       if (ch === '*') {
+        // `****x****`（重复套加粗，编辑器二次点击/AI 产生）→ 折叠为单层加粗。
+        // 统计完整起始星号串（ns）与最近的闭合星号串（≥4 才视为重复套），
+        // `******x******` 任意层级同样折叠；奇数星（如 `*****x*****`）保留
+        // 「加粗+斜体」语义。必须先于 `***`/`**` 判断：`****x****` 的前三
+        // 字符也是 `***`，走 `***` 分支会把第一个 `*` 吞进内容产生残留星号。
+        if (s.startsWith('****', i)) {
+          let ns = 0
+          while (s[i + ns] === '*') ns += 1
+          // 从内容起点扫第一个长度 ≥4 的星号串（中间内容非空、无换行）
+          let k = i + ns
+          let close4 = -1
+          let ne = 0
+          while (k < s.length && s[k] !== '\n') {
+            if (s[k] === '*') {
+              let len = 0
+              while (s[k + len] === '*') len += 1
+              if (len >= 4 && k > i + ns) {
+                close4 = k
+                ne = len
+                break
+              }
+              k += len
+              continue
+            }
+            k += 1
+          }
+          if (close4 > i + ns) {
+            const content = s.slice(i + ns, close4)
+            if (content && !content.includes('\n')) {
+              const m = Math.min(ns, ne)
+              const odd = m % 2 === 1
+              const inner = parseLevel(content, { mode: 'full', mlDollar: opts.mlDollar })
+              pushToken(
+                odd
+                  ? { kind: 'bold', children: [{ kind: 'italic', children: inner }] }
+                  : { kind: 'bold', children: inner },
+                close4 + m,
+              )
+              continue
+            }
+          }
+        }
         // ***x*** → 加粗套斜体（CommonMark 语义）
         if (s.startsWith('***', i)) {
           const close = findCloseOnSameLine(s, '***', i + 3)
@@ -375,8 +477,8 @@ function parseLevel(s: string, opts: ParseOpts): InlineNode[] {
           i += 1
           continue
         }
-        // *x*
-        const close = findCloseOnSameLine(s, '*', i + 1)
+        // *x*（闭合扫描跳过内部成对 `**…**`，支持「斜体套加粗」）
+        const close = findItalicClose(s, i + 1)
         if (close >= 0) {
           const content = s.slice(i + 1, close)
           if (content && !content.includes('\n')) {

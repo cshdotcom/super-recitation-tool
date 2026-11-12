@@ -31,6 +31,7 @@ import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { VersionBadge } from '@/components/recitation/version-badge'
 
 interface AccountSheetProps {
   open: boolean
@@ -369,6 +370,9 @@ export function AccountSheet({
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
+
+        {/* 部署版本：发布后可在此确认站点已更新到新版本 */}
+        <VersionBadge />
       </div>
     </BottomSheet>
   )
