@@ -1,13 +1,28 @@
 // Review logs (熟悉/模糊/忘记) + aggregated statistics.
-// POST /api/review  { cardId, cardTitle, action, durationSec, scheme?, tzOffset? }
-//   scheme  : sm2(默认，SM-2 艾宾浩斯) | fixed(固定间隔 1/2/4/7/15/30) | simple(会/不会)
-//   tzOffset: 客户端时区偏移（分钟，Date#getTimezoneOffset()），
-//             下次复习时间锚定到客户端「当日零点 + interval 天」避免时区漂移
+// POST /api/review  { cardId, cardTitle, action?, grade?, durationSec, scheme?, tzOffset? }
+//   grade  : again | hard | good | easy （v2.8.0+ FSRS 4 档；优先于 action）
+//   action : familiar | fuzzy | forget （旧 3 档，自动映射 grade：familiar→good fuzzy→hard forget→again）
+//   scheme : sm2 | fixed | simple （旧方案，映射为 algorithm；新流程由服务端按全局/单卡配置解析）
+//   tzOffset: 客户端时区偏移（分钟，Date#getTimezoneOffset()），锚定当日零点 + interval 天
 // GET  /api/review?tzOffset=-480 -> ReviewStats (server-side aggregation)
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { requireAccount } from '@/lib/auth'
 import { isReviewScheme, scheduleReview } from '@/lib/card'
+import {
+  type AlgorithmType,
+  type CardMemory,
+  type Grade,
+  computeReview,
+  defaultConfig,
+  isValidAlgType,
+  legacyActionToGrade,
+  mergeConfig,
+  parseMemory,
+  resolveConfig,
+  retrievability,
+  elapsedDays,
+} from '@/lib/spaced-repetition'
 import type { Mastery, ReviewAction, ReviewStats } from '@/lib/types'
 
 const SCORE_ACTIONS = ['familiar', 'fuzzy', 'forget'] as const
@@ -27,66 +42,112 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json()
-    const action = String(body?.action || '')
-    if (!SCORE_ACTIONS.includes(action as (typeof SCORE_ACTIONS)[number])) {
-      return NextResponse.json({ error: '无效的复习动作' }, { status: 400 })
-    }
     const cardId = String(body?.cardId || '')
     if (!cardId) return NextResponse.json({ error: '缺少 cardId' }, { status: 400 })
     const duration = Math.min(3600, Math.max(0, Math.round(Number(body?.durationSec) || 0)))
-
-    // ---- 间隔复习调度（三种可选方案，纯函数见 src/lib/card.ts） ----
-    // 根据本次评分(familiar/fuzzy/forget) + 复习方案 + 卡片当前 ease/interval
-    // 计算下次复习时间，并更新 Card 的复习字段。这样复习过的卡片不会立即
-    // 再次出现在待复习队列。
-    //   sm2    — SM-2 艾宾浩斯（默认）：EF' = EF + (0.1-(5-q)*(0.08+(5-q)*0.02))，
-    //             夹 [1.3, 2.5]；忘记重置 repetitions=0、间隔 1 天；
-    //             成功序列 1 → 3 → round(上次间隔 × EF')（熟悉封顶 30 / 模糊封顶 7）
-    //   fixed  — 固定间隔：1/2/4/7/15/30 天序列，记得前进一格，忘记回到 1 天
-    //   simple — 简单模式：会=间隔翻倍（首评 1 天，封顶 365），不会=重置 1 天
-    const scheme = isReviewScheme(body?.scheme) ? body.scheme : 'sm2'
     const tzOffset = Math.min(840, Math.max(-840, Math.round(Number(body?.tzOffset) || 0)))
+    const now = new Date()
 
+    // 解析评分：优先 grade（4 档），其次 action（旧 3 档映射）
+    let grade: Grade | null = null
+    if (
+      body?.grade === 'again' ||
+      body?.grade === 'hard' ||
+      body?.grade === 'good' ||
+      body?.grade === 'easy'
+    ) {
+      grade = body.grade
+    } else if (SCORE_ACTIONS.includes(body?.action)) {
+      grade = legacyActionToGrade(String(body.action))
+    }
+    if (!grade) return NextResponse.json({ error: '无效的评分' }, { status: 400 })
+
+    // 解析生效算法与配置：全局默认 → 单卡覆盖
     const card = await db.card.findUnique({
       where: { id: cardId },
-      select: { ease: true, interval: true, reviewCount: true },
+      select: { ease: true, interval: true, reviewCount: true, srsState: true, algoType: true, algoConfig: true },
     })
-    const scheduled = scheduleReview({
-      action: action as ReviewAction,
-      scheme,
-      ease: card?.ease ?? 2.5,
-      interval: card?.interval ?? 0,
-      reviewCount: card?.reviewCount ?? 0,
-      now: new Date(),
+    if (!card) return NextResponse.json({ error: '卡片不存在' }, { status: 404 })
+
+    const settings = await db.settings.findUnique({ where: { id: 'singleton' } })
+    let algorithm: AlgorithmType = 'fsrs'
+    let resolvedConfig = defaultConfig()
+    // 客户端顶栏选择的 algorithm 优先（覆盖单卡/全局解析的算法类型，但参数仍取全局配置）
+    const clientAlg = isValidAlgType(body?.algorithm) ? (body.algorithm as AlgorithmType) : null
+    // 旧 scheme 参数兼容：若客户端仍传 scheme 且未配置新算法，用 scheme 作为 algorithm
+    const legacyScheme = isReviewScheme(body?.scheme) ? body.scheme : null
+    if (clientAlg) {
+      algorithm = clientAlg
+      const globalCfg = mergeConfig(settings?.globalAlgConfig)
+      // 若单卡覆盖的算法类型与客户端选择一致，用单卡覆盖配置；否则用全局配置
+      const resolved =
+        card.algoType === clientAlg
+          ? resolveConfig(clientAlg, globalCfg, card.algoType, card.algoConfig)
+          : { algorithm: clientAlg, config: globalCfg }
+      resolvedConfig = resolved.config
+    } else if (legacyScheme && !card.algoType && !isValidAlgType(settings?.globalAlgorithm)) {
+      algorithm = legacyScheme as AlgorithmType
+      resolvedConfig = mergeConfig({})
+    } else {
+      const globalAlg: AlgorithmType = isValidAlgType(settings?.globalAlgorithm)
+        ? (settings.globalAlgorithm as AlgorithmType)
+        : 'fsrs'
+      const globalCfg = mergeConfig(settings?.globalAlgConfig)
+      const resolved = resolveConfig(globalAlg, globalCfg, card.algoType, card.algoConfig)
+      algorithm = resolved.algorithm
+      resolvedConfig = resolved.config
+    }
+
+    const memory: CardMemory = parseMemory(card.srsState)
+    const prevR = retrievability(memory.s, elapsedDays(memory, now))
+
+    const result = computeReview({
+      memory,
+      grade,
+      config: resolvedConfig,
+      algorithm,
+      now,
       tzOffsetMin: tzOffset,
+      durationSec: duration,
+      ease: card.ease ?? undefined,
     })
 
-    // 并行：写日志 + 更新卡片复习调度
+    // ReviewLog 落库动作（向后兼容旧统计查询：grade→action）
+    const logAction: ReviewAction =
+      grade === 'again' ? 'forget' : grade === 'hard' ? 'fuzzy' : 'familiar'
+
     const [log] = await Promise.all([
       db.reviewLog.create({
         data: {
           cardId,
           cardTitle: String(body?.cardTitle || '').slice(0, 120),
-          action,
+          action: logAction,
           durationSec: duration,
         },
       }),
       db.card.update({
         where: { id: cardId },
         data: {
-          ease: scheduled.ease,
-          interval: scheduled.interval,
-          reviewCount: scheduled.reviewCount,
-          lastReviewedAt: new Date(),
-          nextReviewAt: scheduled.nextReviewAt,
+          srsState: JSON.stringify(result.memory),
+          ease: result.ease,
+          interval: Math.max(0, Math.round(result.interval)),
+          reviewCount: result.reviewCount,
+          lastReviewedAt: now,
+          nextReviewAt: result.nextReviewAt,
         },
       }),
     ])
     return NextResponse.json({
       id: log.id,
-      nextReviewAt: scheduled.nextReviewAt,
-      interval: scheduled.interval,
-      scheme,
+      nextReviewAt: result.nextReviewAt,
+      interval: result.interval,
+      algorithm,
+      grade,
+      prevR,
+      newS: result.memory.s,
+      newD: result.memory.d,
+      newState: result.memory.state,
+      log: result.log,
     })
   } catch (err) {
     console.error('[POST /api/review] failed:', err)

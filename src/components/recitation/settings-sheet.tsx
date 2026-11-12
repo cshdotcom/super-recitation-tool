@@ -4,6 +4,7 @@ import * as React from 'react'
 import JSZip from 'jszip'
 import {
   AudioLines,
+  Brain,
   CalendarClock,
   ChevronRight,
   Cpu,
@@ -36,6 +37,7 @@ import { clampSpeed, saveVoicePref, SPEED_OPTIONS } from '@/lib/voice-prefs'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
 import { ThemePicker } from '@/components/recitation/more-sheet'
 import { VoiceSpeedBar, type QuickTtsPref } from '@/components/recitation/tts-player'
+import { AlgorithmConfigDialog } from '@/components/recitation/algorithm-config-dialog'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -604,6 +606,8 @@ export function SettingsSheet({
   onClearAll,
   onOpenPlans,
 }: SettingsSheetProps) {
+  // 复习算法配置面板（全局默认）
+  const [algOpen, setAlgOpen] = React.useState(false)
   // AI model draft (saved via 保存 button)
   const [aiDraft, setAiDraft] = React.useState({
     aiProvider: 'zai' as 'zai' | 'custom',
@@ -1128,8 +1132,27 @@ export function SettingsSheet({
                 选择记忆方案（艾宾浩斯）、编辑自定义复习周期、调整智能预测
               </p>
             </div>
-            <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">点按进入复习计划管理</p>
+
+            <div className="mt-2 rounded-2xl border border-border bg-card px-4 py-3">
+              <button
+                type="button"
+                onClick={() => setAlgOpen(true)}
+                className="flex w-full items-center justify-between gap-3 text-left"
+              >
+                <span className="flex items-center gap-2.5 text-sm font-medium">
+                  <Brain className="size-4 text-muted-foreground" strokeWidth={1.75} />
+                  复习算法配置
+                </span>
+                <ChevronRight className="size-4 text-muted-foreground" strokeWidth={1.75} />
+              </button>
+              <p className="mt-1 pl-[26px] text-[11px] leading-relaxed text-muted-foreground/70">
+                FSRS 级间隔重复算法 · 全局默认算法与参数 · 多算法并行 · 自定义公式可视化
+              </p>
+            </div>
+            <p className="mt-1.5 px-1 text-[11px] text-muted-foreground/70">点按配置全局复习算法</p>
           </section>
+
+          <AlgorithmConfigDialog open={algOpen} onOpenChange={setAlgOpen} scope="global" />
 
           {/* ---------- 出题设置 ---------- */}
           <section>

@@ -31,13 +31,25 @@ model Card {
   deletedAt  DateTime?
   createdAt  DateTime  @default(now())
   updatedAt  DateTime  @updatedAt
-  // ---- 间隔复习（SM-2 简化版）----
+  // ---- 间隔复习（SM-2 简化版，向后兼容）----
   // nextReviewAt 为空 = 从未复习过（新导入卡片，进入待复习队列）
   nextReviewAt  DateTime?
   ease          Float    @default(2.5) // SM-2 难度系数，1.3~3.0
   interval      Int      @default(0) // 当前间隔（天）
   reviewCount   Int      @default(0) // 已复习次数
   lastReviewedAt DateTime?
+  // ---- FSRS 级精细复习算法（v2.8.0+）----
+  // algoType: 单卡覆盖的算法类型（null = 跟随全局默认）。
+  //   fsrs | sm2 | fixed | simple | custom
+  algoType      String?
+  // algoConfig: 单卡覆盖的算法参数 JSON（AlgorithmConfig）；空对象 = 跟随模板默认。
+  algoConfig    String   @default("{}")
+  // algoEnabled: 该卡启用的算法集合 JSON string[]（多算法并行可选；空 = 跟随全局）。
+  algoEnabled   String   @default("[]")
+  // srsState: 完整记忆状态 JSON — FSRS S/D/R + 状态机 + 历史。
+  //   { s, d, reps, lapses, state(new|learning|review|relearn|suspended),
+  //     lastGrade, lastReviewAt, history:[{at,grade,s,d,r,elapsedDays}] }
+  srsState      String   @default("{}")
 }
 
 // 项目（分类文件夹）— 侧边栏「项目」区。删除项目时卡片移入未分类("")。
@@ -101,6 +113,13 @@ model Settings {
   aiMaxTokens    Int?    // 最大 tokens（空 = 默认）
   // ---- PDF 解析引擎: auto(推荐,多引擎链) | unpdf | pdf-parse ----
   pdfEngine String @default("auto")
+  // ---- 全局默认复习算法（v2.8.0+）----
+  // globalAlgorithm: 全局默认算法类型 fsrs | sm2 | fixed | simple | custom
+  globalAlgorithm  String  @default("fsrs")
+  // globalAlgConfig: 全局默认算法参数 JSON（AlgorithmConfig）
+  globalAlgConfig  String  @default("{}")
+  // globalAlgEnabled: 全局启用的算法集合 JSON string[]（复习页顶栏多选）
+  globalAlgEnabled String  @default("[\"fsrs\"]")
 }
 
 // The single app account. Registration is only allowed while this table is
@@ -300,4 +319,19 @@ model Upload {
   data      String
   bytes     Int      @default(0)
   createdAt DateTime @default(now())
+}
+
+// 复习算法模板（v2.8.0+）— 预设（builtIn=true）与用户自定义（builtIn=false）。
+// type: fsrs | sm2 | fixed | simple | custom
+// config: AlgorithmConfig JSON（desiredRetention / maxInterval / w[] / steps / 表达式等）
+// 用户在「复习算法」面板一键切换整套参数，也可基于预设另存为自定义模板。
+model AlgorithmTemplate {
+  id          String   @id @default(uuid())
+  name        String
+  type        String   @default("fsrs")
+  config      String   @default("{}")
+  description String   @default("")
+  builtIn     Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }

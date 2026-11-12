@@ -19,12 +19,15 @@ import * as React from 'react'
 import { motion } from 'framer-motion'
 import {
   BellOff,
+  Brain,
+  BarChart3,
   CalendarClock,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
   Eye,
   EyeOff,
+  Info,
   Play,
   SkipForward,
   X,
@@ -34,16 +37,17 @@ import { toast } from 'sonner'
 import type {
   CardData,
   ClozeStyle,
-  ReviewAction,
   ReviewPlanData,
   SettingsData,
 } from '@/lib/types'
 import {
-  REVIEW_SCHEMES,
-  SCHEME_SCORE_ACTIONS,
-  isReviewScheme,
-  type ReviewScheme,
-} from '@/lib/card'
+  type AlgorithmType,
+  type Grade,
+  type CardPreview,
+  ALGORITHM_TYPES,
+  GRADES,
+  isValidAlgType,
+} from '@/lib/spaced-repetition'
 import { getState, putState } from '@/lib/server-state'
 import { todayKey } from '@/lib/use-local-storage'
 import { useServerState } from '@/lib/use-server-state'
@@ -56,6 +60,9 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { ClozeText } from '@/components/recitation/cloze-text'
 import { ReviewScoreBar } from '@/components/recitation/review-score-bar'
+import { AlgorithmConfigDialog } from '@/components/recitation/algorithm-config-dialog'
+import { AlgorithmStatsView } from '@/components/recitation/algorithm-stats-view'
+import { CardMemoryDetail } from '@/components/recitation/card-memory-detail'
 
 export interface ReviewDueViewProps {
   onBack: () => void
@@ -88,7 +95,7 @@ interface QueueItem extends DueCardRow {
 interface SessionState {
   queue: QueueItem[]
   index: number
-  results: { familiar: number; fuzzy: number; forget: number }
+  results: { again: number; hard: number; good: number; easy: number }
   skipped: number
 }
 
@@ -101,21 +108,21 @@ const ACTION_META: Record<string, { label: string; dot: string }> = {
 const REMIND_DAYS = [1, 3, 7]
 
 // localStorage（个人偏好，按任务约定不加服务端设置项）
-const SCHEME_KEY = 'beishuba-review-scheme'
+const ALG_KEY = 'beishuba-review-algorithm'
 const IMMERSIVE_KEY = 'beishuba-review-immersive'
 // 默认复习计划 id 列表（多选）— 服务端 KV（AppState）持久化，多端同步，
 // localStorage 仅作离线镜像（ReviewPlan 模型没有 isDefault 字段，
 // 改 schema 需迁移数据库，这里用通用 KV 存储实现同等效果）
 const DEFAULT_PLANS_KEY = 'beishuba-default-plans'
 
-function readStoredScheme(): ReviewScheme {
+function readStoredAlgorithm(): AlgorithmType {
   try {
-    const v = window.localStorage.getItem(SCHEME_KEY)
-    if (isReviewScheme(v)) return v
+    const v = window.localStorage.getItem(ALG_KEY)
+    if (isValidAlgType(v)) return v
   } catch {
     /* ignore */
   }
-  return 'sm2'
+  return 'fsrs'
 }
 
 function readStoredImmersive(): boolean {
@@ -148,13 +155,23 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
   const [busy, setBusy] = React.useState(false)
   const [remindOpen, setRemindOpen] = React.useState(false)
 
-  // 复习方案 + 沉浸模式（localStorage 持久化）
-  const [scheme, setScheme] = React.useState<ReviewScheme>(() =>
-    typeof window === 'undefined' ? 'sm2' : readStoredScheme(),
+  // 复习算法 + 沉浸模式（localStorage 持久化）+ 全局启用的算法集合
+  const [algorithm, setAlgorithm] = React.useState<AlgorithmType>(() =>
+    typeof window === 'undefined' ? 'fsrs' : readStoredAlgorithm(),
   )
+  const [enabledAlgs, setEnabledAlgs] = React.useState<AlgorithmType[]>(['fsrs'])
   const [immersive, setImmersive] = React.useState<boolean>(() =>
     typeof window === 'undefined' ? true : readStoredImmersive(),
   )
+  // 算法配置面板（全局 / 单卡）+ 统计面板 + 单卡记忆详情
+  const [algConfig, setAlgConfig] = React.useState<{ open: boolean; scope: 'global' | 'card'; cardId?: string; cardTitle?: string }>({
+    open: false,
+    scope: 'global',
+  })
+  const [statsOpen, setStatsOpen] = React.useState(false)
+  const [memDetail, setMemDetail] = React.useState<{ id: string; title: string } | null>(null)
+  // 会话中当前卡的 4 档预览
+  const [cardPreview, setCardPreview] = React.useState<CardPreview | null>(null)
 
   // 默认复习计划（服务端 KV，与「复习计划管理」页共用同一份状态）
   const [defaultPlanIds] = useServerState<string[]>(DEFAULT_PLANS_KEY, [])
@@ -304,15 +321,33 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
     }
   }, [])
 
-  // ---------- scheme / immersive ----------
-  const changeScheme = (next: ReviewScheme) => {
-    setScheme(next)
+  // ---------- 加载全局启用的算法集合 ----------
+  React.useEffect(() => {
+    let alive = true
+    fetch('/api/algorithms/config')
+      .then((r) => r.json())
+      .then((d: { global?: { enabled?: string[]; algorithm?: string } }) => {
+        if (!alive) return
+        const en = (d.global?.enabled ?? []).filter(isValidAlgType)
+        if (en.length > 0) setEnabledAlgs(en)
+        const ga = d.global?.algorithm
+        if (isValidAlgType(ga)) setAlgorithm(ga as AlgorithmType)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // ---------- algorithm / immersive ----------
+  const changeAlgorithm = (next: AlgorithmType) => {
+    setAlgorithm(next)
     try {
-      window.localStorage.setItem(SCHEME_KEY, next)
+      window.localStorage.setItem(ALG_KEY, next)
     } catch {
       /* ignore */
     }
-    toast.info(`已切换复习方案：${REVIEW_SCHEMES.find((s) => s.value === next)?.label ?? next}`)
+    toast.info(`已切换复习算法：${ALGORITHM_TYPES.find((a) => a.value === next)?.label ?? next}`)
   }
 
   const changeImmersive = (next: boolean) => {
@@ -376,11 +411,12 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
     setSession({
       queue: cards.map((c) => ({ ...c })),
       index: 0,
-      results: { familiar: 0, fuzzy: 0, forget: 0 },
+      results: { again: 0, hard: 0, good: 0, easy: 0 },
       skipped: 0,
     })
     setRevealed(new Set())
     setShowAnswers(false)
+    setCardPreview(null)
     cardStartAtRef.current = Date.now()
   }
 
@@ -399,7 +435,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
     await putState(key, String(next))
   }, [])
 
-  const scoreInSession = async (action: ReviewAction) => {
+  const scoreInSession = async (grade: Grade) => {
     const s = session
     if (!s || scoring) return
     const item = s.queue[s.index]
@@ -412,12 +448,12 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
         body: JSON.stringify({
           cardId: item.id,
           cardTitle: item.title,
-          action,
+          grade,
+          algorithm,
           durationSec: Math.min(
             3600,
             Math.max(1, Math.round((Date.now() - cardStartAtRef.current) / 1000)),
           ),
-          scheme,
           tzOffset: new Date().getTimezoneOffset(),
         }),
       })
@@ -431,7 +467,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
         prev
           ? {
               ...prev,
-              results: { ...prev.results, [action]: prev.results[action] + 1 },
+              results: { ...prev.results, [grade]: prev.results[grade] + 1 },
               index: prev.index + 1,
             }
           : prev,
@@ -445,7 +481,7 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
       })
       void bumpTodayProgress(item.id)
       cardStartAtRef.current = Date.now()
-      const label = SCHEME_SCORE_ACTIONS[scheme].find((a) => a.value === action)?.label ?? action
+      const label = GRADES.find((g) => g.value === grade)?.label ?? grade
       toast.success(`已评「${label}」· ${data.interval ?? 1} 天后再次复习`, { duration: 1600 })
     } catch (err: unknown) {
       toast.error('评分失败：' + (err instanceof Error ? err.message : '未知错误'))
@@ -487,8 +523,32 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
   const currentItem = session && !sessionDone ? session.queue[session.index] : null
   const currentCardData = currentItem ? (cardMap.get(currentItem.id) ?? null) : null
   const scoredCount = session
-    ? session.results.familiar + session.results.fuzzy + session.results.forget
+    ? session.results.again + session.results.hard + session.results.good + session.results.easy
     : 0
+
+  // 会话中拉取当前卡的 4 档预览（供评分条显示间隔）
+  React.useEffect(() => {
+    if (!session || sessionDone || !currentItem) {
+      setCardPreview(null)
+      return
+    }
+    let alive = true
+    fetch('/api/algorithms/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cardId: currentItem.id, tzOffset: new Date().getTimezoneOffset() }),
+    })
+      .then((r) => r.json())
+      .then((d: { preview?: CardPreview }) => {
+        if (alive) setCardPreview(d.preview ?? null)
+      })
+      .catch(() => {
+        if (alive) setCardPreview(null)
+      })
+    return () => {
+      alive = false
+    }
+  }, [session?.index, session, sessionDone, currentItem])
 
   // 会话底部评分区（沉浸 / 快速两种模式共用）
   const scoreFooter = (
@@ -503,9 +563,16 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
           <SkipForward className="size-3.5" strokeWidth={1.75} aria-hidden />
           跳过本张
         </button>
-        <p className="text-xs text-muted-foreground">背完后自评，自动下一张</p>
+        <p className="text-xs text-muted-foreground">
+          {ALGORITHM_TYPES.find((a) => a.value === algorithm)?.label} · 背完后自评
+        </p>
       </div>
-      <ReviewScoreBar scheme={scheme} disabled={scoring} onScore={(a) => void scoreInSession(a)} />
+      <ReviewScoreBar
+        algorithm={algorithm}
+        disabled={scoring}
+        previews={cardPreview?.grades ?? null}
+        onScore={(g) => void scoreInSession(g)}
+      />
     </div>
   )
 
@@ -526,8 +593,26 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
           <h1 className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-base font-bold">
             {cards ? `待复习 ${cards.length} 张` : '待复习'}
           </h1>
-          <div className="ml-auto flex items-center">
-            <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
+          <div className="ml-auto flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="算法统计"
+              className="text-muted-foreground"
+              onClick={() => setStatsOpen(true)}
+            >
+              <BarChart3 className="size-5" strokeWidth={1.75} />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label="算法配置"
+              className="text-muted-foreground"
+              onClick={() => setAlgConfig({ open: true, scope: 'global' })}
+            >
+              <Brain className="size-5" strokeWidth={1.75} />
+            </Button>
+            <label className="flex cursor-pointer items-center gap-1.5 pl-1 text-xs text-muted-foreground">
               <Checkbox
                 checked={allSelected}
                 disabled={!cards || cards.length === 0}
@@ -543,13 +628,13 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
 
       {/* ---------- 主内容 ---------- */}
       <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col px-4 pb-40 pt-4">
-        {/* 方案选择 + 开始复习 */}
+        {/* 算法选择 + 开始复习 */}
         <section
           className="rounded-2xl border border-border bg-card p-4 shadow-sm"
-          aria-label="复习方案"
+          aria-label="复习算法"
         >
           <div className="flex items-center justify-between gap-3">
-            <p className="text-sm font-bold">复习方案</p>
+            <p className="text-sm font-bold">复习算法</p>
             <label className="flex items-center gap-2 text-xs text-muted-foreground">
               沉浸复习模式
               <Switch
@@ -559,27 +644,30 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
               />
             </label>
           </div>
-          <div className="mt-3 grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="复习方案">
-            {REVIEW_SCHEMES.map((s) => (
+          <div className="mt-3 flex flex-wrap gap-1.5" role="radiogroup" aria-label="复习算法">
+            {ALGORITHM_TYPES.filter((a) => enabledAlgs.includes(a.value)).map((a) => (
               <button
-                key={s.value}
+                key={a.value}
                 type="button"
                 role="radio"
-                aria-checked={scheme === s.value}
-                onClick={() => changeScheme(s.value)}
+                aria-checked={algorithm === a.value}
+                onClick={() => changeAlgorithm(a.value)}
                 className={cn(
-                  'h-10 rounded-xl border text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
-                  scheme === s.value
+                  'h-9 rounded-xl border px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  algorithm === a.value
                     ? 'border-zinc-900 bg-zinc-900 text-white'
                     : 'border-border bg-background text-foreground hover:bg-muted',
                 )}
               >
-                {s.label}
+                {a.label}
               </button>
             ))}
+            {enabledAlgs.length === 0 && (
+              <span className="text-xs text-muted-foreground">未启用算法，点右上角齿轮配置</span>
+            )}
           </div>
           <p className="mt-2 text-xs leading-relaxed text-muted-foreground" aria-live="polite">
-            {REVIEW_SCHEMES.find((s) => s.value === scheme)?.hint}
+            {ALGORITHM_TYPES.find((a) => a.value === algorithm)?.desc}
             {planCount > 0 ? ` · 含默认计划今日项 ${planCount} 张` : ''}
           </p>
           <Button
@@ -686,11 +774,35 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
                       </p>
                     )}
                   </div>
-                  <ChevronRight
-                    className="size-4 shrink-0 text-muted-foreground/50"
-                    strokeWidth={1.75}
-                    aria-hidden
-                  />
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      aria-label={`记忆详情 ${item.title}`}
+                      className="-m-1 flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setMemDetail({ id: item.id, title: item.title })
+                      }}
+                    >
+                      <Info className="size-4" strokeWidth={1.75} />
+                    </button>
+                    <button
+                      type="button"
+                      aria-label={`算法配置 ${item.title}`}
+                      className="-m-1 flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setAlgConfig({ open: true, scope: 'card', cardId: item.id, cardTitle: item.title })
+                      }}
+                    >
+                      <Brain className="size-4" strokeWidth={1.75} />
+                    </button>
+                    <ChevronRight
+                      className="size-4 shrink-0 text-muted-foreground/50"
+                      strokeWidth={1.75}
+                      aria-hidden
+                    />
+                  </div>
                 </motion.div>
               )
             })}
@@ -808,13 +920,16 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
                 {session.skipped > 0 ? ` · 跳过 ${session.skipped} 张` : ''}
               </p>
               <div className="mt-6 flex w-full max-w-xs flex-col gap-2">
-                {SCHEME_SCORE_ACTIONS[scheme].map((a) => (
+                {GRADES.map((g) => (
                   <div
-                    key={a.value}
+                    key={g.value}
                     className="flex items-center justify-between rounded-xl bg-muted/60 px-4 py-2.5 text-sm"
                   >
-                    <span className="text-muted-foreground">{a.label}</span>
-                    <span className="font-bold tabular-nums">{session.results[a.value]} 张</span>
+                    <span className="flex items-center gap-1.5 text-muted-foreground">
+                      <span className="size-2 rounded-full" style={{ background: g.color }} />
+                      {g.label}
+                    </span>
+                    <span className="font-bold tabular-nums">{session.results[g.value]} 张</span>
                   </div>
                 ))}
               </div>
@@ -871,6 +986,38 @@ export function ReviewDueView({ onBack, onOpenCard }: ReviewDueViewProps) {
             </>
           )}
         </div>
+      )}
+
+      {/* ---------- 算法配置面板（全局 / 单卡） ---------- */}
+      <AlgorithmConfigDialog
+        open={algConfig.open}
+        onOpenChange={(v) => setAlgConfig((s) => ({ ...s, open: v }))}
+        scope={algConfig.scope}
+        cardId={algConfig.cardId}
+        cardTitle={algConfig.cardTitle}
+      />
+
+      {/* ---------- 单卡记忆详情 ---------- */}
+      {memDetail && (
+        <CardMemoryDetail
+          cardId={memDetail.id}
+          cardTitle={memDetail.title}
+          open
+          onOpenChange={(v) => {
+            if (!v) setMemDetail(null)
+          }}
+        />
+      )}
+
+      {/* ---------- 统计仪表盘（全屏覆盖） ---------- */}
+      {statsOpen && (
+        <AlgorithmStatsView
+          onBack={() => setStatsOpen(false)}
+          onOpenCard={(id) => {
+            setStatsOpen(false)
+            onOpenCard(id)
+          }}
+        />
       )}
     </>
   )
