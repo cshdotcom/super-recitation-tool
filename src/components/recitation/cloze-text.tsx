@@ -2106,9 +2106,15 @@ const RichContentLazy = React.lazy(
 )
 
 function CodeBlockSegment({ lang, code }: { lang: string; code: string }) {
-  const isHtml = /^html?$/i.test(lang.trim())
-  // html 块直接交给 rehypeRaw 渲染；其余包回围栏（mermaid → SVG，其它 → 高亮代码）
-  const content = isHtml ? code : `\`\`\`${(lang || 'text').trim()}\n${code}\n\`\`\``
+  const l = lang.trim().toLowerCase()
+  const isHtml = /^html?$/.test(l)
+  const isSvg = l === 'svg'
+  // html/svg 直接用裸源码（RichContent 的 HtmlSandbox / splitSvgSegments 处理）；
+  // 其余包回围栏（mermaid → SVG，其它 → 高亮代码）。
+  // svg 必须走裸源码：若包回 ```svg 围栏，splitSvgSegments 会先抽走 <svg> 段，
+  // 剩余 ```svg / ``` 碎片被 react-markdown 再次识别为 language-svg 代码块 →
+  // SVG 被渲染两次 + 围栏碎片变成多余代码块。
+  const content = isHtml || isSvg ? code : `\`\`\`${(lang || 'text').trim()}\n${code}\n\`\`\``
   return (
     <div className="my-1">
       <React.Suspense
