@@ -73,6 +73,8 @@ export interface SearchOverlayProps {
   shares?: ShareSearchRow[] | null
   /** share 模式：筛选/排序结果回调（父组件需 useCallback）。 */
   onFiltered?: (list: ShareSearchRow[] | null) => void
+  /** 打开时预填的搜索词（跨模块「搜索」动作注入；父级在关闭时应清空）。 */
+  initialQuery?: string
 }
 
 // ---------- home 模式：检索结果 ----------
@@ -236,6 +238,7 @@ export function SearchOverlay({
   mode = 'home',
   shares = null,
   onFiltered,
+  initialQuery,
 }: SearchOverlayProps) {
   const [query, setQuery] = React.useState('')
   // home 模式状态
@@ -254,6 +257,16 @@ export function SearchOverlay({
   React.useEffect(() => {
     setRecent(loadRecent())
   }, [])
+
+  // 跨模块注入搜索词（选区菜单「搜索」/ 语音搜索入口）：打开时预填并聚焦
+  React.useEffect(() => {
+    if (open && initialQuery) {
+      setQuery(initialQuery)
+      if (mode === 'home') {
+        window.setTimeout(() => inputRef.current?.focus(), 60)
+      }
+    }
+  }, [open, initialQuery, mode])
 
   // 打开 home 浮层时聚焦输入框
   React.useEffect(() => {

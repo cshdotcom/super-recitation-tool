@@ -2603,6 +2603,13 @@ export function ChatTool({
                 className="h-9 rounded-full pl-8 pr-3 text-sm"
               />
             </div>
+            {/* 语音搜索：识别结果填入对话内搜索框 */}
+            <VoiceInput
+              size="sm"
+              context="search"
+              className={TOUCH_MIC}
+              onText={(t) => setConvSearchQ(t)}
+            />
             <Button
               type="submit"
               variant="outline"

@@ -31,6 +31,8 @@ import type { QuizQuestion } from '@/lib/types'
 import { putState, getState, deleteState } from '@/lib/server-state'
 import { VoiceInput } from '@/components/recitation/voice-input'
 import { PapersView } from '@/components/recitation/papers-view'
+import { TextSelectionMenu } from '@/components/recitation/text-selection-menu'
+import { useSettingsLite } from '@/lib/voice-prefs'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
@@ -521,6 +523,10 @@ export function QuizPanel({
   autoRemove = 2,
   quizAutoPaper,
 }: QuizPanelProps) {
+  // ---- 划词浮动菜单（容器 = 面板根 div，朗读音色随设置懒取） ----
+  const settings = useSettingsLite()
+  const rootRef = React.useRef<HTMLDivElement>(null)
+
   // ---- AI 出题自动存试卷夹（props 未传时挂载自取设置，默认开） ----
   const [autoPaperSelf, setAutoPaperSelf] = React.useState(true)
   const autoPaperOn = quizAutoPaper ?? autoPaperSelf
@@ -1397,7 +1403,7 @@ export function QuizPanel({
   }
 
   return (
-    <div className="flex min-h-[62vh] flex-col">
+    <div ref={rootRef} className="flex min-h-[62vh] flex-col">
       {/* ================= 空闲入口 ================= */}
       {step === 'idle' && (
         <IdleView
@@ -2388,6 +2394,9 @@ export function QuizPanel({
         cardTitle={cardTitle || '当前书本'}
         onPractice={practicePaper}
       />
+
+      {/* 划词浮动菜单：题干 / 答案 / AI 批改讲解选区 → 朗读 / 复制 / 搜索 */}
+      <TextSelectionMenu containerRef={rootRef} settings={settings} ttsContext="reader" />
     </div>
   )
 }

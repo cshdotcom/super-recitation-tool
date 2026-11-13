@@ -226,6 +226,8 @@ export default function Page() {
   const [chatRootOpen, setChatRootOpen] = React.useState(false)
   // 统一检索浮层（主页搜索 pill / 'app:openSearch'）
   const [searchOpen, setSearchOpen] = React.useState(false)
+  // 跨模块注入的搜索预填词（选区菜单「搜索」/ 语音搜索入口）；关闭时清空
+  const [searchSeed, setSearchSeed] = React.useState('')
   // AI 对话侧边栏 + 当前活动对话（对话模式 ChatTool 绑定）
   const [chatSidebarOpen, setChatSidebarOpen] = React.useState(false)
   const [activeConvId, setActiveConvId] = React.useState<string | null>(null)
@@ -995,9 +997,14 @@ export default function Page() {
     cardsRef.current = cards
   }, [cards])
 
-  // 主页搜索 pill → 打开统一检索浮层；ChatTool 侧边栏按钮 → 切换侧边栏
+  // 主页搜索 pill → 打开统一检索浮层；ChatTool 侧边栏按钮 → 切换侧边栏。
+  // app:openSearch 可携带 detail.query（跨模块选区菜单「搜索」注入预填词）。
   React.useEffect(() => {
-    const onOpenSearch = () => setSearchOpen(true)
+    const onOpenSearch = (e: Event) => {
+      const q = (e as CustomEvent<{ query?: string }>).detail?.query
+      if (typeof q === 'string' && q.trim()) setSearchSeed(q.trim().slice(0, 80))
+      setSearchOpen(true)
+    }
     const onToggleSidebar = () => setChatSidebarOpen((v) => !v)
     window.addEventListener('app:openSearch', onOpenSearch)
     window.addEventListener('app:toggleChatSidebar', onToggleSidebar)
@@ -1463,7 +1470,15 @@ export default function Page() {
       </SheetGlobal>
 
       {/* 统一检索浮层：书本/文章/对话混合检索 + 语音搜索（主页搜索 pill 触发） */}
-      <SearchOverlay mode="home" open={searchOpen} onOpenChange={setSearchOpen} />
+      <SearchOverlay
+        mode="home"
+        open={searchOpen}
+        initialQuery={searchSeed}
+        onOpenChange={(o) => {
+          setSearchOpen(o)
+          if (!o) setSearchSeed('')
+        }}
+      />
 
       {/* 全局迷你播放按钮：可拖拽、播放动画、所有页面常驻（含待播放列表/冲突弹窗/跨设备同步） */}
       {settings && <MiniPlayerFab settings={settings} />}

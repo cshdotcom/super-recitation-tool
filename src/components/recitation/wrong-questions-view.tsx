@@ -56,6 +56,7 @@ import {
 import { VoiceInput } from '@/components/recitation/voice-input'
 import { useSettingsLite } from '@/lib/voice-prefs'
 import { useQuickTts } from '@/components/recitation/tts-player'
+import { TextSelectionMenu } from '@/components/recitation/text-selection-menu'
 import { RichContent } from '@/components/recitation/rich-content'
 import {
   Dialog,
@@ -298,6 +299,9 @@ export function WrongQuestionsView({
   // ---- TTS（context 'quiz'，随设置里的音色/语速） ----
   const settings = useSettingsLite()
   const tts = useQuickTts('quiz', settings)
+
+  // ---- 划词浮动菜单（容器 = 视图根 div，朗读用 reader 音色偏好） ----
+  const rootRef = React.useRef<HTMLDivElement>(null)
 
   // ---- 搜索 / 排序（排序用 useLocalStorage 记忆，key 与收藏夹各自独立） ----
   const [query, setQuery] = React.useState('')
@@ -1243,7 +1247,7 @@ export function WrongQuestionsView({
   const hlQuery = query.trim()
 
   return (
-    <div className="min-h-dvh bg-muted/40">
+    <div ref={rootRef} className="min-h-dvh bg-muted/40">
       {/* 打印样式：仅显示题单 */}
       <style>{`@media print {
         body * { visibility: hidden !important; }
@@ -1402,18 +1406,22 @@ export function WrongQuestionsView({
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="搜索题目、答案或书名"
                 aria-label="搜索错题"
-                className="h-10 w-full rounded-full border border-border bg-card pl-10 pr-10 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-ring"
+                className="h-10 w-full rounded-full border border-border bg-card pl-10 pr-[4.5rem] text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:ring-2 focus-visible:ring-ring"
               />
-              {query && (
-                <button
-                  type="button"
-                  aria-label="清除搜索"
-                  onClick={() => setQuery('')}
-                  className="absolute right-1.5 top-1/2 flex size-8 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                >
-                  <X className="size-4" strokeWidth={2} />
-                </button>
-              )}
+              <div className="absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5">
+                {query && (
+                  <button
+                    type="button"
+                    aria-label="清除搜索"
+                    onClick={() => setQuery('')}
+                    className="flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  >
+                    <X className="size-4" strokeWidth={2} />
+                  </button>
+                )}
+                {/* 语音搜索：识别结果填入搜索框 */}
+                <VoiceInput size="sm" context="search" onText={(t) => setQuery(t)} />
+              </div>
             </div>
 
             {/* 筛选行：卡片分类 + 时间 pills（含自定义时间段） */}
@@ -2195,6 +2203,9 @@ export function WrongQuestionsView({
           </div>
         ))}
       </div>
+
+      {/* 划词浮动菜单：朗读 / 复制 / 搜索（portal 到 body，与 AI 对话选区条同款） */}
+      <TextSelectionMenu containerRef={rootRef} settings={settings} ttsContext="reader" />
     </div>
   )
 }

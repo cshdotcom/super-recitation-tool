@@ -66,6 +66,7 @@ import type { ExportSection } from '@/lib/conversation-export'
 import { ConversationShareDialog } from '@/components/recitation/conversation-share-dialog'
 import { ConversationExportDialog } from '@/components/recitation/conversation-export-dialog'
 import { LongPressMenu } from '@/components/recitation/long-press-menu'
+import { VoiceInput } from '@/components/recitation/voice-input'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -1233,10 +1234,10 @@ export function ChatSidebar({
         </div>
       )}
 
-      {/* 全局搜索框 */}
+      {/* 全局搜索框（支持语音搜索） */}
       {!manageMode && (
         <div className="flex items-center gap-1.5 px-3 py-2.5">
-          <div className="relative flex-1">
+          <div className="relative min-w-0 flex-1">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground/60" />
             <Input
               value={searchQ}
@@ -1256,6 +1257,8 @@ export function ChatSidebar({
               </button>
             )}
           </div>
+          {/* 语音搜索：识别结果填入搜索框 */}
+          <VoiceInput size="sm" context="search" onText={(t) => setSearchQ(t)} />
         </div>
       )}
 

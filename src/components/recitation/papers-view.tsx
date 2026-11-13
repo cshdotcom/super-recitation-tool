@@ -54,6 +54,9 @@ import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { RichContent } from '@/components/recitation/rich-content'
 import { BottomSheet } from '@/components/recitation/bottom-sheet'
+import { VoiceInput } from '@/components/recitation/voice-input'
+import { TextSelectionMenu } from '@/components/recitation/text-selection-menu'
+import { useSettingsLite } from '@/lib/voice-prefs'
 import {
   applyCardExportOpts,
   escapeHtml,
@@ -511,6 +514,10 @@ export function PapersView({
   const [selected, setSelected] = React.useState<Set<string>>(new Set())
   const [expandedId, setExpandedId] = React.useState<string | null>(null)
 
+  // ---- 划词浮动菜单（容器 = Sheet 内容根，朗读音色随设置懒取） ----
+  const settings = useSettingsLite()
+  const rootRef = React.useRef<HTMLDivElement>(null)
+
   // ---- 弹窗 ----
   const [renaming, setRenaming] = React.useState<{ id: string; title: string } | null>(null)
   const [deleteId, setDeleteId] = React.useState<string | null>(null)
@@ -851,6 +858,7 @@ export function PapersView({
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
+        ref={rootRef}
         side="bottom"
         className="flex h-[92dvh] flex-col gap-0 rounded-t-3xl p-0"
       >
@@ -913,7 +921,14 @@ export function PapersView({
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="搜索标题或题目…"
                 aria-label="搜索试卷"
-                className="h-11 rounded-full pl-9 text-sm"
+                className="h-11 rounded-full pl-9 pr-10 text-sm"
+              />
+              {/* 语音搜索：识别结果填入搜索框 */}
+              <VoiceInput
+                size="sm"
+                context="search"
+                onText={(t) => setSearch(t)}
+                className="absolute right-1 top-1/2 -translate-y-1/2"
               />
             </div>
           </div>
@@ -1220,6 +1235,9 @@ export function PapersView({
             })
           }
         />
+
+        {/* 划词浮动菜单：朗读 / 复制 / 搜索（详情内联展开的题目选区同样生效） */}
+        <TextSelectionMenu containerRef={rootRef} settings={settings} ttsContext="reader" />
       </SheetContent>
     </Sheet>
   )

@@ -40,6 +40,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import { VoiceInput } from '@/components/recitation/voice-input'
 
 interface PlanManagerViewProps {
   onBack: () => void
@@ -1072,15 +1073,17 @@ function AssignDialog({ plan, onOpenChange, onAssigned }: AssignDialogProps) {
           </DialogDescription>
         </DialogHeader>
 
-        {/* 工具条：搜索 + 全选/清空 */}
+        {/* 工具条：搜索 + 全选/清空（搜索支持语音输入） */}
         <div className="flex items-center gap-2 px-5 py-3">
           <Input
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
             placeholder="搜索卡片标题…"
             aria-label="搜索卡片"
-            className="h-9 flex-1 rounded-lg"
+            className="h-9 min-w-0 flex-1 rounded-lg"
           />
+          {/* 语音搜索：识别结果填入卡片搜索框 */}
+          <VoiceInput size="sm" context="search" onText={(t) => setFilter(t)} />
           <Button
             type="button"
             variant="outline"
