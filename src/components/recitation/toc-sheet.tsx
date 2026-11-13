@@ -13,12 +13,111 @@ import { MoreHorizontal, Search, X } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import type { CardData } from '@/lib/types'
-import { splitParagraphs } from '@/lib/cloze'
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet'
 
 export interface TocEntry {
   label: string // display text, e.g. 第1段的开头…
   index: number // chunk/paragraph index to jump to
+}
+
+/** 目录条目：纯文本标签 + 跳转索引（对应 reader-view 的 data-toc-para / data-toc-chunk）。 */
+interface OutlineEntry {
+  label: string
+  paraIndex: number
+}
+
+/** 把富文本段落清理成纯文本标签（剥离围栏/HTML/%%指令/markdown 标记）。 */
+function toPlainLabel(text: string): string {
+  const t = text.trim()
+  if (!t) return ''
+  let s = text
+  // %%样式|文字%% → 文字（行内样式指令：fs/color/u 等）
+  s = s.replace(/%%[^|]*\|([^%]*)%%/g, '$1')
+  // 独立公式块 $$...$$ 与行内 $...$
+  s = s.replace(/\$\$[\s\S]*?\$\$/g, ' ')
+  s = s.replace(/\$[^$\n]+\$/g, ' ')
+  // 图片 ![alt](src) → alt
+  s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+  // HTML/XML 标签 → 删除（保留内文）
+  s = s.replace(/<[^>]+>/g, ' ')
+  // markdown 加粗/高亮/删除线/斜体标记
+  s = s.replace(/\*\*([^*]+)\*\*/g, '$1')
+  s = s.replace(/==([^=]+)==/g, '$1')
+  s = s.replace(/~~([^~]+)~~/g, '$1')
+  s = s.replace(/__([^_]+)__/g, '$1')
+  s = s.replace(/\*([^*\n]+)\*/g, '$1')
+  s = s.replace(/_([^_\n]+)_/g, '$1')
+  // 表格分隔符
+  s = s.replace(/\|/g, ' ')
+  // collapse 空白
+  s = s.replace(/\s+/g, ' ').trim()
+  return s
+}
+
+/** 按「逻辑块」生成目录条目：代码围栏/公式/图片/表格各合并为单条，
+ *  文本段各自一条。paraIndex 只随文本段落递增，与 ClozeText 的
+ *  data-toc-para 计数一致，跳转精准不错位。 */
+function buildOutline(content: string): OutlineEntry[] {
+  const lines = content.split(/\r?\n/)
+  const entries: OutlineEntry[] = []
+  let textPara = 0
+  let i = 0
+  while (i < lines.length) {
+    const text = lines[i] ?? ''
+    const trimmed = text.trim()
+    if (!trimmed) { i++; continue }
+    // 代码围栏块 ```lang ... ```
+    if (trimmed.startsWith('```')) {
+      const lang = trimmed.replace(/^`+/, '').trim().toLowerCase()
+      const label = lang === 'svg' ? 'SVG 图表'
+        : lang === 'mermaid' ? '图表'
+        : lang === 'html' ? 'HTML 块'
+        : lang ? `${lang} 代码` : '代码块'
+      let j = i + 1
+      while (j < lines.length && !lines[j].trim().startsWith('```')) j++
+      entries.push({ label, paraIndex: textPara })
+      i = j < lines.length ? j + 1 : j
+      continue
+    }
+    // 独立公式块 $$...$$
+    if (trimmed.startsWith('$$')) {
+      if (/^\$\$(.+)\$\$$/.test(trimmed) || trimmed === '$$') {
+        if (trimmed === '$$') {
+          let j = i + 1
+          while (j < lines.length && lines[j].trim() !== '$$') j++
+          entries.push({ label: '公式', paraIndex: textPara })
+          i = j < lines.length ? j + 1 : j
+        } else {
+          entries.push({ label: '公式', paraIndex: textPara })
+          i++
+        }
+        continue
+      }
+    }
+    // 图片行
+    if (/^\s*!\[[^\]]*\]\([^)]+\)\s*$/.test(text)) {
+      const m = text.match(/!\[([^\]]*)\]\(([^)]+)\)/)
+      entries.push({ label: m?.[1]?.trim() || '图片', paraIndex: textPara })
+      i++; continue
+    }
+    // 表格块（连续 | 行）
+    if (trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.length > 2) {
+      let j = i
+      while (j < lines.length) {
+        const t2 = lines[j].trim()
+        if (!(t2.startsWith('|') && t2.endsWith('|'))) break
+        j++
+      }
+      entries.push({ label: '表格', paraIndex: textPara })
+      i = j
+      continue
+    }
+    // 文本段落
+    entries.push({ label: toPlainLabel(text), paraIndex: textPara })
+    textPara++
+    i++
+  }
+  return entries
 }
 
 interface TocSheetProps {
@@ -49,15 +148,18 @@ export function TocSheet({ open, onOpenChange, card, chunks, onJump }: TocSheetP
     }
   }, [open])
 
-  const outline: string[] = React.useMemo(() => {
-    if (chunks && chunks.length > 0) return chunks
-    return splitParagraphs(card.content)
+  const outline: OutlineEntry[] = React.useMemo(() => {
+    if (chunks && chunks.length > 0) {
+      // AI 分块模式：每块一条，paraIndex = chunk 索引（对应 data-toc-chunk）
+      return chunks.map((c, i) => ({ label: toPlainLabel(c), paraIndex: i }))
+    }
+    return buildOutline(card.content)
   }, [chunks, card.content])
 
   const isChunks = !!(chunks && chunks.length > 0)
 
-  const handleJump = (index: number) => {
-    onJump(index)
+  const handleJump = (paraIndex: number) => {
+    onJump(paraIndex)
     onOpenChange(false)
   }
 
@@ -65,29 +167,30 @@ export function TocSheet({ open, onOpenChange, card, chunks, onJump }: TocSheetP
   const results = React.useMemo(() => {
     const q = lastQuery.trim()
     if (!q) return []
-    const paragraphs = splitParagraphs(card.content)
+    // 在清理后的目录条目里搜（已剥离围栏/标签/指令，命中即纯文本上下文）
+    const entries = outline
     const out: { paraIndex: number; line: string }[] = []
-    paragraphs.forEach((p, pi) => {
-      const lower = p.toLowerCase()
+    entries.forEach((e) => {
+      const lower = e.label.toLowerCase()
       let pos = lower.indexOf(q.toLowerCase())
       let guard = 0
       while (pos >= 0 && guard < 3) {
         guard++
         const start = Math.max(0, pos - 12)
-        const end = Math.min(p.length, pos + q.length + 24)
+        const end = Math.min(e.label.length, pos + q.length + 24)
         out.push({
-          paraIndex: pi,
+          paraIndex: e.paraIndex,
           line:
             (start > 0 ? '…' : '') +
-            p.slice(start, end) +
-            (end < p.length ? '…' : ''),
+            e.label.slice(start, end) +
+            (end < e.label.length ? '…' : ''),
         })
         pos = lower.indexOf(q.toLowerCase(), pos + Math.max(1, q.length))
         if (out.length >= 50) break
       }
     })
     return out
-  }, [lastQuery, card.content])
+  }, [lastQuery, outline])
 
   const submitSearch = () => {
     setLastQuery(query)
@@ -156,21 +259,21 @@ export function TocSheet({ open, onOpenChange, card, chunks, onJump }: TocSheetP
                 </p>
               ) : (
                 <div className="divide-y divide-zinc-200 dark:divide-zinc-800">
-                  {outline.map((chunk, i) => (
+                  {outline.map((entry, i) => (
                     <div key={`toc-${i}`} className="group flex items-center gap-2 py-3.5">
                       <button
                         type="button"
-                        onClick={() => handleJump(i)}
+                        onClick={() => handleJump(entry.paraIndex)}
                         className="flex-1 text-left text-base font-semibold text-[#4f5cd1] transition-colors hover:opacity-80"
                       >
                         <span className="mr-1">{i + 1}.</span>
-                        {chunk.trim().slice(0, 24) || '（空）'}
-                        {chunk.trim().length > 24 ? '…' : ''}
+                        {entry.label.slice(0, 24) || '（空）'}
+                        {entry.label.length > 24 ? '…' : ''}
                       </button>
                       <button
                         type="button"
                         aria-label={`第 ${i + 1} 块选项`}
-                        onClick={() => handleJump(i)}
+                        onClick={() => handleJump(entry.paraIndex)}
                         className="shrink-0 text-zinc-400 transition-colors hover:text-zinc-600"
                       >
                         <MoreHorizontal className="size-4.5" strokeWidth={1.75} />
